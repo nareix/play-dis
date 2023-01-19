@@ -204,6 +204,16 @@ int main(int argc, char **argv) {
   std::unique_ptr<MCCodeEmitter> CE2(T->createMCCodeEmitter(*MCII, Ctx));
   std::unique_ptr<MCDisassembler> DisAsm(T->createMCDisassembler(*STI, Ctx));
 
+  std::vector<unsigned> gpRegs = {
+    X86::RAX, X86::RCX, X86::RDX, X86::RBX,
+    X86::RSP, X86::RBP, X86::RSI, X86::RDI,
+    X86::R8, X86::R9, X86::R10, X86::R11,
+    X86::R12, X86::R13, X86::R14, X86::R15,
+  };
+
+  auto gpRegIdx = [&](unsigned reg) -> int {
+  };
+
   auto superReg = [&](unsigned reg) -> unsigned {
     auto super = reg;
     for (MCSuperRegIterator i(reg, MRI.get()); i.isValid(); ++i) {
@@ -211,10 +221,6 @@ int main(int argc, char **argv) {
     }
     return super;
   };
-
-  outs() << MRI->getName(superReg(X86::AL)) << "\n";
-
-  return 0;
 
   auto instrDisStr = [&](const MCInst &Inst) -> std::string {
     Str->emitInstruction(Inst, *STI);
@@ -299,11 +305,6 @@ int main(int argc, char **argv) {
     */
     CE2->encodeInstruction(MCInstBuilder(X86::PUSH64r).addReg(X86::RAX), vcode, fixups, *STI);
   };
-
-  // SmallCode code;
-  // emitPushJmpStub(code);
-  // disamInstrBuf(code);
-  // return 0;
 
   enum {
     kNormalOp,
