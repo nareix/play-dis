@@ -48,6 +48,7 @@ std::string formatStr(const char *fmt, Types... args) {
 
 int main(int argc, char **argv) {
   std::vector<std::string> args;
+  std::vector<std::string> args0;
   bool verbose = false;
   bool forAll = false;
   bool summary = false;
@@ -55,7 +56,11 @@ int main(int argc, char **argv) {
   bool printJmp = false;
 
   for (int i = 1; i < argc; i++) {
-    std::string o = argv[i];
+    args0.push_back(std::string(argv[i]));
+  }
+
+  for (int i = 0; i < args0.size(); i++) {
+    auto &o = args0[i];
     if (o == "-j") {
       printJmp = true;
       continue;
@@ -212,6 +217,14 @@ int main(int argc, char **argv) {
   };
 
   auto gpRegIdx = [&](unsigned reg) -> int {
+    auto first = std::lower_bound(gpRegs.begin(), gpRegs.end(), reg);
+    if (first == gpRegs.end()) {
+      return -1;
+    }
+    if (*first != reg) {
+      return -1;
+    }
+    return first - gpRegs.begin();
   };
 
   auto superReg = [&](unsigned reg) -> unsigned {
@@ -258,13 +271,17 @@ int main(int argc, char **argv) {
     }
   };
 
-  auto emitPushJmpStub = [&](SmallCode &code) {
+  auto emitPushJmpStub = [&](
+    SmallCode &code, uint64_t caddr,
+    uint64_t addr0, MCInst &inst0,
+    uint64_t addr1, MCInst &inst1
+  ) {
     raw_svector_ostream vcode(code);
     SmallVector<MCFixup, 4> fixups;
 
     /*
       push %rax; pushfq // save rax,eflags
-      mov -16(%rsp),%rax; cmp (%rsp),%rax // check jmpval == eflags
+      mov 16(%rsp),%rax; cmp (%rsp),%rax // check jmpval == eflags
       je is_tls
     */
     CE2->encodeInstruction(MCInstBuilder(X86::PUSH64r).addReg(X86::RAX), vcode, fixups, *STI);
@@ -278,8 +295,10 @@ int main(int argc, char **argv) {
         .addReg(X86::RAX).addReg(X86::RSP).addImm(1).addReg(0).addImm(0).addReg(0),
         vcode, fixups, *STI);
     CE2->encodeInstruction(
-        MCInstBuilder(X86::JCC_1).addImm(111).addImm(4),
+        MCInstBuilder(X86::JCC_1).addImm(0).addImm(4),
         vcode, fixups, *STI);
+    auto jeIsTlsFixup = (uint8_t *)&code[code.size()-1];
+    auto jeIsTlsOff = code.size();
 
     /*
     is_orig:
@@ -292,17 +311,20 @@ int main(int argc, char **argv) {
         MCInstBuilder(X86::LEA64r)
         .addReg(X86::RSP).addReg(X86::RSP).addImm(1).addReg(0).addImm(8).addReg(0),
         vcode, fixups, *STI);
+    CE2->encodeInstruction(inst0, vcode, fixups, *STI);
     CE2->encodeInstruction(MCInstBuilder(X86::JMP_4).addImm(128), vcode, fixups, *STI);
+    auto jmpAfterOrigFixup = (uint8_t *)&code[code.size()-4];
 
     /*
     is_tls:
       push %tmp1 // save tmp1
       lea orig_m_without_fs,%tmp1; call get_fs_value; lea (%rax),%tmp1 // get orig value
       lea 8(%rsp),%rsp; popfd; pop %rax; lea 8(%rsp),%rsp;  // recover rax,eflags,rsp
-      orig_op (%tmp1),orig_reg // modified orig instr
+      tls_op (%tmp1),orig_reg // modified tls instr
       mov 24(%rsp),%tmp1 // recovery tmp1
       jmp after_tls
     */
+    auto isTlsOff = code.size();
     CE2->encodeInstruction(MCInstBuilder(X86::PUSH64r).addReg(X86::RAX), vcode, fixups, *STI);
   };
 
@@ -584,12 +606,6 @@ int main(int argc, char **argv) {
       tag += formatStr(":%lu,%s,%d", rop.size, name.c_str(), std::abs((int64_t)(jmp.i.addr-addr)));
     }
 
-    // std::string is;
-    // raw_string_ostream ois(is);
-    // Inst.dump_pretty(ois);
-    // Str->emitInstruction(Inst, *STI);
-    // auto dis = ss.slice(0, ss.size()-1);
-
     auto &idesc = MII->get(Inst.getOpcode());
     uint64_t TSFlags = idesc.TSFlags;
     uint64_t Form = TSFlags & X86II::FormMask;
@@ -624,7 +640,7 @@ int main(int argc, char **argv) {
     }
 
     outs() << formatInstHeader(addr, Size) << 
-      IP->getOpcodeName(Inst.getOpcode()) << 
+      IP->getOpcodeName(Inst.getOpcode()) <<
       " " << formStr(Form) << 
       " " << kOpTypeStrs[op.type] <<
       " " << tag << 
