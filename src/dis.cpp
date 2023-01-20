@@ -51,6 +51,7 @@ int main(int argc, char **argv) {
   std::vector<std::string> args0;
   bool verbose = false;
   bool forAll = false;
+  int forSingleInstr = -1;
   bool summary = false;
   bool debug = false;
   bool printJmp = false;
@@ -61,6 +62,15 @@ int main(int argc, char **argv) {
 
   for (int i = 0; i < args0.size(); i++) {
     auto &o = args0[i];
+    if (o == "-i") {
+      if (i+1 >= args0.size()) {
+        fprintf(stderr, "need param\n");
+        return -1;
+      }
+      sscanf(args0[i+1].c_str(), "%x", &forSingleInstr);
+      i++;
+      continue;
+    }
     if (o == "-j") {
       printJmp = true;
       continue;
@@ -124,6 +134,8 @@ int main(int argc, char **argv) {
     return -1;
   }
 
+  uint64_t vaddrLoadEnd = 0;
+  uint64_t vaddrStubStart = 0;
   Elf64_Phdr *phX = NULL;
   uint8_t *phStart = (uint8_t *)eh + eh->e_phoff;
   for (int i = 0; i < eh->e_phnum; i++) {
@@ -131,12 +143,16 @@ int main(int argc, char **argv) {
     if (ph->p_type == PT_LOAD) {
       if (ph->p_flags & PF_X) {
         phX = ph;
-        break;
       }
+      vaddrLoadEnd = ph->p_vaddr + ph->p_memsz;
     }
   }
+  const int vaddrAlign = 0x1000;
+  vaddrStubStart = (vaddrLoadEnd + (vaddrAlign-1)) & ~(vaddrAlign-1);
+
   if (debug) {
     outs() << formatStr("load off %lx size %lx\n", phX->p_offset, phX->p_filesz);
+    outs() << formatStr("load end %lx stub start %lx\n", vaddrLoadEnd, vaddrStubStart);
   }
 
   ArrayRef<uint8_t> instrBuf((uint8_t *)eh + phX->p_offset, phX->p_filesz);
@@ -149,7 +165,7 @@ int main(int argc, char **argv) {
     std::string name;
     int startIdx, endIdx;
   };
-  std::vector<Section> xsecs;
+  std::vector<Section> allSecs;
   std::string plt = ".plt";
 
   uint8_t *shStart = (uint8_t *)eh + eh->e_shoff;
@@ -170,7 +186,7 @@ int main(int argc, char **argv) {
     if (debug) {
       outs() << formatStr("section %s %lx %lx\n", name.c_str(), vaddr(start), vaddr(end));
     }
-    xsecs.push_back({.start = addr, .end = end, .name = name, .startIdx = -1});
+    allSecs.push_back({.start = addr, .end = end, .name = name, .startIdx = -1});
   }
 
   LLVMInitializeX86TargetInfo();
@@ -209,9 +225,13 @@ int main(int argc, char **argv) {
   std::unique_ptr<MCCodeEmitter> CE2(T->createMCCodeEmitter(*MCII, Ctx));
   std::unique_ptr<MCDisassembler> DisAsm(T->createMCDisassembler(*STI, Ctx));
 
+  const int gpRIPIdx = 0;
+  const int gpRAXIdx = 3;
   std::vector<unsigned> gpRegs = {
+    // keep order
+    X86::RIP, X86::RSP, X86::RBP,
     X86::RAX, X86::RCX, X86::RDX, X86::RBX,
-    X86::RSP, X86::RBP, X86::RSI, X86::RDI,
+    X86::RSI, X86::RDI, 
     X86::R8, X86::R9, X86::R10, X86::R11,
     X86::R12, X86::R13, X86::R14, X86::R15,
   };
@@ -249,6 +269,83 @@ int main(int argc, char **argv) {
     return is;
   };
 
+  /*
+    M: [BaseReg, ScaleAmt, IndexReg, Disp, Segment]
+    MRM0m/MRM7m -> M,Imm
+    MRMDestMem -> M,Reg
+    MRMSrcMem -> Reg,M
+  */
+
+  struct InstrInfo {
+    int mIdx;
+    int immIdx;
+    int regIdx;
+  };
+
+  #define panicUnsupportedInstr(inst) {\
+    auto s = instrDumpStr(inst); \
+    fprintf(stderr, "%s:%d: unsupported instr %s\n", __FILE__, __LINE__, s.c_str()); \
+    __builtin_unreachable(); \
+  }
+
+  auto getInstrInfo = [&](const MCInst &inst) -> InstrInfo {
+    auto &idesc = MII->get(inst.getOpcode());
+    uint64_t TSFlags = idesc.TSFlags;
+    uint64_t Form = TSFlags & X86II::FormMask;
+
+    switch (Form) {
+      case X86II::MRM0m:
+      case X86II::MRM7m: {
+        if (inst.getNumOperands() != 6) {
+          panicUnsupportedInstr(inst);
+        }
+        return {.mIdx = 0, .immIdx = 5, .regIdx = -1};
+      }
+      case X86II::MRMDestMem:
+        if (inst.getNumOperands() != 6) {
+          panicUnsupportedInstr(inst);
+        }
+        return {.mIdx = 0, .immIdx = -1, .regIdx = 5};
+      case X86II::MRMSrcMem:
+        if (inst.getNumOperands() != 6) {
+          panicUnsupportedInstr(inst);
+        }
+        return {.mIdx = 5, .immIdx = -1, .regIdx = 0};
+      default: {
+        panicUnsupportedInstr(inst);
+      }
+    }
+  };
+
+  auto instrUsedRegMask = [&](const MCInst &inst) -> unsigned {
+    unsigned mask = 0;
+    auto info = getInstrInfo(inst);
+
+    auto add = [&](int oi) {
+      auto o = inst.getOperand(oi);
+      int i;
+      if (!o.isReg()) {
+        panicUnsupportedInstr(inst);
+      }
+      i = gpRegIdx(superReg(o.getReg()));
+      if (i == -1) {
+        panicUnsupportedInstr(inst);
+      }
+      mask |= 1<<i;
+    };
+
+    if (info.mIdx != -1) {
+      add(info.mIdx + X86::AddrBaseReg);
+      add(info.mIdx + X86::AddrIndexReg);
+    }
+
+    if (info.regIdx != -1) {
+      add(info.regIdx);
+    }
+
+    return mask;
+  };
+
   using SmallCode = SmallString<256>;
 
   auto disamInstrBuf = [&](const SmallCode &code) {
@@ -256,7 +353,7 @@ int main(int argc, char **argv) {
     MCInst Inst;
     uint64_t Size;
     for (int addr = 0; addr < buf.size(); ) {
-      auto r = DisAsm->getInstruction(Inst, Size, buf.slice(addr), addr, nulls());
+      auto r = DisAsm->getInstruction(Inst, Size, buf.slice(addr), 0, nulls());
       if (r != MCDisassembler::DecodeStatus::Success) {
         addr++;
         continue;
@@ -271,13 +368,20 @@ int main(int argc, char **argv) {
     }
   };
 
+  uint64_t fnGetFsVaddr = 0;
+
   auto emitPushJmpStub = [&](
-    SmallCode &code, uint64_t caddr,
-    uint64_t addr0, MCInst &inst0,
-    uint64_t addr1, MCInst &inst1
+    SmallCode &code, uint64_t vaddrCode,
+    uint64_t vaddr0, MCInst &inst0,
+    uint64_t vaddr1, MCInst &inst1
   ) {
     raw_svector_ostream vcode(code);
     SmallVector<MCFixup, 4> fixups;
+
+    auto freeReg = [&](unsigned mask) -> int {
+    };
+
+    instrUsedRegMask(inst0);
 
     /*
       push %rax; pushfq // save rax,eflags
@@ -318,7 +422,7 @@ int main(int argc, char **argv) {
     /*
     is_tls:
       push %tmp1 // save tmp1
-      lea orig_m_without_fs,%tmp1; call get_fs_value; lea (%rax),%tmp1 // get orig value
+      lea orig_m_without_fs,%tmp1; call get_fs; lea (%rax),%tmp1 // get orig value
       lea 8(%rsp),%rsp; popfd; pop %rax; lea 8(%rsp),%rsp;  // recover rax,eflags,rsp
       tls_op (%tmp1),orig_reg // modified tls instr
       mov 24(%rsp),%tmp1 // recovery tmp1
@@ -419,7 +523,7 @@ int main(int argc, char **argv) {
   auto decodeInstr = [&](uint64_t addr) -> OpcodeAndSize {
     MCInst Inst;
     uint64_t Size;
-    auto S = DisAsm->getInstruction(Inst, Size, instrBuf.slice(addr), addr, nulls());
+    auto S = DisAsm->getInstruction(Inst, Size, instrBuf.slice(addr), 0, nulls());
 
     if (S != MCDisassembler::DecodeStatus::Success) {
       return {.size = 1, .type = kBadOp};
@@ -465,7 +569,7 @@ int main(int argc, char **argv) {
   std::vector<AddrAndIdx> badRanges;
   const int BadMaxDiff = 100;
 
-  for (auto &sec: xsecs) {
+  for (auto &sec: allSecs) {
     sec.startIdx = allOpcode.size();
     for (uint64_t addr = sec.start; addr < sec.end; ) {
       auto op = decodeInstr(addr);
@@ -567,13 +671,6 @@ int main(int argc, char **argv) {
   TEST32mi XCHG32rm XOR64rm
   */
 
-  /*
-    M: [BaseReg, ScaleAmt, IndexReg, Disp, Segment]
-    MRM0m/MRM7m -> M,Imm
-    MRMDestMem -> M,Reg
-    MRMSrcMem -> Reg,M
-  */
-
   auto formatInstHeader = [&](uint64_t addr, uint64_t size) -> std::string {
     return formatStr("%lx n=%lu ", vaddr(addr), size);
   };
@@ -623,22 +720,6 @@ int main(int argc, char **argv) {
       #undef X
     };
 
-    if (op.type == kTlsOp) {
-      if (Form == X86II::MRM0m) {
-        unsigned i = X86II::getOperandBias(idesc);
-        bool HasEVEX_K = TSFlags & X86II::EVEX_K;
-        bool HasVEX_4V = TSFlags & X86II::VEX_4V;
-        bool HasEVEX_RC = TSFlags & X86II::EVEX_RC;
-        if (HasVEX_4V)
-          i++;
-        if (HasEVEX_K)
-          i++;
-        MCOperand &SegReg = Inst.getOperand(i + X86::AddrSegmentReg);
-        MCOperand &Imm = Inst.getOperand(i + X86::AddrNumOperands);
-        // SegReg.setReg(0);
-      }
-    }
-
     outs() << formatInstHeader(addr, Size) << 
       IP->getOpcodeName(Inst.getOpcode()) <<
       " " << formStr(Form) << 
@@ -650,6 +731,8 @@ int main(int argc, char **argv) {
 
   int totOpType[kOpTypeNr] = {};
   int totJmpType[kJmpTypeNr] = {};
+
+  uint64_t vaddrStub = vaddrStubStart;
 
   auto doReplace = [&](AddrAndIdx i) {
     auto op = allOpcode[i.idx];
@@ -680,10 +763,23 @@ int main(int argc, char **argv) {
     if (verbose) {
       printInstr(i, jmp);
     }
+
+    if (jmp.type == kPushJmp) {
+      MCInst inst0, inst1;
+      uint64_t size0, size1;
+      uint64_t vaddr0 = vaddr(jmp.i.addr);
+      uint64_t vaddr1 = vaddr(i.addr);
+
+      DisAsm->getInstruction(inst0, size0, instrBuf.slice(jmp.i.addr), 0, nulls());
+      DisAsm->getInstruction(inst1, size1, instrBuf.slice(i.addr), 0, nulls());
+
+      SmallCode code;
+      emitPushJmpStub(code, vaddrStub, vaddr0, inst0, vaddr1, inst1);
+    }
   };
 
-  if (forAll) {
-    for (auto sec: xsecs) {
+  auto forAllInstr = [&](std::function<void(AddrAndIdx)> fn) {
+    for (auto sec: allSecs) {
       if (sec.startIdx == -1) {
         continue;
       }
@@ -692,10 +788,22 @@ int main(int argc, char **argv) {
       }
       uint64_t addr = sec.start;
       for (int i = sec.startIdx; i < sec.endIdx; i++) {
-        doReplace({.addr = addr, .idx = i});
+        fn({.addr = addr, .idx = i});
         addr += allOpcode[i].size;
       }
     }
+  };
+
+  if (forAll) {
+    forAllInstr([&](AddrAndIdx i) {
+      doReplace(i);
+    });
+  } else if (forSingleInstr != -1) {
+    forAllInstr([&](AddrAndIdx i) {
+      if (vaddr(i.addr) == forSingleInstr) {
+        doReplace(i);
+      }
+    });
   } else {
     for (auto i: fsInstrs) {
       doReplace(i);
