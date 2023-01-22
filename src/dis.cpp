@@ -29,12 +29,14 @@
 #include "llvm/Support/WithColor.h"
 #include "X86BaseInfo.h"
 
+#include <unistd.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <elf.h>
+
+#include "elf.h"
 
 using namespace llvm;
 
@@ -55,6 +57,7 @@ int main(int argc, char **argv) {
   bool summary = false;
   bool debug = false;
   bool printJmp = false;
+  std::string elfOutfile;
 
   for (int i = 1; i < argc; i++) {
     args0.push_back(std::string(argv[i]));
@@ -68,6 +71,15 @@ int main(int argc, char **argv) {
         return -1;
       }
       sscanf(args0[i+1].c_str(), "%x", &forSingleInstr);
+      i++;
+      continue;
+    }
+    if (o == "-e") {
+      if (i+1 >= args0.size()) {
+        fprintf(stderr, "need param\n");
+        return -1;
+      }
+      elfOutfile = args0[i+1];
       i++;
       continue;
     }
@@ -111,8 +123,9 @@ int main(int argc, char **argv) {
     fprintf(stderr, "stat %s failed\n", filename.c_str());
     return -1;
   }
+  auto fileSize = sb.st_size;
 
-  uint8_t *faddr = (uint8_t *)mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  uint8_t *faddr = (uint8_t *)mmap(NULL, fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
   if (faddr == MAP_FAILED) {
     fprintf(stderr, "mmap %s failed\n", filename.c_str());
     return -1;
@@ -122,7 +135,7 @@ int main(int argc, char **argv) {
   uint8_t osabi = eh->e_ident[EI_OSABI];
   if (
     eh->e_ident[EI_MAG0] != ELFMAG0 || eh->e_ident[EI_MAG1] != ELFMAG1 ||
-    eh->e_ident[EI_MAG2] != ELFMAG2 || eh->e_ident[EI_MAG3] != ELFMAG3 || 
+    eh->e_ident[EI_MAG2] != ELFMAG2 || eh->e_ident[EI_MAG3] != ELFMAG3 ||
     eh->e_ident[EI_CLASS] != ELFCLASS64 ||
     eh->e_ident[EI_DATA] != ELFDATA2LSB ||
     (osabi != ELFOSABI_LINUX && osabi != ELFOSABI_SYSV) ||
@@ -132,6 +145,14 @@ int main(int argc, char **argv) {
   {
     fprintf(stderr, "%s elf not supported\n", filename.c_str());
     return -1;
+  }
+
+  if (debug) {
+    outs() << formatStr("filesize %lx e_ehsize %d e_phoff %lx size %d e_shoff %lx size %d\n",
+      sb.st_size, eh->e_ehsize,
+      eh->e_phoff, eh->e_phentsize*eh->e_phnum,
+      eh->e_shoff, eh->e_shentsize*eh->e_shnum
+    );
   }
 
   uint64_t vaddrLoadEnd = 0;
@@ -147,8 +168,12 @@ int main(int argc, char **argv) {
       vaddrLoadEnd = ph->p_vaddr + ph->p_memsz;
     }
   }
-  const int vaddrAlign = 0x1000;
-  vaddrStubStart = (vaddrLoadEnd + (vaddrAlign-1)) & ~(vaddrAlign-1);
+
+  auto alignAddr = [&](uint64_t base, uint64_t align) {
+    return (base + (align - 1)) & ~(align - 1);
+  };
+
+  vaddrStubStart = alignAddr(vaddrLoadEnd, 0x1000);
 
   if (debug) {
     outs() << formatStr("load off %lx size %lx\n", phX->p_offset, phX->p_filesz);
@@ -231,7 +256,7 @@ int main(int argc, char **argv) {
     // keep order
     X86::RIP, X86::RSP, X86::RBP,
     X86::RAX, X86::RCX, X86::RDX, X86::RBX,
-    X86::RSI, X86::RDI, 
+    X86::RSI, X86::RDI,
     X86::R8, X86::R9, X86::R10, X86::R11,
     X86::R12, X86::R13, X86::R14, X86::R15,
   };
@@ -372,16 +397,13 @@ int main(int argc, char **argv) {
 
   auto emitPushJmpStub = [&](
     SmallCode &code, uint64_t vaddrCode,
-    uint64_t vaddr0, MCInst &inst0,
-    uint64_t vaddr1, MCInst &inst1
+    uint64_t vaddr0, MCInst &inst0, // normal_op
+    uint64_t vaddr1, MCInst &inst1  // tls_op
   ) {
     raw_svector_ostream vcode(code);
     SmallVector<MCFixup, 4> fixups;
 
-    auto freeReg = [&](unsigned mask) -> int {
-    };
-
-    instrUsedRegMask(inst0);
+    // instrUsedRegMask(inst1);
 
     /*
       push %rax; pushfq // save rax,eflags
@@ -405,9 +427,9 @@ int main(int argc, char **argv) {
     auto jeIsTlsOff = code.size();
 
     /*
-    is_orig:
+    is_normal:
       popfd; pop %rax; lea 8(%rsp),%rsp // recover rax,eflags,rsp
-      orig_instr; jmp after_orig
+      normal_op; jmp after_normal
     */
     CE2->encodeInstruction(MCInstBuilder(X86::POPF64), vcode, fixups, *STI);
     CE2->encodeInstruction(MCInstBuilder(X86::POP64r).addReg(X86::RAX), vcode, fixups, *STI);
@@ -421,11 +443,11 @@ int main(int argc, char **argv) {
 
     /*
     is_tls:
-      push %tmp1 // save tmp1
-      lea orig_m_without_fs,%tmp1; call get_fs; lea (%rax),%tmp1 // get orig value
+      push %tmp // save tmp
+      lea tls_op.args,%tmp; call get_fs; lea (%rax),%tmp // get orig value
       lea 8(%rsp),%rsp; popfd; pop %rax; lea 8(%rsp),%rsp;  // recover rax,eflags,rsp
-      tls_op (%tmp1),orig_reg // modified tls instr
-      mov 24(%rsp),%tmp1 // recovery tmp1
+      tls_op (%tmp),... // modified tls instr
+      mov 24(%rsp),%tmp // recovery tmp1
       jmp after_tls
     */
     auto isTlsOff = code.size();
@@ -720,7 +742,7 @@ int main(int argc, char **argv) {
       #undef X
     };
 
-    outs() << formatInstHeader(addr, Size) << 
+    outs() << formatInstHeader(addr, Size) <<
       IP->getOpcodeName(Inst.getOpcode()) <<
       " " << formStr(Form) << 
       " " << kOpTypeStrs[op.type] <<
@@ -819,6 +841,83 @@ int main(int argc, char **argv) {
       outs() << kJmpTypeStrs[i] << " " << totJmpType[i] << " ";
     }
     outs() << "\n";
+  }
+
+  auto stubSize = vaddrStub - vaddrStubStart;
+
+  if (elfOutfile != "") {
+    int fd = open(elfOutfile.c_str(), O_CREAT|O_RDWR|O_APPEND|O_TRUNC, 0744);
+    if (fd == -1) {
+      fprintf(stderr, "create %s failed: %s\n", elfOutfile.c_str(),
+          strerror(errno));
+      return -1;
+    }
+
+    auto newPhNum = eh->e_phnum + 1;
+    auto newFileEnd = alignAddr(fileSize, 0x1000);
+    auto newPhSize = eh->e_phentsize * newPhNum;
+    auto newShSize = eh->e_shentsize * (eh->e_shnum + 1);
+    auto newFileSize = newFileEnd + stubSize + newPhSize + newShSize;
+
+    if (ftruncate(fd, newFileSize) != 0) {
+      fprintf(stderr, "ftruncate %s failed\n", elfOutfile.c_str());
+      return -1;
+    }
+
+    uint8_t *faddr = (uint8_t *)mmap(NULL, newFileSize, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+    if (faddr == MAP_FAILED) {
+      fprintf(stderr, "mmap %s failed\n", elfOutfile.c_str());
+      return -1;
+    }
+
+    Elf64_Ehdr *eh2 = (Elf64_Ehdr *)faddr;
+    memcpy(eh2, eh, fileSize);
+
+    eh2->e_phoff = newFileEnd + stubSize;
+    eh2->e_shoff = eh2->e_phoff + newPhSize;
+    eh2->e_phnum = newPhNum;
+
+    uint8_t *phStart2 = (uint8_t *)eh2 + eh2->e_phoff;
+    uint8_t *shStart2 = (uint8_t *)eh2 + eh2->e_shoff;
+
+    memcpy(phStart2, phStart, eh->e_phentsize * eh->e_phnum);
+    memcpy(shStart2, shStart, eh->e_shentsize * eh->e_shnum);
+
+    { // modify PT_PHDR
+      Elf64_Phdr *ph = (Elf64_Phdr *)(phStart2 + eh2->e_phentsize*0);
+      ph->p_offset = eh2->e_phoff;
+      ph->p_vaddr = 0x4000000;
+      ph->p_paddr = 0x4000000;
+      ph->p_filesz = newPhSize;
+      ph->p_memsz = newPhSize;
+    }
+
+    { // add LOAD phdr
+      Elf64_Phdr *ph = (Elf64_Phdr *)(phStart2 + eh2->e_phentsize * (eh2->e_phnum - 1));
+      ph->p_type = PT_LOAD;
+      ph->p_offset = eh2->e_phoff;
+      ph->p_vaddr = 0x4000000;
+      ph->p_paddr = ph->p_vaddr;
+      ph->p_filesz = newPhSize;
+      ph->p_memsz = newPhSize;
+      ph->p_flags = PF_R;
+      ph->p_align = 0x1000;
+    }
+
+    if (msync((void *)eh2, newFileSize, MS_SYNC) != 0) {
+      fprintf(stderr, "msync %s failed\n", elfOutfile.c_str());
+      return -1;
+    }
+
+    if (fsync(fd) != 0) {
+      fprintf(stderr, "fsync %s failed\n", elfOutfile.c_str());
+      return -1;
+    }
+
+    if (close(fd) != 0) {
+      fprintf(stderr, "close %s failed\n", elfOutfile.c_str());
+      return -1;
+    }
   }
 
   // printf("total %d\n", n);
