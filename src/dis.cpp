@@ -29,6 +29,9 @@
 #include "llvm/Support/WithColor.h"
 #include "X86BaseInfo.h"
 
+#include <vector>
+#include <string>
+
 #include <unistd.h>
 #include <stdint.h>
 #include <stdlib.h>
