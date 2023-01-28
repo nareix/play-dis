@@ -262,8 +262,6 @@ int main(int argc, char **argv) {
   };
 
   auto gpFreeStart = gpRegIdx(X86::RCX);
-  auto gpRIPIdx = gpRegIdx(X86::RIP);
-  auto gpRSPIdx = gpRegIdx(X86::RSP);
 
   auto gpFindFreeReg = [&](unsigned mask) -> int {
     for (int i = gpFreeStart; i < gpRegs.size(); i++) {
@@ -422,10 +420,22 @@ int main(int argc, char **argv) {
   };
 
   enum {
-    kStubToText,
-    kTextToStub,
-    kStubToGetTlsFn,
+    kStubReloc,
+    kTextReloc,
     kRelocNr,
+  };
+
+  enum {
+    kRelText,
+    kRelStub,
+    kRelCall,
+    kRelRIP,
+  };
+
+  struct SimpleReloc {
+    uint32_t addr;
+    unsigned slot:2;
+    unsigned type:3;
   };
 
   class SimpleCE {
@@ -434,45 +444,65 @@ int main(int argc, char **argv) {
     const std::unique_ptr<MCSubtargetInfo> &STI;
     SmallCode code;
     raw_svector_ostream vcode;
+    uint8_t *text;
     SmallVector<MCFixup, 4> fixups;
-    std::vector<uint64_t> relocAddrs[kRelocNr];
+    std::vector<SimpleReloc> relocs;
 
-    SimpleCE(typeof(CE2) &CE2, typeof(STI) &STI): 
-      CE2(CE2), STI(STI), vcode(code) { }
+    SimpleCE(typeof(CE2) &CE2, typeof(STI) &STI, uint8_t *text): 
+      CE2(CE2), STI(STI), vcode(code), text(text) {
+    }
 
     void emit(const MCInst &inst) {
       CE2->encodeInstruction(inst, vcode, fixups, *STI);
     }
 
-    size_t size() {
-      return code.size();
-    }
-
-    uint8_t *data() {
-      return (uint8_t *)code.data();
-    }
-
-    uint64_t last4() {
-      return code.size()-4;
-    }
-
-    ArrayRef<uint8_t> slice(size_t start) {
+    ArrayRef<uint8_t> codeSlice(size_t start) {
       return {(uint8_t *)code.data()+start, code.size()-start};
     }
 
-    int32_t codeOff(uint64_t addr) {
-      return int64_t(addr) - int64_t(code.size());
+    void reloc(int slot, int type, uint8_t *base, uint32_t addr, int32_t v, bool add = false) {
+      auto p = (int32_t *)(base + addr);
+      if (add) {
+        *p += v;
+      } else {
+        *p = v;
+      }
+      relocs.push_back({(uint32_t)addr, (unsigned)slot, (unsigned)type});
     }
 
-    void reloc(int slot, uint8_t *base, uint64_t off, int32_t v) {
-      relocAddrs[slot].push_back(off);
-      *(int32_t *)(base + off) = v;
+    void relocStub(int32_t v, int type = kRelText, bool add = false) {
+      reloc(kStubReloc, type, (uint8_t *)code.data(), code.size()-4, v, add);
+    }
+
+    void relocText(uint64_t addr, int32_t v, int type = kRelStub) {
+      reloc(kTextReloc, type, text, addr, v);
     }
   };
 
-  SimpleCE E(CE2, STI);
+  SimpleCE E(CE2, STI, newText.data());
 
-  auto emitTlsOpStub = [&](MCInst &inst1) {
+  auto adjustImm = [&](MCInst &inst, uint64_t backAddr, bool noRsp) {
+    if ([&]() -> bool {
+      if (inst.getOpcode() == X86::JCC_4) {
+        return true;
+      }
+      auto info = getInstrInfo(inst);
+      if (info.mIdx != -1) {
+        auto reg = superReg(inst.getOperand(info.mIdx).getReg());
+        if (noRsp && reg == X86::RSP) { 
+          panicUnsupportedInstr(inst);
+        }
+        if (reg == X86::RIP) {
+          return true;
+        }
+      }
+      return false;
+    }()) {
+      E.relocStub(-int32_t(backAddr), kRelRIP, true);
+    }
+  };
+
+  auto emitTlsOpStub = [&](MCInst &inst1, uint64_t backAddr1) {
     /*
       push %tmp // save tmp
       lea inst1.mem, %tmp // get orig value
@@ -501,10 +531,11 @@ int main(int argc, char **argv) {
     }
     lea.getOperand(5).setReg(0);
     E.emit(lea);
+    adjustImm(lea, backAddr1, true);
 
     E.emit(MCInstBuilder(X86::PUSH64r).addReg(X86::RAX));
     E.emit(MCInstBuilder(X86::CALL64pcrel32).addImm(0));
-    E.reloc(kStubToGetTlsFn, E.data(), E.last4(), E.codeOff(0));
+    E.relocStub(0, kRelCall);
     E.emit(MCInstBuilder(X86::LEA64r)
       .addReg(tmpReg).addReg(X86::RAX).addImm(1).addReg(tmpReg).addImm(0).addReg(0));
     E.emit(MCInstBuilder(X86::POP64r).addReg(X86::RAX));
@@ -520,6 +551,13 @@ int main(int argc, char **argv) {
     E.emit(MCInstBuilder(X86::POP64r).addReg(tmpReg));
   };
 
+  auto emitDirectJmpStub = [&](MCInst &inst0, uint64_t backAddr0) {
+    E.emit(inst0);
+    adjustImm(inst0, backAddr0, false);
+    E.emit(MCInstBuilder(X86::JMP_4).addImm(128));
+    E.relocStub(backAddr0);
+  };
+
   auto emitPushJmpStub = [&](
     MCInst &inst0, uint64_t backAddr0, // normal
     MCInst &inst1, uint64_t backAddr1  // tls
@@ -532,7 +570,7 @@ int main(int argc, char **argv) {
     E.emit(MCInstBuilder(X86::PUSH64r).addReg(X86::RAX));
     E.emit(MCInstBuilder(X86::PUSHF64));
     E.emit(MCInstBuilder(X86::MOV64rm)
-      .addReg(X86::RAX).addReg(X86::RSP).addImm(1).addReg(0).addImm(-16).addReg(0));
+      .addReg(X86::RAX).addReg(X86::RSP).addImm(1).addReg(0).addImm(16).addReg(0));
     E.emit(MCInstBuilder(X86::CMP64rm)
       .addReg(X86::RAX).addReg(X86::RSP).addImm(1).addReg(0).addImm(0).addReg(0));
     E.emit(MCInstBuilder(X86::JCC_1).addImm(0).addImm(4));
@@ -552,9 +590,7 @@ int main(int argc, char **argv) {
       jmp back0
     */
     recovery();
-    E.emit(inst0);
-    E.emit(MCInstBuilder(X86::JMP_4).addImm(128));
-    E.reloc(kStubToText, E.data(), E.last4(), E.codeOff(backAddr0));
+    emitDirectJmpStub(inst0, backAddr0);
 
     /*
     1:
@@ -565,27 +601,39 @@ int main(int argc, char **argv) {
     auto label1Off = E.code.size();
     *jmp1Fix = int8_t(label1Off - jmp1Off);
     recovery();
-    emitTlsOpStub(inst1);
+    emitTlsOpStub(inst1, backAddr1);
     E.emit(MCInstBuilder(X86::JMP_4).addImm(128));
-    E.reloc(kStubToText, E.data(), E.last4(), E.codeOff(backAddr1));
+    E.relocStub(backAddr1);
+  };
+
+  auto emitShortJmpNop = [&](uint64_t addr0, uint64_t addr1, uint64_t size1) {
+    while (size1 > 2) {
+      newText[addr1] = 0xf2; // repne
+      addr1++;
+      size1--;
+    }
+    newText[addr1] = 0x74; // jmp
+    newText[addr1+1] = uint8_t(int8_t(int64_t(addr1+2)-int64_t(addr0)));
+  };
+
+  auto emitLongJmpNop = [&](uint64_t addr, uint64_t size, uint64_t stubAddr) {
+    while (size > 5) {
+      newText[addr] = 0xf2; // repne
+      addr++;
+      size--;
+    }
+    newText[addr] = 0xe9; // jmp
+    E.relocText(addr+1, stubAddr);
   };
 
   auto modifyPushJmpInst0 = [&](uint64_t addr, uint64_t size, uint64_t stubAddr) {
     newText[addr] = 0x54; // push %rsp
-    newText[addr+1] = 0xe9; // jmp
-    E.reloc(kTextToStub, newText.data(), addr+2, int64_t(addr+6) - int64_t(stubAddr));
-    for (auto i = 6; i < size; i++) {
-      newText[addr+i] = 0x90; // nop
-    }
+    emitLongJmpNop(addr+1, size-1, stubAddr);
   };
 
   auto modifyPushJmpInst1 = [&](uint64_t addr0, uint64_t addr1, uint64_t size1) {
     newText[addr1] = 0x9c; // pushf
-    newText[addr1+1] = 0x74; // jmp
-    newText[addr1+2] = uint8_t(int8_t(int64_t(addr1+3)-int64_t(addr0)));
-    for (auto i = 3; i < size1; i++) {
-      newText[addr1+i] = 0x90; // nop
-    }
+    emitShortJmpNop(addr0, addr1+1, size1-1);
   };
 
   enum {
@@ -665,10 +713,25 @@ int main(int argc, char **argv) {
     return false;
   };
 
+  auto opIsValid = [&](unsigned op, bool noop) -> bool {
+    if (noop) {
+      return op == X86::NOOP;
+    }
+    switch (op) {
+      case X86::MOV64rm:
+      case X86::MOV64mr:
+      case X86::LEA64r:
+      case X86::JCC_4:
+      case X86::MOV32rm:
+        return true;
+    }
+    return false;
+  };
+
   auto findReplaceInstr = [&](AddrAndIdx i, AddrAndIdx &res, int size, bool noop) -> bool {
     return forInstrAround(i, 127, [&](AddrAndIdx i) -> bool {
       auto op = &allOpcode[i.idx];
-      if (noop == (op->op == X86::NOOP) && !op->used && op->size >= size) {
+      if (opIsValid(op->op, noop) && !op->used && op->size >= size) {
         res = i;
         return true;
       }
@@ -889,7 +952,23 @@ int main(int argc, char **argv) {
 
   int totOpType[kOpTypeNr] = {};
   int totJmpType[kJmpTypeNr] = {};
- 
+
+  auto debugJmpStub = [&](int jmpType, uint64_t stubAddr, int relocIdx, 
+    uint64_t addr0, uint64_t size0, uint64_t addr1 = 0, uint64_t size1 = 0
+  ) {
+    if (!debug) {
+      return;
+    }
+    outs() << formatStr("%s stub:\n", kJmpTypeStrs[jmpType]);
+    disamInstrBuf(E.codeSlice(stubAddr), 2);
+    outs() << formatStr("inst0 size=%d:\n", size0);
+    disamInstrBuf({&newText[addr0], size0}, 2);
+    if (size1) {
+      outs() << formatStr("inst1 size=%d:\n", size1);
+      disamInstrBuf({&newText[addr1], size1}, 2);
+    }
+  };
+
   auto doReplace = [&](AddrAndIdx i) {
     auto op = allOpcode[i.idx];
     JmpRes jmp = {};
@@ -922,26 +1001,57 @@ int main(int argc, char **argv) {
 
     if (jmp.type == kPushJmp) {
       MCInst inst0, inst1;
-      uint64_t size0, size1;
       uint64_t addr0 = jmp.i.addr;
+      uint64_t size0;
       uint64_t addr1 = i.addr;
+      uint64_t size1;
 
       DisAsm->getInstruction(inst0, size0, instrBuf.slice(addr0), 0, nulls());
       DisAsm->getInstruction(inst1, size1, instrBuf.slice(addr1), 0, nulls());
 
-      auto stubStart = E.size();
+      auto stubAddr = E.code.size();
+      auto relocIdx = E.relocs.size();
+
       emitPushJmpStub(inst0, addr0+size0, inst1, addr1+size1);
-      modifyPushJmpInst0(addr0, size0, stubStart);
+      modifyPushJmpInst0(addr0, size0, stubAddr);
       modifyPushJmpInst1(addr0, addr1, size1);
 
-      if (debug) {
-        outs() << formatStr("push jmp %d/%d stub:\n", size0, size1);
-        disamInstrBuf(E.slice(stubStart), 2);
-        outs() << "after modify inst0:\n";
-        disamInstrBuf({&newText[addr0], size0}, 2);
-        outs() << "after modify inst1:\n";
-        disamInstrBuf({&newText[addr1], size1}, 2);
-      }
+      debugJmpStub(jmp.type, stubAddr, relocIdx, addr0, size0, addr1, size1);
+
+    }
+    return;
+    if (jmp.type == kNoopJmp) {
+      MCInst inst0;
+      uint64_t addr0 = jmp.i.addr;
+      uint64_t size0;
+      uint64_t addr1 = i.addr;
+      uint64_t size1 = allOpcode[i.idx].size;
+
+      DisAsm->getInstruction(inst0, size0, instrBuf.slice(addr0), 0, nulls());
+
+      auto stubAddr = E.code.size();
+      auto relocIdx = E.relocs.size();
+
+      emitDirectJmpStub(inst0, addr0+size0);
+      emitLongJmpNop(addr0, size0, stubAddr);
+      emitShortJmpNop(addr0, addr1, size1);
+
+      debugJmpStub(jmp.type, stubAddr, relocIdx, addr0, size0);
+
+    } else if (jmp.type == kDirectJmp) {
+      MCInst inst0;
+      uint64_t addr0 = i.addr;
+      uint64_t size0;
+
+      DisAsm->getInstruction(inst0, size0, instrBuf.slice(addr0), 0, nulls());
+
+      auto stubAddr = E.code.size();
+      auto relocIdx = E.relocs.size();
+
+      emitDirectJmpStub(inst0, addr0+size0);
+      emitLongJmpNop(addr0, size0, stubAddr);
+
+      debugJmpStub(jmp.type, stubAddr, relocIdx, addr0, size0);
     }
   };
 
