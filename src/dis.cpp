@@ -60,7 +60,6 @@ int main(int argc, char **argv) {
   bool summary = false;
   bool debug = false;
   bool printJmp = false;
-  std::string elfOutfile;
 
   for (int i = 1; i < argc; i++) {
     args0.push_back(std::string(argv[i]));
@@ -74,15 +73,6 @@ int main(int argc, char **argv) {
         return -1;
       }
       sscanf(args0[i+1].c_str(), "%x", &forSingleInstr);
-      i++;
-      continue;
-    }
-    if (o == "-e") {
-      if (i+1 >= args0.size()) {
-        fprintf(stderr, "need param\n");
-        return -1;
-      }
-      elfOutfile = args0[i+1];
       i++;
       continue;
     }
@@ -253,26 +243,33 @@ int main(int argc, char **argv) {
   std::unique_ptr<MCCodeEmitter> CE2(T->createMCCodeEmitter(*MCII, Ctx));
   std::unique_ptr<MCDisassembler> DisAsm(T->createMCDisassembler(*STI, Ctx));
 
-  const int gpRIPIdx = 0;
-  const int gpRAXIdx = 3;
   std::vector<unsigned> gpRegs = {
     // keep order
-    X86::RIP, X86::RSP, X86::RBP,
-    X86::RAX, X86::RCX, X86::RDX, X86::RBX,
-    X86::RSI, X86::RDI,
+    X86::RIP, X86::RSP, X86::RBP, X86::RAX,
+    X86::RCX, X86::RDX, X86::RBX, X86::RSI, X86::RDI,
     X86::R8, X86::R9, X86::R10, X86::R11,
     X86::R12, X86::R13, X86::R14, X86::R15,
   };
 
   auto gpRegIdx = [&](unsigned reg) -> int {
-    auto first = std::lower_bound(gpRegs.begin(), gpRegs.end(), reg);
+    auto first = std::find(gpRegs.begin(), gpRegs.end(), reg);
     if (first == gpRegs.end()) {
       return -1;
     }
-    if (*first != reg) {
-      return -1;
-    }
     return first - gpRegs.begin();
+  };
+
+  auto gpFreeStart = gpRegIdx(X86::RCX);
+  auto gpRIPIdx = gpRegIdx(X86::RIP);
+  auto gpRSPIdx = gpRegIdx(X86::RSP);
+
+  auto gpFindFreeReg = [&](unsigned mask) -> int {
+    for (int i = gpFreeStart; i < gpRegs.size(); i++) {
+      if (!(mask & (1<<i))) {
+        return i;
+      }
+    }
+    return -1;
   };
 
   auto superReg = [&](unsigned reg) -> unsigned {
@@ -311,8 +308,9 @@ int main(int argc, char **argv) {
   };
 
   #define panicUnsupportedInstr(inst) {\
-    auto s = instrDumpStr(inst); \
-    fprintf(stderr, "%s:%d: unsupported instr %s\n", __FILE__, __LINE__, s.c_str()); \
+    auto s0 = instrDisStr(inst); \
+    auto s1 = instrDumpStr(inst); \
+    fprintf(stderr, "%s:%d: unsupported instr %s %s\n", __FILE__, __LINE__, s0.c_str(), s1.c_str()); \
     __builtin_unreachable(); \
   }
 
@@ -338,7 +336,7 @@ int main(int argc, char **argv) {
         if (inst.getNumOperands() != 6) {
           panicUnsupportedInstr(inst);
         }
-        return {.mIdx = 5, .immIdx = -1, .regIdx = 0};
+        return {.mIdx = 1, .immIdx = -1, .regIdx = 0};
       default: {
         panicUnsupportedInstr(inst);
       }
@@ -351,11 +349,15 @@ int main(int argc, char **argv) {
 
     auto add = [&](int oi) {
       auto o = inst.getOperand(oi);
-      int i;
       if (!o.isReg()) {
         panicUnsupportedInstr(inst);
       }
-      i = gpRegIdx(superReg(o.getReg()));
+      unsigned r = o.getReg();
+      if (r == 0) {
+        return;
+      }
+      unsigned sr = superReg(r);
+      int i = gpRegIdx(sr);
       if (i == -1) {
         panicUnsupportedInstr(inst);
       }
@@ -363,8 +365,8 @@ int main(int argc, char **argv) {
     };
 
     if (info.mIdx != -1) {
-      add(info.mIdx + X86::AddrBaseReg);
-      add(info.mIdx + X86::AddrIndexReg);
+      add(info.mIdx + 0);
+      add(info.mIdx + 2);
     }
 
     if (info.regIdx != -1) {
@@ -390,8 +392,8 @@ int main(int argc, char **argv) {
       for (int i = addr; i < addr+Size; i++) {
         hex += formatStr("%.2X ", buf[i]);
       }
-      outs() << formatStr("%lx", addr) << instrDisStr(Inst)
-        << " [ " << hex << "] " << instrDumpStr(Inst) << "\n";
+      outs() << formatStr("%lx", addr) << instrDisStr(Inst) << " "
+        << instrDumpStr(Inst) << " [ " << hex << "] "  << "\n";
       addr += Size;
     }
   };
@@ -406,12 +408,10 @@ int main(int argc, char **argv) {
     raw_svector_ostream vcode(code);
     SmallVector<MCFixup, 4> fixups;
 
-    // instrUsedRegMask(inst1);
-
     /*
       push %rax; pushfq // save rax,eflags
       mov 16(%rsp),%rax; cmp (%rsp),%rax // check jmpval == eflags
-      je is_tls
+      je 1f
     */
     CE2->encodeInstruction(MCInstBuilder(X86::PUSH64r).addReg(X86::RAX), vcode, fixups, *STI);
     CE2->encodeInstruction(MCInstBuilder(X86::PUSHF64), vcode, fixups, *STI);
@@ -426,35 +426,85 @@ int main(int argc, char **argv) {
     CE2->encodeInstruction(
         MCInstBuilder(X86::JCC_1).addImm(0).addImm(4),
         vcode, fixups, *STI);
-    auto jeIsTlsFixup = (uint8_t *)&code[code.size()-1];
-    auto jeIsTlsOff = code.size();
+    auto jmp1Fix = (uint8_t *)&code[code.size()-1];
+
+    auto recovery = [&]() {
+      CE2->encodeInstruction(MCInstBuilder(X86::POPF64), vcode, fixups, *STI);
+      CE2->encodeInstruction(MCInstBuilder(X86::POP64r).addReg(X86::RAX), vcode, fixups, *STI);
+      CE2->encodeInstruction(
+          MCInstBuilder(X86::LEA64r)
+          .addReg(X86::RSP).addReg(X86::RSP).addImm(1).addReg(0).addImm(8).addReg(0),
+          vcode, fixups, *STI);
+    };
 
     /*
-    is_normal:
       popfd; pop %rax; lea 8(%rsp),%rsp // recover rax,eflags,rsp
-      normal_op; jmp after_normal
+      normal_op; jmp back0
     */
-    CE2->encodeInstruction(MCInstBuilder(X86::POPF64), vcode, fixups, *STI);
-    CE2->encodeInstruction(MCInstBuilder(X86::POP64r).addReg(X86::RAX), vcode, fixups, *STI);
-    CE2->encodeInstruction(
-        MCInstBuilder(X86::LEA64r)
-        .addReg(X86::RSP).addReg(X86::RSP).addImm(1).addReg(0).addImm(8).addReg(0),
-        vcode, fixups, *STI);
+    recovery();
     CE2->encodeInstruction(inst0, vcode, fixups, *STI);
     CE2->encodeInstruction(MCInstBuilder(X86::JMP_4).addImm(128), vcode, fixups, *STI);
-    auto jmpAfterOrigFixup = (uint8_t *)&code[code.size()-4];
+    auto jmpBack0Fix = (uint8_t *)&code[code.size()-4];
 
     /*
-    is_tls:
+    1:
+      popfd; pop %rax; lea 8(%rsp),%rsp // recover rax,eflags,rsp
       push %tmp // save tmp
-      lea tls_op.args,%tmp; call get_fs; lea (%rax),%tmp // get orig value
-      lea 8(%rsp),%rsp; popfd; pop %rax; lea 8(%rsp),%rsp;  // recover rax,eflags,rsp
-      tls_op (%tmp),... // modified tls instr
-      mov 24(%rsp),%tmp // recovery tmp1
-      jmp after_tls
+      lea inst1.mem, %tmp // get orig value
+      push %rax; call get_fs; lea (%rax,%tmp), %tmp; pop %rax // add fs
+      inst1.op inst1.reg,(%tmp) // modified instr
+      pop %tmp // recovery tmp
+      jmp back1
     */
-    auto isTlsOff = code.size();
+    auto info = getInstrInfo(inst1);
+    if (info.mIdx == -1) {
+      panicUnsupportedInstr(inst1);
+    }
+    unsigned used = instrUsedRegMask(inst1);
+    if (used & ((1<<gpRSPIdx)|(1<<gpRIPIdx))) {
+      panicUnsupportedInstr(inst1);
+    }
+    int ti = gpFindFreeReg(instrUsedRegMask(inst1));
+    if (ti == -1) {
+      panicUnsupportedInstr(inst1);
+    }
+    unsigned tmpReg = gpRegs[ti];
+
+    auto label1Off = code.size();
+    recovery();
+
+    CE2->encodeInstruction(MCInstBuilder(X86::PUSH64r).addReg(tmpReg), vcode, fixups, *STI);
+
+    MCInst lea;
+    lea.setOpcode(X86::LEA64r);
+    lea.addOperand(MCOperand::createReg(tmpReg));
+    for (int i = 0; i < 5; i++) {
+      lea.addOperand(inst1.getOperand(info.mIdx+i));
+    }
+    lea.getOperand(5).setReg(0);
+    CE2->encodeInstruction(lea, vcode, fixups, *STI);
+
     CE2->encodeInstruction(MCInstBuilder(X86::PUSH64r).addReg(X86::RAX), vcode, fixups, *STI);
+    CE2->encodeInstruction(MCInstBuilder(X86::CALL64pcrel32).addImm(0), vcode, fixups, *STI);
+    auto callFix = (uint8_t *)&code[code.size()-4];
+    CE2->encodeInstruction(
+        MCInstBuilder(X86::LEA64r)
+        .addReg(tmpReg).addReg(X86::RAX).addImm(1).addReg(tmpReg).addImm(0).addReg(0),
+        vcode, fixups, *STI);
+    CE2->encodeInstruction(MCInstBuilder(X86::POP64r).addReg(X86::RAX), vcode, fixups, *STI);
+
+    MCInst inst2 = inst1;
+    inst2.getOperand(info.mIdx).setReg(tmpReg);
+    inst2.getOperand(info.mIdx+1).setImm(1);
+    inst2.getOperand(info.mIdx+2).setReg(0);
+    inst2.getOperand(info.mIdx+3).setImm(0);
+    inst2.getOperand(info.mIdx+4).setReg(0);
+    CE2->encodeInstruction(inst2, vcode, fixups, *STI);
+
+    CE2->encodeInstruction(MCInstBuilder(X86::POP64r).addReg(tmpReg), vcode, fixups, *STI);
+
+    CE2->encodeInstruction(MCInstBuilder(X86::JMP_4).addImm(128), vcode, fixups, *STI);
+    auto jmpBack1Fix = (uint8_t *)&code[code.size()-4];
   };
 
   enum {
@@ -800,6 +850,10 @@ int main(int argc, char **argv) {
 
       SmallCode code;
       emitPushJmpStub(code, vaddrStub, vaddr0, inst0, vaddr1, inst1);
+      if (debug) {
+        outs() << "stub:\n";
+        disamInstrBuf(code);
+      }
     }
   };
 
@@ -846,88 +900,5 @@ int main(int argc, char **argv) {
     outs() << "\n";
   }
 
-  auto stubSize = vaddrStub - vaddrStubStart;
-
-  if (elfOutfile != "") {
-    int fd = open(elfOutfile.c_str(), O_CREAT|O_RDWR|O_APPEND|O_TRUNC, 0744);
-    if (fd == -1) {
-      fprintf(stderr, "create %s failed: %s\n", elfOutfile.c_str(),
-          strerror(errno));
-      return -1;
-    }
-
-    auto newPhNum = eh->e_phnum + 1;
-    auto newFileEnd = alignAddr(fileSize, 0x1000);
-    auto newPhSize = eh->e_phentsize * newPhNum;
-    auto newShSize = eh->e_shentsize * (eh->e_shnum + 1);
-    auto newFileSize = newFileEnd + stubSize + newPhSize + newShSize;
-
-    if (ftruncate(fd, newFileSize) != 0) {
-      fprintf(stderr, "ftruncate %s failed\n", elfOutfile.c_str());
-      return -1;
-    }
-
-    uint8_t *faddr = (uint8_t *)mmap(NULL, newFileSize, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-    if (faddr == MAP_FAILED) {
-      fprintf(stderr, "mmap %s failed\n", elfOutfile.c_str());
-      return -1;
-    }
-
-    Elf64_Ehdr *eh2 = (Elf64_Ehdr *)faddr;
-    memcpy(eh2, eh, fileSize);
-
-    eh2->e_phoff = newFileEnd + stubSize;
-    eh2->e_shoff = eh2->e_phoff + newPhSize;
-    eh2->e_phnum = newPhNum;
-
-    uint8_t *phStart2 = (uint8_t *)eh2 + eh2->e_phoff;
-    uint8_t *shStart2 = (uint8_t *)eh2 + eh2->e_shoff;
-
-    memcpy(phStart2, phStart, eh->e_phentsize * eh->e_phnum);
-    memcpy(shStart2, shStart, eh->e_shentsize * eh->e_shnum);
-
-    { // modify PT_PHDR
-      Elf64_Phdr *ph = (Elf64_Phdr *)(phStart2 + eh2->e_phentsize*0);
-      ph->p_offset = eh2->e_phoff;
-      ph->p_vaddr = 0x4000000;
-      ph->p_paddr = 0x4000000;
-      ph->p_filesz = newPhSize;
-      ph->p_memsz = newPhSize;
-    }
-
-    { // add LOAD phdr
-      Elf64_Phdr *ph = (Elf64_Phdr *)(phStart2 + eh2->e_phentsize * (eh2->e_phnum - 1));
-      ph->p_type = PT_LOAD;
-      ph->p_offset = eh2->e_phoff;
-      ph->p_vaddr = 0x4000000;
-      ph->p_paddr = ph->p_vaddr;
-      ph->p_filesz = newPhSize;
-      ph->p_memsz = newPhSize;
-      ph->p_flags = PF_R;
-      ph->p_align = 0x1000;
-    }
-
-    if (msync((void *)eh2, newFileSize, MS_SYNC) != 0) {
-      fprintf(stderr, "msync %s failed\n", elfOutfile.c_str());
-      return -1;
-    }
-
-    if (fsync(fd) != 0) {
-      fprintf(stderr, "fsync %s failed\n", elfOutfile.c_str());
-      return -1;
-    }
-
-    if (close(fd) != 0) {
-      fprintf(stderr, "close %s failed\n", elfOutfile.c_str());
-      return -1;
-    }
-  }
-
-  // printf("total %d\n", n);
-  // FILE *fp2 = fopen("text2", "wb+");
-  // fwrite(data, 1, length, fp2);
-  // fclose(fp2);
-
   return 0;
 }
-

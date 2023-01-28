@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.4.3)
 
 set(ZLIB_INCLUDE_DIR /usr/include)
 set(ZLIB_LIBRARY -lz)
+set(CMAKE_BUILD_TYPE Debug)
 find_package(ZLIB REQUIRED)
 find_package(LLVM REQUIRED CONFIG)
 project(play)
