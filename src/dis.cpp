@@ -178,6 +178,8 @@ int main(int argc, char **argv) {
     return addr + phX->p_vaddr;
   };
 
+  auto newText = std::vector<uint8_t>(instrBuf.begin(), instrBuf.end());
+
   struct Section {
     uint64_t start, end;
     std::string name;
@@ -280,9 +282,26 @@ int main(int argc, char **argv) {
     return super;
   };
 
+  auto instrHexStr = [&](ArrayRef<uint8_t> buf) -> std::string {
+    std::string hex = "[";
+    for (int i = 0; i < buf.size(); i++) {
+      hex += formatStr("%.2X", buf[i]);
+      if (i < buf.size()-1) {
+        hex += " ";
+      }
+    }
+    hex += "]";
+    return hex;
+  };
+
   auto instrDisStr = [&](const MCInst &Inst) -> std::string {
     Str->emitInstruction(Inst, *STI);
-    auto r = ss.slice(0, ss.size()-1).str();
+    auto r = ss.slice(1, ss.size()-1).str();
+    for (int i = 0; i < r.size(); i++) {
+      if (r[i] == '\t') {
+        r[i] = ' ';
+      }
+    }
     ss.clear();
     return r;
   };
@@ -378,102 +397,101 @@ int main(int argc, char **argv) {
 
   using SmallCode = SmallString<256>;
 
-  auto disamInstrBuf = [&](const SmallCode &code) {
-    ArrayRef<uint8_t> buf((uint8_t *)code.data(), code.size());
+  auto disamInstrBuf = [&](ArrayRef<uint8_t> buf, int tab = 0) {
     MCInst Inst;
     uint64_t Size;
     for (int addr = 0; addr < buf.size(); ) {
       auto r = DisAsm->getInstruction(Inst, Size, buf.slice(addr), 0, nulls());
+      std::string dis, dump;
       if (r != MCDisassembler::DecodeStatus::Success) {
-        addr++;
-        continue;
+        Size = 1;
+        dis = "bad";
+        dump = "bad";
+      } else {
+        dis = instrDisStr(Inst);
+        dump = instrDumpStr(Inst);
       }
-      std::string hex;
-      for (int i = addr; i < addr+Size; i++) {
-        hex += formatStr("%.2X ", buf[i]);
-      }
-      outs() << formatStr("%lx", addr) << instrDisStr(Inst) << " "
-        << instrDumpStr(Inst) << " [ " << hex << "] "  << "\n";
+    print:
+      outs() << std::string(tab, ' ') << formatStr("%lx", addr) << 
+        " " << dis << 
+        " " << dump << 
+        " " << instrHexStr(buf.slice(addr,  Size)) << 
+        "\n";
       addr += Size;
     }
   };
 
-  uint64_t fnGetFsVaddr = 0;
+  enum {
+    kStubToText,
+    kTextToStub,
+    kStubToGetTlsFn,
+    kRelocNr,
+  };
 
-  auto emitPushJmpStub = [&](
-    SmallCode &code, uint64_t vaddrCode,
-    uint64_t vaddr0, MCInst &inst0, // normal_op
-    uint64_t vaddr1, MCInst &inst1  // tls_op
-  ) {
-    raw_svector_ostream vcode(code);
+  class SimpleCE {
+  public:
+    const std::unique_ptr<MCCodeEmitter> &CE2;
+    const std::unique_ptr<MCSubtargetInfo> &STI;
+    SmallCode code;
+    raw_svector_ostream vcode;
     SmallVector<MCFixup, 4> fixups;
+    std::vector<uint64_t> relocAddrs[kRelocNr];
 
+    SimpleCE(typeof(CE2) &CE2, typeof(STI) &STI): 
+      CE2(CE2), STI(STI), vcode(code) { }
+
+    void emit(const MCInst &inst) {
+      CE2->encodeInstruction(inst, vcode, fixups, *STI);
+    }
+
+    size_t size() {
+      return code.size();
+    }
+
+    uint8_t *data() {
+      return (uint8_t *)code.data();
+    }
+
+    uint64_t last4() {
+      return code.size()-4;
+    }
+
+    ArrayRef<uint8_t> slice(size_t start) {
+      return {(uint8_t *)code.data()+start, code.size()-start};
+    }
+
+    int32_t codeOff(uint64_t addr) {
+      return int64_t(addr) - int64_t(code.size());
+    }
+
+    void reloc(int slot, uint8_t *base, uint64_t off, int32_t v) {
+      relocAddrs[slot].push_back(off);
+      *(int32_t *)(base + off) = v;
+    }
+  };
+
+  SimpleCE E(CE2, STI);
+
+  auto emitTlsOpStub = [&](MCInst &inst1) {
     /*
-      push %rax; pushfq // save rax,eflags
-      mov 16(%rsp),%rax; cmp (%rsp),%rax // check jmpval == eflags
-      je 1f
-    */
-    CE2->encodeInstruction(MCInstBuilder(X86::PUSH64r).addReg(X86::RAX), vcode, fixups, *STI);
-    CE2->encodeInstruction(MCInstBuilder(X86::PUSHF64), vcode, fixups, *STI);
-    CE2->encodeInstruction(
-        MCInstBuilder(X86::MOV64rm)
-        .addReg(X86::RAX).addReg(X86::RSP).addImm(1).addReg(0).addImm(-16).addReg(0),
-        vcode, fixups, *STI);
-    CE2->encodeInstruction(
-        MCInstBuilder(X86::CMP64rm)
-        .addReg(X86::RAX).addReg(X86::RSP).addImm(1).addReg(0).addImm(0).addReg(0),
-        vcode, fixups, *STI);
-    CE2->encodeInstruction(
-        MCInstBuilder(X86::JCC_1).addImm(0).addImm(4),
-        vcode, fixups, *STI);
-    auto jmp1Fix = (uint8_t *)&code[code.size()-1];
-
-    auto recovery = [&]() {
-      CE2->encodeInstruction(MCInstBuilder(X86::POPF64), vcode, fixups, *STI);
-      CE2->encodeInstruction(MCInstBuilder(X86::POP64r).addReg(X86::RAX), vcode, fixups, *STI);
-      CE2->encodeInstruction(
-          MCInstBuilder(X86::LEA64r)
-          .addReg(X86::RSP).addReg(X86::RSP).addImm(1).addReg(0).addImm(8).addReg(0),
-          vcode, fixups, *STI);
-    };
-
-    /*
-      popfd; pop %rax; lea 8(%rsp),%rsp // recover rax,eflags,rsp
-      normal_op; jmp back0
-    */
-    recovery();
-    CE2->encodeInstruction(inst0, vcode, fixups, *STI);
-    CE2->encodeInstruction(MCInstBuilder(X86::JMP_4).addImm(128), vcode, fixups, *STI);
-    auto jmpBack0Fix = (uint8_t *)&code[code.size()-4];
-
-    /*
-    1:
-      popfd; pop %rax; lea 8(%rsp),%rsp // recover rax,eflags,rsp
       push %tmp // save tmp
       lea inst1.mem, %tmp // get orig value
       push %rax; call get_fs; lea (%rax,%tmp), %tmp; pop %rax // add fs
-      inst1.op inst1.reg,(%tmp) // modified instr
+      inst1.op inst1.reg, (%tmp) // modified instr
       pop %tmp // recovery tmp
-      jmp back1
     */
     auto info = getInstrInfo(inst1);
     if (info.mIdx == -1) {
       panicUnsupportedInstr(inst1);
     }
     unsigned used = instrUsedRegMask(inst1);
-    if (used & ((1<<gpRSPIdx)|(1<<gpRIPIdx))) {
-      panicUnsupportedInstr(inst1);
-    }
     int ti = gpFindFreeReg(instrUsedRegMask(inst1));
     if (ti == -1) {
       panicUnsupportedInstr(inst1);
     }
     unsigned tmpReg = gpRegs[ti];
 
-    auto label1Off = code.size();
-    recovery();
-
-    CE2->encodeInstruction(MCInstBuilder(X86::PUSH64r).addReg(tmpReg), vcode, fixups, *STI);
+    E.emit(MCInstBuilder(X86::PUSH64r).addReg(tmpReg));
 
     MCInst lea;
     lea.setOpcode(X86::LEA64r);
@@ -482,16 +500,14 @@ int main(int argc, char **argv) {
       lea.addOperand(inst1.getOperand(info.mIdx+i));
     }
     lea.getOperand(5).setReg(0);
-    CE2->encodeInstruction(lea, vcode, fixups, *STI);
+    E.emit(lea);
 
-    CE2->encodeInstruction(MCInstBuilder(X86::PUSH64r).addReg(X86::RAX), vcode, fixups, *STI);
-    CE2->encodeInstruction(MCInstBuilder(X86::CALL64pcrel32).addImm(0), vcode, fixups, *STI);
-    auto callFix = (uint8_t *)&code[code.size()-4];
-    CE2->encodeInstruction(
-        MCInstBuilder(X86::LEA64r)
-        .addReg(tmpReg).addReg(X86::RAX).addImm(1).addReg(tmpReg).addImm(0).addReg(0),
-        vcode, fixups, *STI);
-    CE2->encodeInstruction(MCInstBuilder(X86::POP64r).addReg(X86::RAX), vcode, fixups, *STI);
+    E.emit(MCInstBuilder(X86::PUSH64r).addReg(X86::RAX));
+    E.emit(MCInstBuilder(X86::CALL64pcrel32).addImm(0));
+    E.reloc(kStubToGetTlsFn, E.data(), E.last4(), E.codeOff(0));
+    E.emit(MCInstBuilder(X86::LEA64r)
+      .addReg(tmpReg).addReg(X86::RAX).addImm(1).addReg(tmpReg).addImm(0).addReg(0));
+    E.emit(MCInstBuilder(X86::POP64r).addReg(X86::RAX));
 
     MCInst inst2 = inst1;
     inst2.getOperand(info.mIdx).setReg(tmpReg);
@@ -499,12 +515,77 @@ int main(int argc, char **argv) {
     inst2.getOperand(info.mIdx+2).setReg(0);
     inst2.getOperand(info.mIdx+3).setImm(0);
     inst2.getOperand(info.mIdx+4).setReg(0);
-    CE2->encodeInstruction(inst2, vcode, fixups, *STI);
+    E.emit(inst2);
 
-    CE2->encodeInstruction(MCInstBuilder(X86::POP64r).addReg(tmpReg), vcode, fixups, *STI);
+    E.emit(MCInstBuilder(X86::POP64r).addReg(tmpReg));
+  };
 
-    CE2->encodeInstruction(MCInstBuilder(X86::JMP_4).addImm(128), vcode, fixups, *STI);
-    auto jmpBack1Fix = (uint8_t *)&code[code.size()-4];
+  auto emitPushJmpStub = [&](
+    MCInst &inst0, uint64_t backAddr0, // normal
+    MCInst &inst1, uint64_t backAddr1  // tls
+  ) {
+    /*
+      push %rax; pushfq // save rax,eflags
+      mov 16(%rsp),%rax; cmp (%rsp),%rax // check jmpval == eflags
+      je 1f
+    */
+    E.emit(MCInstBuilder(X86::PUSH64r).addReg(X86::RAX));
+    E.emit(MCInstBuilder(X86::PUSHF64));
+    E.emit(MCInstBuilder(X86::MOV64rm)
+      .addReg(X86::RAX).addReg(X86::RSP).addImm(1).addReg(0).addImm(-16).addReg(0));
+    E.emit(MCInstBuilder(X86::CMP64rm)
+      .addReg(X86::RAX).addReg(X86::RSP).addImm(1).addReg(0).addImm(0).addReg(0));
+    E.emit(MCInstBuilder(X86::JCC_1).addImm(0).addImm(4));
+    auto jmp1Off = E.code.size();
+    auto jmp1Fix = (uint8_t *)&E.code[E.code.size()-1];
+
+    auto recovery = [&]() {
+      E.emit(MCInstBuilder(X86::POPF64));
+      E.emit(MCInstBuilder(X86::POP64r).addReg(X86::RAX));
+      E.emit(MCInstBuilder(X86::LEA64r)
+        .addReg(X86::RSP).addReg(X86::RSP).addImm(1).addReg(0).addImm(8).addReg(0));
+    };
+
+    /*
+      popfd; pop %rax; lea 8(%rsp),%rsp // recover rax,eflags,rsp
+      normal_op
+      jmp back0
+    */
+    recovery();
+    E.emit(inst0);
+    E.emit(MCInstBuilder(X86::JMP_4).addImm(128));
+    E.reloc(kStubToText, E.data(), E.last4(), E.codeOff(backAddr0));
+
+    /*
+    1:
+      popfd; pop %rax; lea 8(%rsp),%rsp // recover rax,eflags,rsp
+      tls_op
+      jmp back1
+    */
+    auto label1Off = E.code.size();
+    *jmp1Fix = int8_t(label1Off - jmp1Off);
+    recovery();
+    emitTlsOpStub(inst1);
+    E.emit(MCInstBuilder(X86::JMP_4).addImm(128));
+    E.reloc(kStubToText, E.data(), E.last4(), E.codeOff(backAddr1));
+  };
+
+  auto modifyPushJmpInst0 = [&](uint64_t addr, uint64_t size, uint64_t stubAddr) {
+    newText[addr] = 0x54; // push %rsp
+    newText[addr+1] = 0xe9; // jmp
+    E.reloc(kTextToStub, newText.data(), addr+2, int64_t(addr+6) - int64_t(stubAddr));
+    for (auto i = 6; i < size; i++) {
+      newText[addr+i] = 0x90; // nop
+    }
+  };
+
+  auto modifyPushJmpInst1 = [&](uint64_t addr0, uint64_t addr1, uint64_t size1) {
+    newText[addr1] = 0x9c; // pushf
+    newText[addr1+1] = 0x74; // jmp
+    newText[addr1+2] = uint8_t(int8_t(int64_t(addr1+3)-int64_t(addr0)));
+    for (auto i = 3; i < size1; i++) {
+      newText[addr1+i] = 0x90; // nop
+    }
   };
 
   enum {
@@ -801,14 +882,14 @@ int main(int argc, char **argv) {
       " " << kOpTypeStrs[op.type] <<
       " " << tag << 
       " " << instrDisStr(Inst) <<
-      " " << instrDumpStr(Inst) << "\n";
+      " " << instrDumpStr(Inst) << 
+      " " << instrHexStr(instrBuf.slice(addr, Size)) << 
+      "\n";
   };
 
   int totOpType[kOpTypeNr] = {};
   int totJmpType[kJmpTypeNr] = {};
-
-  uint64_t vaddrStub = vaddrStubStart;
-
+ 
   auto doReplace = [&](AddrAndIdx i) {
     auto op = allOpcode[i.idx];
     JmpRes jmp = {};
@@ -842,17 +923,24 @@ int main(int argc, char **argv) {
     if (jmp.type == kPushJmp) {
       MCInst inst0, inst1;
       uint64_t size0, size1;
-      uint64_t vaddr0 = vaddr(jmp.i.addr);
-      uint64_t vaddr1 = vaddr(i.addr);
+      uint64_t addr0 = jmp.i.addr;
+      uint64_t addr1 = i.addr;
 
-      DisAsm->getInstruction(inst0, size0, instrBuf.slice(jmp.i.addr), 0, nulls());
-      DisAsm->getInstruction(inst1, size1, instrBuf.slice(i.addr), 0, nulls());
+      DisAsm->getInstruction(inst0, size0, instrBuf.slice(addr0), 0, nulls());
+      DisAsm->getInstruction(inst1, size1, instrBuf.slice(addr1), 0, nulls());
 
-      SmallCode code;
-      emitPushJmpStub(code, vaddrStub, vaddr0, inst0, vaddr1, inst1);
+      auto stubStart = E.size();
+      emitPushJmpStub(inst0, addr0+size0, inst1, addr1+size1);
+      modifyPushJmpInst0(addr0, size0, stubStart);
+      modifyPushJmpInst1(addr0, addr1, size1);
+
       if (debug) {
-        outs() << "stub:\n";
-        disamInstrBuf(code);
+        outs() << formatStr("push jmp %d/%d stub:\n", size0, size1);
+        disamInstrBuf(E.slice(stubStart), 2);
+        outs() << "after modify inst0:\n";
+        disamInstrBuf({&newText[addr0], size0}, 2);
+        outs() << "after modify inst1:\n";
+        disamInstrBuf({&newText[addr1], size1}, 2);
       }
     }
   };
