@@ -638,25 +638,22 @@ int main(int argc, char **argv) {
 
   enum {
     kNormalOp,
-    kBadOp,
     kTlsStackCanary,
     kTlsOp,
-    kTlsOpBad,
     kSyscall,
     kOpTypeNr,
   };
 
   const char *kOpTypeStrs[] = {
     "normal_op",
-    "bad_op",
     "tls_stack_canary",
     "tls_op_normal",
-    "tls_op_bad",
     "syscall",
   };
 
   enum {
     kNoJmp,
+    kIgnoreJmp,
     kDirectJmp,
     kPushJmp,
     kNoopJmp,
@@ -666,6 +663,7 @@ int main(int argc, char **argv) {
 
   const char *kJmpTypeStrs[] = {
     "no_jmp",
+    "ignore_jmp",
     "direct_jmp",
     "push_jmp",
     "noop_jmp",
@@ -739,13 +737,15 @@ int main(int argc, char **argv) {
     });
   };
 
+  auto constexpr X86_BAD = X86::INSTRUCTION_LIST_END+1;
+
   auto decodeInstr = [&](uint64_t addr) -> OpcodeAndSize {
     MCInst Inst;
     uint64_t Size;
     auto S = DisAsm->getInstruction(Inst, Size, instrBuf.slice(addr), 0, nulls());
 
     if (S != MCDisassembler::DecodeStatus::Success) {
-      return {.size = 1, .type = kBadOp};
+      return {.op = X86_BAD, .size = 1, .type = kNormalOp};
     }
 
     switch (Inst.getOpcode()) {
@@ -756,7 +756,7 @@ int main(int argc, char **argv) {
     }
 
     auto &idesc = MII->get(Inst.getOpcode());
-    char type = 0;
+    char type = kNormalOp;
     char used = 0;
 
     for (int i = 0; i < idesc.NumOperands; i++) {
@@ -815,11 +815,7 @@ int main(int argc, char **argv) {
 
       auto idx = (int)allOpcode.size();
 
-      if (op.type >= kTlsStackCanary) {
-        fsInstrs.push_back({.addr = addr, .idx = idx});
-      }
-
-      if (op.type == kBadOp) {
+      if (op.op == X86_BAD) {
         if (badRanges.size() == 0 ||
             addr - badRanges[badRanges.size()-1].addr > BadMaxDiff)
         {
@@ -828,6 +824,10 @@ int main(int argc, char **argv) {
         } else {
           badRanges[badRanges.size()-1] = {.addr = addr+op.size, .idx = idx+1};
         }
+      }
+
+      if (op.type >= kTlsStackCanary) {
+        fsInstrs.push_back({.addr = addr, .idx = idx});
       }
 
       allOpcode.push_back(op);
@@ -874,15 +874,6 @@ int main(int argc, char **argv) {
     return false;
   };
 
-  for (auto i: fsInstrs) {
-    auto op = &allOpcode[i.idx];
-    if (op->type == kTlsOp) {
-      if (inBadRange(i.addr)) {
-        op->type = kTlsOpBad;
-      }
-    }
-  }
-
   /*
   ADD64rm CMP32mi8 CMP64mi8 CMP64mr CMP64rm
   CMP8mi MOV32mi MOV32mr MOV32rm MOV64mi32 MOV64mr
@@ -898,7 +889,7 @@ int main(int argc, char **argv) {
     auto op = allOpcode[ai.idx];
     auto addr = ai.addr;
 
-    if (op.type == kBadOp) {
+    if (op.op == X86_BAD) {
       outs() << formatInstHeader(addr, op.size) << "BAD " << "\n";
       return;
     }
@@ -974,7 +965,9 @@ int main(int argc, char **argv) {
     JmpRes jmp = {};
 
     if (op.type == kTlsOp) {
-      if (op.size < 5) {
+      if (inBadRange(i.addr)) {
+        jmp.type = kIgnoreJmp;
+      } else if (op.size < 5) {
         if (findReplaceInstr(i, jmp.i, 5, true)) {
           jmp.type = kNoopJmp;
           allOpcode[jmp.i.idx].used = 1;
