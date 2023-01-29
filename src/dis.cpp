@@ -359,6 +359,7 @@ int main(int argc, char **argv) {
       C(ADD64rm)
       C(XCHG32rm)
       C(XOR64rm)
+      C(SUB64rm)
       R(7, 2, -1, 0, 1)
 
       C(CMP64rm)
@@ -676,6 +677,7 @@ int main(int argc, char **argv) {
   enum {
     kNoJmp,
     kIgnoreJmp,
+    kCanaryImm,
     kDirectJmp,
     kPushJmp,
     kNoopJmp,
@@ -687,6 +689,7 @@ int main(int argc, char **argv) {
   const char *kJmpTypeStrs[] = {
     "no_jmp",
     "ignore_jmp",
+    "canary_imm",
     "direct_jmp",
     "push_jmp",
     "noop_jmp",
@@ -709,6 +712,8 @@ int main(int argc, char **argv) {
   struct JmpRes {
     int type;
     AddrAndIdx i;
+    int n;
+    int size;
   };
 
   std::vector<OpcodeAndSize> allOpcode;
@@ -909,14 +914,15 @@ int main(int argc, char **argv) {
       auto rop = allOpcode[jmp.i.idx];
       std::string name = IP->getOpcodeName(rop.op).str();
       tag += formatStr(":%lu,%s,%d", rop.size, name.c_str(), std::abs((int64_t)(jmp.i.addr-addr)));
+    } else if (jmp.type == kCombineJmp) {
+      tag += formatStr(":%d,%d", jmp.size, jmp.n);
     }
 
     outs() << formatInstHeader(addr, Size) <<
       IP->getOpcodeName(Inst.getOpcode()) <<
-      sep << instrDisStr(Inst) <<
-      // " " << formStr(Form) << 
       sep << kOpTypeStrs[op.type] <<
       sep << tag << 
+      sep << instrDisStr(Inst) <<
       sep << instrDumpStr(Inst) << 
       sep << instrHexStr(instrBuf.slice(addr, Size)) << 
       "\n";
@@ -977,20 +983,29 @@ int main(int argc, char **argv) {
           jmp.type = kDirectJmp;
         }
       } else if (op.type == kSyscall) {
-        AddrAndIdx j = i;
-        int size = 0;
-        while (size < 5 && j.idx >= 0) {
-          auto &op = allOpcode[j.idx];
+        uint64_t addr = i.addr;
+        uint64_t size = op.size;
+        int j = i.idx-1;
+        int n = 1;
+        while (j >= 0 && size < 5) {
+          auto &op = allOpcode[j];
+          if (op.used) {
+            break;
+          }
           op.used = 1;
           size += op.size;
-          j.idx--;
-          j.addr -= op.size;
+          addr -= op.size;
+          j--;
+          n++;
         }
         if (size < 5) {
           jmp.type = kJmpFail;
         } else {
           jmp.type = kCombineJmp;
-          jmp.i = j;
+          jmp.i.addr = addr;
+          jmp.i.idx = j+1;
+          jmp.size = size;
+          jmp.n = n;
         }
       }
     }();
@@ -1079,6 +1094,16 @@ int main(int argc, char **argv) {
         disamInstrBuf(formatStr("%s_inst_after", stype), {&newText[addr0], size0});
         disamInstrBuf(formatStr("%s_stub", stype), E.codeSlice(stubAddr));
       }
+
+    } else if (jmp.type == kCombineJmp) {
+      uint64_t addr0 = jmp.i.addr;
+      uint64_t size0 = jmp.size;
+
+      auto stype = kJmpTypeStrs[jmp.type];
+      if (debug) {
+        disamInstrBuf(formatStr("%s_inst_before", stype), {&newText[addr0], size0});
+      }
+
     }
   };
 
