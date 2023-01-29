@@ -304,11 +304,22 @@ int main(int argc, char **argv) {
     return r;
   };
 
-  auto instrDumpStr = [&](const MCInst &Inst) -> std::string {
-    std::string is;
-    raw_string_ostream ois(is);
-    Inst.dump_pretty(ois);
-    return is;
+  auto instrDumpStr = [&](const MCInst &inst) -> std::string {
+    auto n = inst.getNumOperands();
+    std::string s = formatStr("%d,n=%d[", inst.getOpcode(), n);
+    for (int i = 0; i < n; i++) {
+      auto op = inst.getOperand(i);
+      if (op.isReg()) {
+        s += formatStr("r%d", op.getReg());
+      } else if (op.isImm()) {
+        s += formatStr("i%d", op.getImm());
+      }
+      if (i < n-1) {
+        s += ",";
+      }
+    }
+    s += "]";
+    return s;
   };
 
   /*
@@ -322,42 +333,58 @@ int main(int argc, char **argv) {
     int mIdx;
     int immIdx;
     int regIdx;
+    int regIdx1;
   };
 
   #define panicUnsupportedInstr(inst) {\
     auto s0 = instrDisStr(inst); \
     auto s1 = instrDumpStr(inst); \
-    fprintf(stderr, "%s:%d: unsupported instr %s %s\n", __FILE__, __LINE__, s0.c_str(), s1.c_str()); \
+    auto s2 = IP->getOpcodeName(inst.getOpcode()).str(); \
+    fprintf(stderr, "%s:%d: unsupported instr %s %s %s\n", __FILE__, __LINE__, s2.c_str(), s0.c_str(), s1.c_str()); \
+    exit(-1); \
     __builtin_unreachable(); \
   }
 
   auto getInstrInfo = [&](const MCInst &inst) -> InstrInfo {
-    auto &idesc = MII->get(inst.getOpcode());
-    uint64_t TSFlags = idesc.TSFlags;
-    uint64_t Form = TSFlags & X86II::FormMask;
+    auto n = inst.getNumOperands();
+    #define C(op) case X86::op: 
+    #define R(n_, m, imm, r0, r1) if (n != n_) panicUnsupportedInstr(inst); \
+      return {.mIdx = m, .immIdx = imm, .regIdx = r0, .regIdx1 = r1};
 
-    switch (Form) {
-      case X86II::MRM0m:
-      case X86II::MRM7m: {
-        if (inst.getNumOperands() != 6) {
-          panicUnsupportedInstr(inst);
-        }
-        return {.mIdx = 0, .immIdx = 5, .regIdx = -1};
-      }
-      case X86II::MRMDestMem:
-        if (inst.getNumOperands() != 6) {
-          panicUnsupportedInstr(inst);
-        }
-        return {.mIdx = 0, .immIdx = -1, .regIdx = 5};
-      case X86II::MRMSrcMem:
-        if (inst.getNumOperands() != 6) {
-          panicUnsupportedInstr(inst);
-        }
-        return {.mIdx = 1, .immIdx = -1, .regIdx = 0};
-      default: {
-        panicUnsupportedInstr(inst);
-      }
+    switch (inst.getOpcode()) {
+      C(CMP32mi8)
+      C(CMP64mi8)
+      C(CMP8mi)
+      C(MOV32mi)
+      C(MOV8mi)
+      C(TEST32mi)
+      C(MOV64mi32)
+      R(6, 0, 5, -1, -1)
+
+      C(ADD64rm)
+      C(XCHG32rm)
+      C(XOR64rm)
+      R(7, 2, -1, 0, 1)
+
+      C(CMP64rm)
+      C(MOV32rm)
+      C(MOV64rm)
+      C(MOV8rm)
+      C(LEA64r)
+      C(MOVSX64rm32)
+      R(6, 1, -1, 0, -1)
+
+      C(CMP64mr)
+      C(MOV32mr)
+      C(MOV64mr)
+      C(MOV8mr)
+      R(6, 0, -1, 5, -1)
     }
+
+    panicUnsupportedInstr(inst);
+
+    #undef C
+    #undef X
   };
 
   auto instrUsedRegMask = [&](const MCInst &inst) -> unsigned {
@@ -395,7 +422,7 @@ int main(int argc, char **argv) {
 
   using SmallCode = SmallString<256>;
 
-  auto disamInstrBuf = [&](ArrayRef<uint8_t> buf, int tab = 0) {
+  auto disamInstrBuf = [&](const std::string &prefix, ArrayRef<uint8_t> buf) {
     MCInst Inst;
     uint64_t Size;
     for (int addr = 0; addr < buf.size(); ) {
@@ -410,7 +437,7 @@ int main(int argc, char **argv) {
         dump = instrDumpStr(Inst);
       }
     print:
-      outs() << std::string(tab, ' ') << formatStr("%lx", addr) << 
+      outs() << prefix << " " << formatStr("%lx", addr) << 
         " " << dis << 
         " " << dump << 
         " " << instrHexStr(buf.slice(addr,  Size)) << 
@@ -657,6 +684,7 @@ int main(int argc, char **argv) {
     kDirectJmp,
     kPushJmp,
     kNoopJmp,
+    kCombineJmp,
     kJmpFail,
     kJmpTypeNr,
   };
@@ -667,6 +695,7 @@ int main(int argc, char **argv) {
     "direct_jmp",
     "push_jmp",
     "noop_jmp",
+    "combine_jmp",
     "jmp_fail",
   };
 
@@ -711,32 +740,6 @@ int main(int argc, char **argv) {
     return false;
   };
 
-  auto opIsValid = [&](unsigned op, bool noop) -> bool {
-    if (noop) {
-      return op == X86::NOOP;
-    }
-    switch (op) {
-      case X86::MOV64rm:
-      case X86::MOV64mr:
-      case X86::LEA64r:
-      case X86::JCC_4:
-      case X86::MOV32rm:
-        return true;
-    }
-    return false;
-  };
-
-  auto findReplaceInstr = [&](AddrAndIdx i, AddrAndIdx &res, int size, bool noop) -> bool {
-    return forInstrAround(i, 127, [&](AddrAndIdx i) -> bool {
-      auto op = &allOpcode[i.idx];
-      if (opIsValid(op->op, noop) && !op->used && op->size >= size) {
-        res = i;
-        return true;
-      }
-      return false;
-    });
-  };
-
   auto constexpr X86_BAD = X86::INSTRUCTION_LIST_END+1;
 
   auto decodeInstr = [&](uint64_t addr) -> OpcodeAndSize {
@@ -759,19 +762,24 @@ int main(int argc, char **argv) {
     char type = kNormalOp;
     char used = 0;
 
-    for (int i = 0; i < idesc.NumOperands; i++) {
-      auto opinfo = idesc.OpInfo[i];
-      if (opinfo.RegClass == X86::SEGMENT_REGRegClassID) {
-        if (Inst.getOperand(i).getReg() == X86::FS) {
-          type = kTlsOp;
-          used = 1;
-          if (i > 0) {
-            auto preOp = Inst.getOperand(i-1);
-            if (preOp.isImm() && preOp.getImm() == 40) {
-              type = kTlsStackCanary;
+    if (Inst.getOpcode() == X86::SYSCALL) {
+      type = kSyscall;
+      used = 1;
+    } else {
+      for (int i = 0; i < idesc.NumOperands; i++) {
+        auto opinfo = idesc.OpInfo[i];
+        if (opinfo.RegClass == X86::SEGMENT_REGRegClassID) {
+          if (Inst.getOperand(i).getReg() == X86::FS) {
+            type = kTlsOp;
+            used = 1;
+            if (i > 0) {
+              auto preOp = Inst.getOperand(i-1);
+              if (preOp.isImm() && preOp.getImm() == 40) {
+                type = kTlsStackCanary;
+              }
             }
+            break;
           }
-          break;
         }
       }
     }
@@ -950,43 +958,94 @@ int main(int argc, char **argv) {
     if (!debug) {
       return;
     }
-    outs() << formatStr("%s stub:\n", kJmpTypeStrs[jmpType]);
-    disamInstrBuf(E.codeSlice(stubAddr), 2);
-    outs() << formatStr("inst0 size=%d:\n", size0);
-    disamInstrBuf({&newText[addr0], size0}, 2);
+    auto stype = kJmpTypeStrs[jmpType];
+    disamInstrBuf(formatStr("%s_stub", stype), E.codeSlice(stubAddr));
+    disamInstrBuf(formatStr("%s_inst0_after", stype), {&newText[addr0], size0});
     if (size1) {
-      outs() << formatStr("inst1 size=%d:\n", size1);
-      disamInstrBuf({&newText[addr1], size1}, 2);
+      disamInstrBuf(formatStr("%s_inst1_after", stype), {&newText[addr1], size1});
     }
+  };
+
+  auto opIsValid = [&](unsigned op, bool noop) -> bool {
+    if (noop) {
+      return op == X86::NOOP;
+    }
+    switch (op) {
+      case X86::MOV64rm:
+      case X86::MOV64mr:
+      case X86::LEA64r:
+      case X86::JCC_4:
+      case X86::MOV32rm:
+        return true;
+    }
+    return false;
+  };
+
+  auto findReplaceInstr = [&](AddrAndIdx i, AddrAndIdx &res, int size, bool noop) -> bool {
+    return forInstrAround(i, 127, [&](AddrAndIdx i) -> bool {
+      auto op = &allOpcode[i.idx];
+      if (opIsValid(op->op, noop) && !op->used && op->size >= size) {
+        res = i;
+        return true;
+      }
+      return false;
+    });
   };
 
   auto doReplace = [&](AddrAndIdx i) {
     auto op = allOpcode[i.idx];
     JmpRes jmp = {};
 
-    if (op.type == kTlsOp) {
-      if (inBadRange(i.addr)) {
-        jmp.type = kIgnoreJmp;
-      } else if (op.size < 5) {
-        if (findReplaceInstr(i, jmp.i, 5, true)) {
-          jmp.type = kNoopJmp;
-          allOpcode[jmp.i.idx].used = 1;
-        } else if (findReplaceInstr(i, jmp.i, 6, false)) {
-          jmp.type = kPushJmp;
-          allOpcode[jmp.i.idx].used = 1;
-          if (printJmp) {
-            printInstr(jmp.i, {});
+    [&]() {
+      if (op.type == kTlsOp || op.type == kSyscall) {
+        if (inBadRange(i.addr)) {
+          jmp.type = kIgnoreJmp;
+          return;
+        }
+      }
+
+      if (op.type == kTlsOp) {
+        if (op.size < 5) {
+          if (findReplaceInstr(i, jmp.i, 5, true)) {
+            jmp.type = kNoopJmp;
+            allOpcode[jmp.i.idx].used = 1;
+          } else if (findReplaceInstr(i, jmp.i, 6, false)) {
+            jmp.type = kPushJmp;
+            allOpcode[jmp.i.idx].used = 1;
+          } else {
+            jmp.type = kJmpFail;
           }
         } else {
-          jmp.type = kJmpFail;
+          jmp.type = kDirectJmp;
         }
-      } else {
-        jmp.type = kDirectJmp;
+      } else if (op.type == kSyscall) {
+        AddrAndIdx j = i;
+        int size = 0;
+        while (size < 5 && j.idx >= 0) {
+          auto &op = allOpcode[j.idx];
+          op.used = 1;
+          size += op.size;
+          j.idx--;
+          j.addr -= op.size;
+        }
+        if (size < 5) {
+          jmp.type = kJmpFail;
+        } else {
+          jmp.type = kCombineJmp;
+          jmp.i = j;
+        }
       }
-    }
+    }();
 
     totOpType[op.type]++;
     totJmpType[jmp.type]++;
+
+    if (printJmp) {
+      if (jmp.type == kPushJmp) {
+        outs() << "push_jmp_instr0:\n";
+        printInstr(jmp.i, {});
+      }
+    }
 
     if (verbose) {
       printInstr(i, jmp);
@@ -1011,25 +1070,23 @@ int main(int argc, char **argv) {
 
       debugJmpStub(jmp.type, stubAddr, relocIdx, addr0, size0, addr1, size1);
 
-    }
-    return;
-    if (jmp.type == kNoopJmp) {
-      MCInst inst0;
+    } else if (jmp.type == kNoopJmp) {
+      MCInst inst0, inst1;
       uint64_t addr0 = jmp.i.addr;
-      uint64_t size0;
+      uint64_t size0 = 5;
       uint64_t addr1 = i.addr;
       uint64_t size1 = allOpcode[i.idx].size;
 
-      DisAsm->getInstruction(inst0, size0, instrBuf.slice(addr0), 0, nulls());
+      DisAsm->getInstruction(inst1, size1, instrBuf.slice(addr1), 0, nulls());
 
       auto stubAddr = E.code.size();
       auto relocIdx = E.relocs.size();
 
-      emitDirectJmpStub(inst0, addr0+size0);
+      emitDirectJmpStub(inst1, addr1+size1);
       emitLongJmpNop(addr0, size0, stubAddr);
       emitShortJmpNop(addr0, addr1, size1);
 
-      debugJmpStub(jmp.type, stubAddr, relocIdx, addr0, size0);
+      // debugJmpStub(jmp.type, stubAddr, relocIdx, addr0, size0);
 
     } else if (jmp.type == kDirectJmp) {
       MCInst inst0;
