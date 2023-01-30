@@ -1,35 +1,3 @@
-#ifndef C
-#define C(...)
-#endif
-
-#ifndef IMM
-#define IMM(...)
-#endif
-
-#ifndef R
-#define R(...)
-#endif
-
-#ifndef R1
-#define R1(...)
-#endif
-
-#ifndef N
-#define N(...)
-#endif
-
-#ifndef M
-#define M(...)
-#endif
-
-#ifndef E
-#define E(...)
-#endif
-
-#ifndef USE
-#define USE(...)
-#endif
-
 C(NOOPW)
 C(HLT)
 E()
@@ -91,36 +59,3 @@ N(0) E()
 C(CMP64i32)
 C(CMP32i32)
 N(1) IMM(0) USE(RAX) E()
-
-#ifdef C
-#undef C
-#endif
-
-#ifdef IMM
-#undef IMM
-#endif
-
-#ifdef R
-#undef R
-#endif
-
-#ifdef R1
-#undef R1
-#endif
-
-#ifdef N
-#undef N
-#endif
-
-#ifdef M
-#undef M
-#endif
-
-#ifdef E
-#undef E
-#endif
-
-#ifdef USE
-#undef USE
-#endif
-

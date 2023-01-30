@@ -364,7 +364,6 @@ int main(int argc, char **argv) {
     };
 
     #define RET if (panic) { panicUnsupportedInstr(inst); } else { return r; }
-
     #define C(op) case X86::op: 
     #define M(v) r.mIdx = v;
     #define IMM(v) r.immIdx = v;
@@ -379,6 +378,14 @@ int main(int argc, char **argv) {
     }
 
     RET
+
+    #undef E
+    #undef N
+    #undef R1
+    #undef R
+    #undef IMM
+    #undef M
+    #undef C
     #undef RET
   };
 
@@ -612,11 +619,13 @@ int main(int argc, char **argv) {
   const int BadMaxDiff = 100;
 
   std::hash<std::string_view> strhash;
-  auto instHash = [&](AddrAndIdx i) -> size_t {
-    return strhash({(char *)instrBuf.data()+i.addr, allOpcode[i.idx].size});
+
+  auto instStrview = [&](AddrAndIdx i) -> std::string_view {
+    return {(char *)instrBuf.data()+i.addr, allOpcode[i.idx].size};
   };
 
-  std::unordered_map<size_t, int> instOccur;
+  using OccurPair = std::pair<std::string_view, int>;
+  std::unordered_map<size_t, OccurPair> instOccur;
 
   for (auto &sec: allSecs) {
     sec.startIdx = allOpcode.size();
@@ -646,8 +655,12 @@ int main(int argc, char **argv) {
 
       if (op.type != kNormalOp) {
         if (op.size >= 5) {
-          auto v = instOccur.try_emplace(instHash(ai));
-          v.first->second++;
+          auto view = instStrview(ai);
+          auto h = strhash(view);
+          auto v = instOccur.try_emplace(h);
+          auto &p = v.first->second;
+          p.first = view;
+          p.second++;
         }
       }
     }
@@ -656,16 +669,28 @@ int main(int argc, char **argv) {
 
   std::unordered_map<size_t, int> instOccur2;
   {
-    std::vector<std::pair<size_t, int>> a;
+    std::vector<std::pair<size_t,OccurPair>> a;
     for (auto v: instOccur) {
       a.push_back(v);
     }
     std::sort(a.begin(), a.end(), [](auto &l, auto &r) {
-      return l.second > r.second;
+      return l.second.second > r.second.second;
     });
+    for (int i = 0; i < a.size(); i++) {
+      auto h = a[i].first;
+      instOccur2[h] = i;
+    }
+
     if (debug) {
       for (int i = 0; i < a.size(); i++) {
-        outsfmt("instoccur %lx %d\n", a[i].first, a[i].second);
+        MCInst Inst;
+        uint64_t Size;
+        auto p = a[i].second;
+        auto view = p.first;
+        auto n = p.second;
+        DisAsm->getInstruction(Inst, Size, {(uint8_t*)view.data(), view.size()}, 0, nulls());
+        auto s = instrDisStr(Inst);
+        outsfmt("instoccur %d %s %d\n", i, s.c_str(), n);
       }
     }
   }
