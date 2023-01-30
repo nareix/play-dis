@@ -754,7 +754,7 @@ int main(int argc, char **argv) {
 
   SimpleCE E(CE2, STI, newText.data());
 
-  auto adjustImm = [&](MCInst &inst, uint64_t backAddr, bool noRsp) {
+  auto adjustImm4 = [&](MCInst &inst, uint64_t backAddr, bool noRsp) {
     if ([&]() -> bool {
       if (inst.getOpcode() == X86::JCC_4) {
         return true;
@@ -810,7 +810,7 @@ int main(int argc, char **argv) {
     }
     lea.getOperand(5).setReg(0);
     E.emit(lea);
-    adjustImm(lea, backAddr1, true);
+    adjustImm4(lea, backAddr1, true);
 
     E.emit(MCInstBuilder(X86::PUSH64r).addReg(X86::RAX));
     E.emit(MCInstBuilder(X86::CALL64pcrel32).addImm(0));
@@ -831,14 +831,14 @@ int main(int argc, char **argv) {
   };
 
   auto emitOldNormalInst = [&](AddrAndIdx i) {
-    MCInst inst1;
-    uint64_t size1;
-    auto addr1 = i.addr;
-    DisAsm->getInstruction(inst1, size1, instrBuf.slice(addr1), 0, nulls());
-    auto backAddr1 = addr1+size1;
+    MCInst inst;
+    uint64_t size;
+    auto addr = i.addr;
+    DisAsm->getInstruction(inst, size, instrBuf.slice(addr), 0, nulls());
+    auto backAddr = addr+size;
 
-    E.emit(inst1);
-    adjustImm(inst1, backAddr1, false);
+    E.emit(inst);
+    adjustImm4(inst, backAddr, false);
   };
 
   auto emitOldInst = [&](AddrAndIdx i) {
@@ -925,7 +925,7 @@ int main(int argc, char **argv) {
 
   auto modifyShortJmpNop = [&](AddrRange r0, AddrRange r1) {
     while (r0.size > 2) {
-      newText[r0.size] = 0xf2; // repne
+      newText[r0.i.addr] = 0xf2; // repne
       r0.i.addr++;
       r0.size--;
     }
@@ -990,6 +990,10 @@ int main(int argc, char **argv) {
         res.err = 1;
         break;
       }
+      if (op.op == X86::JCC_1 || op.op == X86::JMP_1) {
+        res.err = 4;
+        break;
+      }
       if (op.used && i != i0.idx) {
         res.err = 2;
         break;
@@ -1018,6 +1022,10 @@ int main(int argc, char **argv) {
       auto &op = allOpcode[i];
       if (!isOpSupported(op.op)) {
         res.err1 = 1;
+        break;
+      }
+      if (op.op == X86::JCC_1 || op.op == X86::JMP_1) {
+        res.err1 = 4;
         break;
       }
       if (op.used && i != i0.idx) {
