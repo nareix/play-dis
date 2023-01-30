@@ -31,6 +31,7 @@
 
 #include <vector>
 #include <string>
+#include <string_view>
 
 #include <unistd.h>
 #include <stdint.h>
@@ -64,6 +65,7 @@ int main(int argc, char **argv) {
   int forSingleInstr = -1;
   bool summary = false;
   bool debug = false;
+  bool debugOnlyBefore = false;
 
   for (int i = 1; i < argc; i++) {
     args0.push_back(std::string(argv[i]));
@@ -82,6 +84,10 @@ int main(int argc, char **argv) {
     }
     if (o == "-d") {
       debug = true;
+      continue;
+    }
+    if (o == "-donlybefore") {
+      debugOnlyBefore = true;
       continue;
     }
     if (o == "-v") {
@@ -330,6 +336,7 @@ int main(int argc, char **argv) {
   */
 
   struct InstrInfo {
+    bool ok;
     int mIdx;
     int immIdx;
     int regIdx;
@@ -346,18 +353,7 @@ int main(int argc, char **argv) {
     __builtin_unreachable(); \
   }
 
-  auto isOpSupported = [&](unsigned op) -> bool {
-    #define C(op) case X86::op: 
-    #define E() return true;
-
-    switch (op) {
-      #include "inst.inc"
-    }
-
-    return false;
-  };
-
-  auto getInstrInfo = [&](const MCInst &inst) -> InstrInfo {
+  auto getInstrInfo = [&](const MCInst &inst, bool panic = true) -> InstrInfo {
     auto n = inst.getNumOperands();
     InstrInfo r = {
       .mIdx = -1,
@@ -367,20 +363,23 @@ int main(int argc, char **argv) {
       .useReg = -1,
     };
 
+    #define RET if (panic) { panicUnsupportedInstr(inst); } else { return r; }
+
     #define C(op) case X86::op: 
     #define M(v) r.mIdx = v;
     #define IMM(v) r.immIdx = v;
     #define R(v) r.regIdx = v;
     #define R1(v) r.regIdx1 = v;
-    #define N(v) if (inst.getNumOperands() != v) panicUnsupportedInstr(inst);
-    #define E() return r;
+    #define N(v) if (inst.getNumOperands() != v) { RET }
+    #define E() r.ok = true; return r;
     #define USE(v) r.useReg = X86::v;
 
     switch (inst.getOpcode()) {
       #include "inst.inc"
     }
 
-    panicUnsupportedInstr(inst);
+    RET
+    #undef RET
   };
 
   auto instrUsedRegMask = [&](const MCInst &inst) -> unsigned {
@@ -466,7 +465,7 @@ int main(int argc, char **argv) {
 
   struct OpcodeAndSize {
     uint16_t op;
-    uint8_t size;
+    unsigned size:5;
     char used:1;
     char type:3;
     char jmpto:1;
@@ -582,9 +581,10 @@ int main(int argc, char **argv) {
       used = 1;
     } else {
       for (int i = 0; i < idesc.NumOperands; i++) {
+        auto od = Inst.getOperand(i);
         auto opinfo = idesc.OpInfo[i];
         if (opinfo.RegClass == X86::SEGMENT_REGRegClassID) {
-          if (Inst.getOperand(i).getReg() == X86::FS) {
+          if (od.getReg() == X86::FS) {
             type = kTlsOp;
             used = 1;
             if (i > 0) {
@@ -611,6 +611,13 @@ int main(int argc, char **argv) {
   std::vector<AddrAndIdx> badRanges;
   const int BadMaxDiff = 100;
 
+  std::hash<std::string_view> strhash;
+  auto instHash = [&](AddrAndIdx i) -> size_t {
+    return strhash({(char *)instrBuf.data()+i.addr, allOpcode[i.idx].size});
+  };
+
+  std::unordered_map<size_t, int> instOccur;
+
   for (auto &sec: allSecs) {
     sec.startIdx = allOpcode.size();
     for (uint64_t addr = sec.start; addr < sec.end; ) {
@@ -622,21 +629,45 @@ int main(int argc, char **argv) {
         if (badRanges.size() == 0 ||
             addr - badRanges[badRanges.size()-1].addr > BadMaxDiff)
         {
-          badRanges.push_back({.addr = addr, .idx = idx});
-          badRanges.push_back({.addr = addr+op.size, .idx = idx+1});
+          badRanges.push_back({addr, idx});
+          badRanges.push_back({addr+op.size, idx+1});
         } else {
-          badRanges[badRanges.size()-1] = {.addr = addr+op.size, .idx = idx+1};
+          badRanges[badRanges.size()-1] = {addr+op.size, idx+1};
         }
       }
 
-      if (op.type >= kTlsStackCanary) {
-        fsInstrs.push_back({.addr = addr, .idx = idx});
-      }
-
+      AddrAndIdx ai = {addr, idx};
       allOpcode.push_back(op);
       addr += op.size;
+
+      if (op.type >= kTlsStackCanary) {
+        fsInstrs.push_back(ai);
+      }
+
+      if (op.type != kNormalOp) {
+        if (op.size >= 5) {
+          auto v = instOccur.try_emplace(instHash(ai));
+          v.first->second++;
+        }
+      }
     }
     sec.endIdx = allOpcode.size();
+  }
+
+  std::unordered_map<size_t, int> instOccur2;
+  {
+    std::vector<std::pair<size_t, int>> a;
+    for (auto v: instOccur) {
+      a.push_back(v);
+    }
+    std::sort(a.begin(), a.end(), [](auto &l, auto &r) {
+      return l.second > r.second;
+    });
+    if (debug) {
+      for (int i = 0; i < a.size(); i++) {
+        outsfmt("instoccur %lx %d\n", a[i].first, a[i].second);
+      }
+    }
   }
 
   for (auto bi: badRanges) {
@@ -721,6 +752,11 @@ int main(int argc, char **argv) {
     kRelRIP,
   };
 
+  enum {
+    kFnGetTls,
+    kFnSyscall,
+  };
+
   struct SimpleReloc {
     uint32_t addr;
     unsigned slot:2;
@@ -778,9 +814,6 @@ int main(int argc, char **argv) {
       auto info = getInstrInfo(inst);
       if (info.mIdx != -1) {
         auto reg = superReg(inst.getOperand(info.mIdx).getReg());
-        if (noRsp && reg == X86::RSP) { 
-          panicUnsupportedInstr(inst);
-        }
         if (reg == X86::RIP) {
           return true;
         }
@@ -809,7 +842,6 @@ int main(int argc, char **argv) {
     if (info.mIdx == -1) {
       panicUnsupportedInstr(inst1);
     }
-    unsigned used = instrUsedRegMask(inst1);
     int ti = gpFindFreeReg(instrUsedRegMask(inst1));
     if (ti == -1) {
       panicUnsupportedInstr(inst1);
@@ -829,8 +861,10 @@ int main(int argc, char **argv) {
     adjustImm4(lea, backAddr1, true);
 
     E.emit(MCInstBuilder(X86::PUSH64r).addReg(X86::RAX));
+
     E.emit(MCInstBuilder(X86::CALL64pcrel32).addImm(0));
-    E.relocStub(0, kRelCall);
+    E.relocStub(kFnGetTls, kRelCall);
+
     E.emit(MCInstBuilder(X86::LEA64r)
       .addReg(tmpReg).addReg(X86::RAX).addImm(1).addReg(tmpReg).addImm(0).addReg(0));
     E.emit(MCInstBuilder(X86::POP64r).addReg(X86::RAX));
@@ -852,6 +886,12 @@ int main(int argc, char **argv) {
     auto addr = i.addr;
     DisAsm->getInstruction(inst, size, instrBuf.slice(addr), 0, nulls());
     auto backAddr = addr+size;
+
+    if (inst.getOpcode() == X86::SYSCALL) {
+      E.emit(MCInstBuilder(X86::CALL64pcrel32).addImm(0));
+      E.relocStub(kFnSyscall, kRelCall);
+      return;
+    }
 
     E.emit(inst);
     adjustImm4(inst, backAddr, false);
@@ -972,6 +1012,32 @@ int main(int argc, char **argv) {
     return r;
   };
 
+  auto regIsRsp = [](const MCInst &inst, int i) -> bool {
+    auto r = inst.getOperand(i).getReg();
+    return r == X86::ESP || r == X86::RSP;
+  };
+
+  auto canReplace = [&](AddrAndIdx i) -> bool {
+    MCInst inst;
+    uint64_t size;
+    DisAsm->getInstruction(inst, size, instrBuf.slice(i.addr), 0, nulls());
+    auto op = inst.getOpcode();
+    if (op == X86::JCC_1 || op == X86::JMP_1) {
+      return false;
+    }
+    auto info = getInstrInfo(inst, false);
+    if (!info.ok) {
+      return false;
+    }
+    if (info.regIdx != -1 && regIsRsp(inst, info.regIdx)) {
+      return false;
+    }
+    if (info.regIdx1 != -1 && regIsRsp(inst, info.regIdx1)) {
+      return false;
+    }
+    return true;
+  };
+
   auto checkPushJmp = [&](AddrAndIdx i) -> JmpRes {
     auto op = allOpcode[i.idx];
 
@@ -983,7 +1049,7 @@ int main(int argc, char **argv) {
 
     if (forInstrAround(i, 127, [&](AddrAndIdx i) -> int {
       auto op = allOpcode[i.idx];
-      if (isOpSupported(op.op) && !op.used && op.size >= 6) {
+      if (canReplace(i) && !op.used && op.size >= 6) {
         j = i;
         return 0;
       }
@@ -1007,11 +1073,7 @@ int main(int argc, char **argv) {
     auto addr = i0.addr;
     for (int i = i0.idx; i > 0; i--) {
       auto &op = allOpcode[i];
-      if (!isOpSupported(op.op)) {
-        LOG_JMP_FAIL(addr);
-        break;
-      }
-      if (op.op == X86::JCC_1 || op.op == X86::JMP_1) {
+      if (!canReplace({addr,i})) {
         LOG_JMP_FAIL(addr);
         break;
       }
@@ -1044,11 +1106,7 @@ int main(int argc, char **argv) {
     addr = i0.addr;
     for (int i = i0.idx; i < allOpcode.size(); i++) {
       auto &op = allOpcode[i];
-      if (!isOpSupported(op.op)) {
-        LOG_JMP_FAIL(addr);
-        break;
-      }
-      if (op.op == X86::JCC_1 || op.op == X86::JMP_1) {
+      if (!canReplace({addr,i})) {
         LOG_JMP_FAIL(addr);
         break;
       }
@@ -1157,16 +1215,21 @@ int main(int argc, char **argv) {
     }
 
     if (debug) {
-      if (jmp.r0.size) {
+      if (debugOnlyBefore) {
         disamInstrBuf(fmt("%s_inst0_before", stype), oldTextRange(jmp.r0));
-        disamInstrBuf(fmt("%s_inst0_after", stype), newTextRange(jmp.r0));
-      }
-      if (jmp.r1.size) {
         disamInstrBuf(fmt("%s_inst1_before", stype), oldTextRange(jmp.r1));
-        disamInstrBuf(fmt("%s_inst1_after", stype), newTextRange(jmp.r1));
-      }
-      if (E.code.size() != stubAddr) {
-        disamInstrBuf(fmt("%s_stub", stype), E.codeSlice(stubAddr));
+      } else {
+        if (jmp.r0.size) {
+          disamInstrBuf(fmt("%s_inst0_before", stype), oldTextRange(jmp.r0));
+          disamInstrBuf(fmt("%s_inst0_after", stype), newTextRange(jmp.r0));
+        }
+        if (jmp.r1.size) {
+          disamInstrBuf(fmt("%s_inst1_before", stype), oldTextRange(jmp.r1));
+          disamInstrBuf(fmt("%s_inst1_after", stype), newTextRange(jmp.r1));
+        }
+        if (E.code.size() != stubAddr) {
+          disamInstrBuf(fmt("%s_stub", stype), E.codeSlice(stubAddr));
+        }
       }
     }
   };
@@ -1265,8 +1328,6 @@ int main(int argc, char **argv) {
     }
     outs() << "\n";
   }
-
-  outsfmt("%p %p\n", newText.data(), instrBuf.data());
 
   return 0;
 }

@@ -12,6 +12,8 @@ add_definitions(${LLVM_DEFINITIONS})
 list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
 include(AddLLVM)
 
+set (CMAKE_CXX_STANDARD 20)
+
 set(LLVM_LINK_COMPONENTS
   x86asmparser 
   x86desc
