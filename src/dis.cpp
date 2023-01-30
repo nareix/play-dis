@@ -340,47 +340,36 @@ int main(int argc, char **argv) {
     __builtin_unreachable(); \
   }
 
+  auto isOpSupported = [&](unsigned op) -> bool {
+    #define C(op) case X86::op: 
+    #define R0(...) return true;
+    #define R(...) return true;
+
+    switch (op) {
+      #include "inst.inc"
+    }
+    return false;
+
+    #undef C
+    #undef R
+    #undef R0
+  };
+
   auto getInstrInfo = [&](const MCInst &inst) -> InstrInfo {
     auto n = inst.getNumOperands();
     #define C(op) case X86::op: 
-    #define R(n_, m, imm, r0, r1) if (n != n_) panicUnsupportedInstr(inst); \
-      return {.mIdx = m, .immIdx = imm, .regIdx = r0, .regIdx1 = r1};
+    #define R0(m, imm, r0, r1) return {.mIdx = m, .immIdx = imm, .regIdx = r0, .regIdx1 = r1};
+    #define R(n_, m, imm, r0, r1) if (n != n_) panicUnsupportedInstr(inst); R0(m, imm, r0, r1)
 
     switch (inst.getOpcode()) {
-      C(CMP32mi8)
-      C(CMP64mi8)
-      C(CMP8mi)
-      C(MOV32mi)
-      C(MOV8mi)
-      C(TEST32mi)
-      C(MOV64mi32)
-      R(6, 0, 5, -1, -1)
-
-      C(ADD64rm)
-      C(XCHG32rm)
-      C(XOR64rm)
-      C(SUB64rm)
-      R(7, 2, -1, 0, 1)
-
-      C(CMP64rm)
-      C(MOV32rm)
-      C(MOV64rm)
-      C(MOV8rm)
-      C(LEA64r)
-      C(MOVSX64rm32)
-      R(6, 1, -1, 0, -1)
-
-      C(CMP64mr)
-      C(MOV32mr)
-      C(MOV64mr)
-      C(MOV8mr)
-      R(6, 0, -1, 5, -1)
+      #include "inst.inc"
     }
 
     panicUnsupportedInstr(inst);
 
     #undef C
-    #undef X
+    #undef R
+    #undef R0
   };
 
   auto instrUsedRegMask = [&](const MCInst &inst) -> unsigned {
@@ -413,7 +402,85 @@ int main(int argc, char **argv) {
       add(info.regIdx);
     }
 
+    if (info.regIdx1 != -1) {
+      add(info.regIdx1);
+    }
+
     return mask;
+  };
+
+  enum {
+    kNormalOp,
+    kTlsStackCanary,
+    kTlsOp,
+    kSyscall,
+    kOpTypeNr,
+  };
+
+  const char *kOpTypeStrs[] = {
+    "normal_op",
+    "tls_stack_canary",
+    "tls_op_normal",
+    "syscall",
+  };
+
+  enum {
+    kNoJmp,
+    kIgnoreJmp,
+    kCanaryImm,
+    kDirectJmp,
+    kPushJmp,
+    kCombineJmp,
+    kJmpFail,
+    kJmpTypeNr,
+  };
+
+  const char *kJmpTypeStrs[] = {
+    "no_jmp",
+    "ignore_jmp",
+    "canary_imm",
+    "direct_jmp",
+    "push_jmp",
+    "combine_jmp",
+    "jmp_fail",
+  };
+
+  struct OpcodeAndSize {
+    uint16_t op;
+    uint8_t size;
+    char used:1;
+    char type:3;
+    char jmpto:1;
+    char bad:1;
+  } __attribute__((packed, aligned(4)));
+  static_assert(sizeof(OpcodeAndSize) == 4, "");
+
+  struct AddrAndIdx {
+    uint64_t addr;
+    int idx;
+  };
+
+  struct AddrRange {
+    AddrAndIdx i;
+    int n;
+    uint64_t size;
+  };
+
+  struct JmpRes {
+    int type;
+    AddrRange r0;
+    AddrRange r1;
+    int err;
+  };
+
+  std::vector<OpcodeAndSize> allOpcode;
+
+  auto newTextRange = [&](AddrRange r) -> ArrayRef<uint8_t> {
+    return {newText.data() + r.i.addr, r.size};
+  };
+
+  auto oldTextRange = [&](AddrRange r) -> ArrayRef<uint8_t> {
+    return {instrBuf.data() + r.i.addr, r.size};
   };
 
   using SmallCode = SmallString<256>;
@@ -441,6 +508,174 @@ int main(int argc, char **argv) {
       addr += Size;
     }
   };
+
+  auto forInstrAround = [&](AddrAndIdx ai, int maxDist, std::function<int(AddrAndIdx i)> fn) -> bool {
+    auto addr = ai.addr;
+    for (int i = ai.idx; i > 0 && ai.addr-addr < maxDist; i--) {
+      if (i != ai.idx) {
+        int r = fn({.addr = addr, .idx = i});
+        if (r == 0) 
+          return true;
+        if (r == 1)
+          break;
+      }
+      addr -= allOpcode[i-1].size;
+    }
+    addr = ai.addr;
+    for (int i = ai.idx; i < allOpcode.size() && addr-ai.addr < maxDist; i++) {
+      if (i != ai.idx) {
+        int r = fn({.addr = addr, .idx = i});
+        if (r == 0) 
+          return true;
+        if (r == 1)
+          break;
+      }
+      addr += allOpcode[i].size;
+    }
+    return false;
+  };
+
+  auto constexpr X86_BAD = X86::INSTRUCTION_LIST_END+1;
+
+  auto decodeInstr = [&](uint64_t addr) -> OpcodeAndSize {
+    MCInst Inst;
+    uint64_t Size;
+    auto S = DisAsm->getInstruction(Inst, Size, instrBuf.slice(addr), 0, nulls());
+
+    if (S != MCDisassembler::DecodeStatus::Success) {
+      return {.op = X86_BAD, .size = 1, .type = kNormalOp};
+    }
+
+    auto &idesc = MII->get(Inst.getOpcode());
+    char type = kNormalOp;
+    char used = 0;
+
+    if (Inst.getOpcode() == X86::SYSCALL) {
+      type = kSyscall;
+      used = 1;
+    } else {
+      for (int i = 0; i < idesc.NumOperands; i++) {
+        auto opinfo = idesc.OpInfo[i];
+        if (opinfo.RegClass == X86::SEGMENT_REGRegClassID) {
+          if (Inst.getOperand(i).getReg() == X86::FS) {
+            type = kTlsOp;
+            used = 1;
+            if (i > 0) {
+              auto preOp = Inst.getOperand(i-1);
+              if (preOp.isImm() && preOp.getImm() == 40) {
+                type = kTlsStackCanary;
+              }
+            }
+            break;
+          }
+        }
+      }
+    }
+
+    return {
+      .op = (uint16_t)Inst.getOpcode(),
+      .size = (uint8_t)Size,
+      .used = used,
+      .type = type,
+    };
+  };
+
+  std::vector<AddrAndIdx> fsInstrs;
+  std::vector<AddrAndIdx> badRanges;
+  const int BadMaxDiff = 100;
+
+  for (auto &sec: allSecs) {
+    sec.startIdx = allOpcode.size();
+    for (uint64_t addr = sec.start; addr < sec.end; ) {
+      auto op = decodeInstr(addr);
+
+      auto idx = (int)allOpcode.size();
+
+      if (op.op == X86_BAD) {
+        if (badRanges.size() == 0 ||
+            addr - badRanges[badRanges.size()-1].addr > BadMaxDiff)
+        {
+          badRanges.push_back({.addr = addr, .idx = idx});
+          badRanges.push_back({.addr = addr+op.size, .idx = idx+1});
+        } else {
+          badRanges[badRanges.size()-1] = {.addr = addr+op.size, .idx = idx+1};
+        }
+      }
+
+      if (op.type >= kTlsStackCanary) {
+        fsInstrs.push_back({.addr = addr, .idx = idx});
+      }
+
+      allOpcode.push_back(op);
+      addr += op.size;
+    }
+    sec.endIdx = allOpcode.size();
+  }
+
+  for (auto bi: badRanges) {
+    for (int i = 0; i < badRanges.size(); i += 2) {
+      for (int j = badRanges[i].idx; j < badRanges[i+1].idx; j++) {
+        allOpcode[j].bad = 1;
+      }
+    }
+    forInstrAround(bi, BadMaxDiff, [&](AddrAndIdx i) -> int {
+      allOpcode[i.idx].bad = 1;
+      allOpcode[i.idx].used = 1;
+      return -1;
+    });
+  }
+
+  if (debug) {
+    for (int i = 0; i < badRanges.size(); i += 2) {
+      auto start = badRanges[i];
+      auto end = badRanges[i+1];
+      outs() << formatStr("bad range %d addr %lx %lx len %lu n %d\n", i/2, vaddr(start.addr), vaddr(end.addr),
+        end.addr-start.addr, end.idx-start.idx);
+    }
+  }
+
+  auto printInstr = [&](AddrAndIdx ai, JmpRes jmp) {
+    auto op = allOpcode[ai.idx];
+    auto addr = ai.addr;
+
+    std::string sep = " ";
+
+    auto formatInstHeader = [&](uint64_t addr, uint64_t size) -> std::string {
+      return formatStr("%lx%sn=%lu%s", vaddr(addr), sep.c_str(), size, sep.c_str());
+    };
+
+    if (op.op == X86_BAD) {
+      outs() << formatInstHeader(addr, op.size) << "BAD " << "\n";
+      return;
+    }
+
+    MCInst Inst;
+    uint64_t Size;
+
+    DisAsm->getInstruction(Inst, Size, instrBuf.slice(addr), addr, nulls());
+
+    std::string tag = kJmpTypeStrs[jmp.type];
+
+    if (jmp.type == kPushJmp) {
+      auto rop = allOpcode[jmp.r0.i.idx];
+      std::string name = IP->getOpcodeName(rop.op).str();
+      tag += formatStr(":%lu,%s,%d", rop.size, name.c_str(), std::abs((int64_t)(jmp.r0.i.addr-addr)));
+    } else if (jmp.type == kCombineJmp) {
+      tag += formatStr(":%d,%d", jmp.r0.size, jmp.r0.n);
+    }
+
+    outs() << formatInstHeader(addr, Size) <<
+      IP->getOpcodeName(Inst.getOpcode()) <<
+      sep << kOpTypeStrs[op.type] <<
+      sep << tag << 
+      sep << instrDisStr(Inst) <<
+      sep << instrDumpStr(Inst) << 
+      sep << instrHexStr(instrBuf.slice(addr, Size)) << 
+      "\n";
+  };
+
+  int totOpType[kOpTypeNr] = {};
+  int totJmpType[kJmpTypeNr] = {};
 
   enum {
     kStubReloc,
@@ -525,7 +760,13 @@ int main(int argc, char **argv) {
     }
   };
 
-  auto emitTlsOpStub = [&](MCInst &inst1, uint64_t backAddr1) {
+  auto emitOldTlsInst = [&](AddrAndIdx i) {
+    MCInst inst1;
+    uint64_t size1;
+    auto addr1 = i.addr;
+    DisAsm->getInstruction(inst1, size1, instrBuf.slice(addr1), 0, nulls());
+    auto backAddr1 = addr1+size1;
+
     /*
       push %tmp // save tmp
       lea inst1.mem, %tmp // get orig value
@@ -574,16 +815,45 @@ int main(int argc, char **argv) {
     E.emit(MCInstBuilder(X86::POP64r).addReg(tmpReg));
   };
 
-  auto emitDirectJmpStub = [&](MCInst &inst1, uint64_t backAddr1) {
-    emitTlsOpStub(inst1, backAddr1);
-    E.emit(MCInstBuilder(X86::JMP_4).addImm(128));
-    E.relocStub(backAddr1);
+  auto emitOldNormalInst = [&](AddrAndIdx i) {
+    MCInst inst1;
+    uint64_t size1;
+    auto addr1 = i.addr;
+    DisAsm->getInstruction(inst1, size1, instrBuf.slice(addr1), 0, nulls());
+    auto backAddr1 = addr1+size1;
+
+    E.emit(inst1);
+    adjustImm(inst1, backAddr1, false);
   };
 
-  auto emitPushJmpStub = [&](
-    MCInst &inst0, uint64_t backAddr0, // normal
-    MCInst &inst1, uint64_t backAddr1  // tls
-  ) {
+  auto emitOldInst = [&](AddrAndIdx i) {
+    auto op = allOpcode[i.idx];
+    if (op.type == kTlsOp) {
+      emitOldTlsInst(i);
+    } else {
+      emitOldNormalInst(i);
+    }
+  };
+
+  auto emitOldInsts = [&](AddrRange r) {
+    auto addr = r.i.addr;
+    for (auto i = r.i.idx; i < r.i.idx+r.n; i++) {
+      emitOldInst({.addr = addr, .idx = i});
+      addr += allOpcode[i].size;
+    }
+  };
+
+  auto emitJmpBack = [&](AddrRange r) {
+    E.emit(MCInstBuilder(X86::JMP_4).addImm(128));
+    E.relocStub(r.i.addr+r.size);
+  };
+
+  auto emitDirectJmpStub = [&](AddrRange r0) {
+    emitOldInsts(r0);
+    emitJmpBack(r0);
+  };
+
+  auto emitPushJmpStub = [&](AddrRange r0, AddrRange r1) {
     /*
       push %rax; pushfq // save rax,eflags
       mov 16(%rsp),%rax; cmp (%rsp),%rax // check jmpval == eflags
@@ -612,10 +882,8 @@ int main(int argc, char **argv) {
       jmp back0
     */
     recovery();
-    E.emit(inst0);
-    adjustImm(inst0, backAddr0, false);
-    E.emit(MCInstBuilder(X86::JMP_4).addImm(128));
-    E.relocStub(backAddr0);
+    emitOldInsts(r0);
+    emitJmpBack(r0);
 
     /*
     1:
@@ -626,389 +894,173 @@ int main(int argc, char **argv) {
     auto label1Off = E.code.size();
     *jmp1Fix = int8_t(label1Off - jmp1Off);
     recovery();
-    emitDirectJmpStub(inst1, backAddr1);
+    emitOldInsts(r1);
+    emitJmpBack(r1);
   };
 
-  auto emitShortJmpNop = [&](uint64_t addr0, uint64_t addr1, uint64_t size1) {
-    while (size1 > 2) {
-      newText[addr1] = 0xf2; // repne
-      addr1++;
-      size1--;
+  auto modifyLongJmpNop = [&](AddrRange r0, uint64_t stubAddr) {
+    while (r0.size > 5) {
+      newText[r0.i.addr] = 0xf2; // repne
+      r0.i.addr++;
+      r0.size--;
     }
-    newText[addr1] = 0x74; // jmp
-    newText[addr1+1] = uint8_t(int8_t(int64_t(addr1+2)-int64_t(addr0)));
+    newText[r0.i.addr] = 0xe9; // jmp
+    E.relocText(r0.i.addr+1, stubAddr);
   };
 
-  auto emitLongJmpNop = [&](uint64_t addr, uint64_t size, uint64_t stubAddr) {
-    while (size > 5) {
-      newText[addr] = 0xf2; // repne
-      addr++;
-      size--;
+  auto modifyShortJmpNop = [&](AddrRange r0, AddrRange r1) {
+    while (r0.size > 2) {
+      newText[r0.size] = 0xf2; // repne
+      r0.i.addr++;
+      r0.size--;
     }
-    newText[addr] = 0xe9; // jmp
-    E.relocText(addr+1, stubAddr);
+    newText[r0.i.addr] = 0x74; // jmp
+    newText[r0.i.addr+1] = uint8_t(int8_t(int64_t(r0.i.addr+2)-int64_t(r1.i.addr)));
   };
 
-  auto modifyPushJmpInst0 = [&](uint64_t addr, uint64_t size, uint64_t stubAddr) {
-    newText[addr] = 0x54; // push %rsp
-    emitLongJmpNop(addr+1, size-1, stubAddr);
+  auto modifyPushRspJmpInst = [&](AddrRange r0, uint64_t stubAddr) {
+    newText[r0.i.addr] = 0x54; // push %rsp
+    r0.i.addr++;
+    r0.size--;
+    modifyLongJmpNop(r0, stubAddr);
   };
 
-  auto modifyPushJmpInst1 = [&](uint64_t addr0, uint64_t addr1, uint64_t size1) {
-    newText[addr1] = 0x9c; // pushf
-    emitShortJmpNop(addr0, addr1+1, size1-1);
+  auto modifyPushFJmpInst = [&](AddrRange r0, AddrRange r1) {
+    newText[r0.i.addr] = 0x9c; // pushf
+    r0.i.addr++;
+    r0.size--;
+    r1.i.addr++; // skip push %rsp
+    modifyShortJmpNop(r0, r1);
   };
 
-  enum {
-    kNormalOp,
-    kTlsStackCanary,
-    kTlsOp,
-    kSyscall,
-    kOpTypeNr,
+  auto singleAddrRange = [&](AddrAndIdx i) -> AddrRange {
+    AddrRange r;
+    r.i = i;
+    r.n = 1;
+    r.size = allOpcode[r.i.idx].size;
+    return r;
   };
 
-  const char *kOpTypeStrs[] = {
-    "normal_op",
-    "tls_stack_canary",
-    "tls_op_normal",
-    "syscall",
-  };
-
-  enum {
-    kNoJmp,
-    kIgnoreJmp,
-    kCanaryImm,
-    kDirectJmp,
-    kPushJmp,
-    kNoopJmp,
-    kCombineJmp,
-    kJmpFail,
-    kJmpTypeNr,
-  };
-
-  const char *kJmpTypeStrs[] = {
-    "no_jmp",
-    "ignore_jmp",
-    "canary_imm",
-    "direct_jmp",
-    "push_jmp",
-    "noop_jmp",
-    "combine_jmp",
-    "jmp_fail",
-  };
-
-  struct OpcodeAndSize {
-    uint16_t op;
-    uint8_t size;
-    char used:1;
-    char type:4;
-  } __attribute__((packed, aligned(4)));
-
-  struct AddrAndIdx {
-    uint64_t addr;
-    int idx;
-  };
-
-  struct JmpRes {
-    int type;
-    AddrAndIdx i;
-    int n;
-    int size;
-  };
-
-  std::vector<OpcodeAndSize> allOpcode;
-
-  auto forInstrAround = [&](AddrAndIdx ai, int maxDist, std::function<bool(AddrAndIdx i)> fn) -> bool {
-    auto addr = ai.addr;
-    for (int i = ai.idx; i > 0 && ai.addr-addr < maxDist; i--) {
-      if (i != ai.idx) {
-        if (fn({.addr = addr, .idx = i})) {
-          return true;
-        }
-      }
-      addr -= allOpcode[i-1].size;
-    }
-    addr = ai.addr;
-    for (int i = ai.idx; i < allOpcode.size() && addr-ai.addr < maxDist; i++) {
-      if (i != ai.idx) {
-        if (fn({.addr = addr, .idx = i})) {
-          return true;
-        }
-      }
-      addr += allOpcode[i].size;
-    }
-    return false;
-  };
-
-  auto constexpr X86_BAD = X86::INSTRUCTION_LIST_END+1;
-
-  auto decodeInstr = [&](uint64_t addr) -> OpcodeAndSize {
-    MCInst Inst;
-    uint64_t Size;
-    auto S = DisAsm->getInstruction(Inst, Size, instrBuf.slice(addr), 0, nulls());
-
-    if (S != MCDisassembler::DecodeStatus::Success) {
-      return {.op = X86_BAD, .size = 1, .type = kNormalOp};
-    }
-
-    switch (Inst.getOpcode()) {
-      case X86::NOOP:
-      case X86::NOOPL:
-      case X86::NOOPW:
-        return {.op = X86::NOOP, .size = (uint8_t)Size};
-    }
-
-    auto &idesc = MII->get(Inst.getOpcode());
-    char type = kNormalOp;
-    char used = 0;
-
-    if (Inst.getOpcode() == X86::SYSCALL) {
-      type = kSyscall;
-      used = 1;
-    } else {
-      for (int i = 0; i < idesc.NumOperands; i++) {
-        auto opinfo = idesc.OpInfo[i];
-        if (opinfo.RegClass == X86::SEGMENT_REGRegClassID) {
-          if (Inst.getOperand(i).getReg() == X86::FS) {
-            type = kTlsOp;
-            used = 1;
-            if (i > 0) {
-              auto preOp = Inst.getOperand(i-1);
-              if (preOp.isImm() && preOp.getImm() == 40) {
-                type = kTlsStackCanary;
-              }
-            }
-            break;
-          }
-        }
-      }
-    }
-
-    return {
-      .op = (uint16_t)Inst.getOpcode(),
-      .size = (uint8_t)Size,
-      .used = used,
-      .type = type,
-    };
-  };
-
-  std::vector<AddrAndIdx> fsInstrs;
-  std::vector<AddrAndIdx> badRanges;
-  const int BadMaxDiff = 100;
-
-  for (auto &sec: allSecs) {
-    sec.startIdx = allOpcode.size();
-    for (uint64_t addr = sec.start; addr < sec.end; ) {
-      auto op = decodeInstr(addr);
-
-      if (op.op == X86::NOOP) {
-        auto newaddr = addr + op.size;
-        while (newaddr < instrBuf.size()) {
-          auto op = decodeInstr(newaddr);
-          if (op.op != X86::NOOP) {
-            break;
-          }
-          newaddr += op.size;
-        }
-
-        int n = newaddr - addr;
-        while (n > 5) {
-          allOpcode.push_back({.op = X86::NOOP, .size = 5});
-          n -= 5;
-        }
-        allOpcode.push_back({.op = X86::NOOP, .size = (uint8_t)n});
-        addr = newaddr;
-        continue;
-      }
-
-      auto idx = (int)allOpcode.size();
-
-      if (op.op == X86_BAD) {
-        if (badRanges.size() == 0 ||
-            addr - badRanges[badRanges.size()-1].addr > BadMaxDiff)
-        {
-          badRanges.push_back({.addr = addr, .idx = idx});
-          badRanges.push_back({.addr = addr+op.size, .idx = idx+1});
-        } else {
-          badRanges[badRanges.size()-1] = {.addr = addr+op.size, .idx = idx+1};
-        }
-      }
-
-      if (op.type >= kTlsStackCanary) {
-        fsInstrs.push_back({.addr = addr, .idx = idx});
-      }
-
-      allOpcode.push_back(op);
-      addr += op.size;
-    }
-    sec.endIdx = allOpcode.size();
-  }
-
-  for (auto bi: badRanges) {
-    forInstrAround(bi, BadMaxDiff, [&](AddrAndIdx i) -> bool {
-      allOpcode[i.idx].used = 1;
-      return false;
-    });
-  }
-
-  if (debug) {
-    outs() << formatStr("bad ranges %lu:\n", badRanges.size());
-    for (int i = 0; i < badRanges.size(); i += 2) {
-      auto start = badRanges[i];
-      auto end = badRanges[i+1];
-      outs() << formatStr("addr %lx %lx len %lu n %d\n", vaddr(start.addr), vaddr(end.addr),
-        end.addr-start.addr, end.idx-start.idx);
-    }
-  }
-
-  auto inBadRange = [&](uint64_t addr) -> bool {
-    auto upper = std::upper_bound(badRanges.begin(), badRanges.end(), addr, 
-      [](uint64_t addr, const AddrAndIdx &i) -> bool {
-        return i.addr > addr;
-      });
-    if (upper == badRanges.end()) {
-      return false;
-    }
-    auto i = std::distance(badRanges.begin(), upper);
-    if (i%2 != 0) {
-      return true;
-    }
-    if (i > 0 && addr-badRanges[i-1].addr < BadMaxDiff) {
-      return true;
-    }
-    if (badRanges[i].addr-addr < BadMaxDiff) {
-      return true;
-    }
-    return false;
-  };
-
-  auto printInstr = [&](AddrAndIdx ai, JmpRes jmp) {
-    auto op = allOpcode[ai.idx];
-    auto addr = ai.addr;
-
-    std::string sep = " ";
-
-    auto formatInstHeader = [&](uint64_t addr, uint64_t size) -> std::string {
-      return formatStr("%lx%sn=%lu%s", vaddr(addr), sep.c_str(), size, sep.c_str());
-    };
-
-    if (op.op == X86_BAD) {
-      outs() << formatInstHeader(addr, op.size) << "BAD " << "\n";
-      return;
-    }
-
-    MCInst Inst;
-    uint64_t Size;
-
-    if (op.op == X86::NOOP) {
-      Inst.setOpcode(X86::NOOP);
-      Inst.setFlags(0);
-      Size = op.size;
-    } else {
-      DisAsm->getInstruction(Inst, Size, instrBuf.slice(addr), addr, nulls());
-    }
-
-    std::string tag = kJmpTypeStrs[jmp.type];
-
-    if (jmp.type == kPushJmp) {
-      auto rop = allOpcode[jmp.i.idx];
-      std::string name = IP->getOpcodeName(rop.op).str();
-      tag += formatStr(":%lu,%s,%d", rop.size, name.c_str(), std::abs((int64_t)(jmp.i.addr-addr)));
-    } else if (jmp.type == kCombineJmp) {
-      tag += formatStr(":%d,%d", jmp.size, jmp.n);
-    }
-
-    outs() << formatInstHeader(addr, Size) <<
-      IP->getOpcodeName(Inst.getOpcode()) <<
-      sep << kOpTypeStrs[op.type] <<
-      sep << tag << 
-      sep << instrDisStr(Inst) <<
-      sep << instrDumpStr(Inst) << 
-      sep << instrHexStr(instrBuf.slice(addr, Size)) << 
-      "\n";
-  };
-
-  int totOpType[kOpTypeNr] = {};
-  int totJmpType[kJmpTypeNr] = {};
-
-  auto findReplaceInstr = [&](AddrAndIdx i, AddrAndIdx &res, int size, bool noop) -> bool {
-    auto opIsValid = [](unsigned op, bool noop) -> bool {
-      if (noop) {
-        return op == X86::NOOP;
-      }
-      switch (op) {
-        case X86::MOV64rm:
-        case X86::MOV64mr:
-        case X86::LEA64r:
-        case X86::JCC_4:
-        case X86::MOV32rm:
-          return true;
-      }
-      return false;
-    };
-    return forInstrAround(i, 127, [&](AddrAndIdx i) -> bool {
-      auto op = &allOpcode[i.idx];
-      if (opIsValid(op->op, noop) && !op->used && op->size >= size) {
-        res = i;
-        return true;
-      }
-      return false;
-    });
-  };
-
-  auto doReplace = [&](AddrAndIdx i) {
+  auto replaceTls = [&](AddrAndIdx i) -> JmpRes {
     auto op = allOpcode[i.idx];
-    JmpRes jmp = {};
 
-    [&]() {
-      if (op.type == kTlsOp || op.type == kSyscall) {
-        if (inBadRange(i.addr)) {
-          jmp.type = kIgnoreJmp;
-          return;
-        }
-      }
+    if (op.size >= 5) {
+      return {
+        .type = kDirectJmp,
+        .r0 = singleAddrRange(i),
+      };
+    }
 
-      if (op.type == kTlsOp) {
-        if (op.size < 5) {
-          if (findReplaceInstr(i, jmp.i, 5, true)) {
-            jmp.type = kNoopJmp;
-            allOpcode[jmp.i.idx].used = 1;
-          } else if (findReplaceInstr(i, jmp.i, 6, false)) {
-            jmp.type = kPushJmp;
-            allOpcode[jmp.i.idx].used = 1;
-          } else {
-            jmp.type = kJmpFail;
-          }
-        } else {
-          jmp.type = kDirectJmp;
-        }
-      } else if (op.type == kSyscall) {
-        uint64_t addr = i.addr;
-        uint64_t size = op.size;
-        int j = i.idx-1;
-        int n = 1;
-        while (j >= 0 && size < 5) {
-          auto &op = allOpcode[j];
-          if (op.used) {
-            break;
-          }
-          op.used = 1;
-          size += op.size;
-          addr -= op.size;
-          j--;
-          n++;
-        }
-        if (size < 5) {
-          jmp.type = kJmpFail;
-        } else {
-          jmp.type = kCombineJmp;
-          jmp.i.addr = addr;
-          jmp.i.idx = j+1;
-          jmp.size = size;
-          jmp.n = n;
-        }
+    AddrAndIdx j;
+
+    if (forInstrAround(i, 127, [&](AddrAndIdx i) -> int {
+      auto op = allOpcode[i.idx];
+      if (isOpSupported(op.op) && !op.used && op.size >= 6) {
+        j = i;
+        return 0;
       }
-    }();
+      return -1;
+    })) {
+      allOpcode[j.idx].used = 1;
+      return {
+        .type = kPushJmp,
+        .r0 = singleAddrRange(j),
+        .r1 = singleAddrRange(i),
+      };
+    }
+
+    return {.type = kJmpFail};
+  };
+
+  auto replaceSyscall = [&](AddrAndIdx i0) -> JmpRes {
+    JmpRes res;
+    int err0, err1;
+
+    uint64_t size = 0;
+    for (int i = i0.idx; i > 0; i--) {
+      auto &op = allOpcode[i];
+      if (!isOpSupported(op.op)) {
+        err0 = 1;
+        break;
+      }
+      if (op.used && i != i0.idx) {
+        err0 = 2;
+        break;
+      }
+      size += op.size;
+      if (size >= 5) {
+        return {
+          .type = kCombineJmp,
+          .r0 = {
+            .i = {
+              .addr = i0.addr + allOpcode[i0.idx].size - size,
+              .idx = i,
+            },
+            .n = i0.idx - i + 1,
+            .size = size,
+          },
+        };
+      }
+      if (op.jmpto) {
+        err0 = 3;
+        break;
+      }
+    }
+
+    for (int i = i0.idx; i < allOpcode.size(); i++) {
+      auto &op = allOpcode[i];
+      if (!isOpSupported(op.op)) {
+        err1 = 1;
+        break;
+      }
+      if (op.used && i != i0.idx) {
+        err1 = 2;
+        break;
+      }
+      if (op.jmpto && i != i0.idx) {
+        err1 = 3;
+        break;
+      }
+      size += op.size;
+      if (size >= 5) {
+        return {
+          .type = kCombineJmp,
+          .r0 = {
+            .i = i0,
+            .n = i - i0.idx + 1,
+            .size = size,
+          },
+        };
+      }
+    }
+
+    if (debug) {
+      outs() << formatStr("syscall fail %d %d\n", err0, err1);
+    }
+
+    return {.type = kJmpFail};
+  };
+
+  auto doReplace = [&](AddrAndIdx i) -> JmpRes {
+    auto op = allOpcode[i.idx];
+    if (op.type == kTlsOp || op.type == kSyscall) {
+      if (op.bad) {
+        return {.type = kIgnoreJmp};
+      }
+    }
+
+    if (op.type == kTlsOp) {
+      return replaceTls(i);
+    } else if (op.type == kSyscall) {
+      return replaceSyscall(i);
+    } else {
+      return {.type = kNoJmp};
+    }
+  };
+
+  auto handleInstr = [&](AddrAndIdx i) {
+    auto op = allOpcode[i.idx];
+    JmpRes jmp = doReplace(i);
 
     totOpType[op.type]++;
     totJmpType[jmp.type]++;
@@ -1017,125 +1069,118 @@ int main(int argc, char **argv) {
       printInstr(i, jmp);
     }
 
+    auto stubAddr = E.code.size();
+    auto relocIdx = E.relocs.size();
+    auto stype = kJmpTypeStrs[jmp.type];
+
     if (jmp.type == kPushJmp) {
-      MCInst inst0, inst1;
-      uint64_t addr0 = jmp.i.addr;
-      uint64_t size0;
-      uint64_t addr1 = i.addr;
-      uint64_t size1;
-
-      DisAsm->getInstruction(inst0, size0, instrBuf.slice(addr0), 0, nulls());
-      DisAsm->getInstruction(inst1, size1, instrBuf.slice(addr1), 0, nulls());
-
-      auto stubAddr = E.code.size();
-      auto relocIdx = E.relocs.size();
-      auto stype = kJmpTypeStrs[jmp.type];
-
-      if (debug) {
-        disamInstrBuf(formatStr("%s_inst0_before", stype), {&newText[addr0], size0});
-        disamInstrBuf(formatStr("%s_inst1_before", stype), {&newText[addr1], size1});
-      }
-
-      emitPushJmpStub(inst0, addr0+size0, inst1, addr1+size1);
-      modifyPushJmpInst0(addr0, size0, stubAddr);
-      modifyPushJmpInst1(addr0, addr1, size1);
-
-      if (debug) {
-        disamInstrBuf(formatStr("%s_inst0_after", stype), {&newText[addr0], size0});
-        disamInstrBuf(formatStr("%s_inst1_after", stype), {&newText[addr1], size1});
-        disamInstrBuf(formatStr("%s_stub", stype), E.codeSlice(stubAddr));
-      }
-
-    } else if (jmp.type == kNoopJmp) {
-      MCInst inst0, inst1;
-      uint64_t addr0 = jmp.i.addr;
-      uint64_t size0 = 5;
-      uint64_t addr1 = i.addr;
-      uint64_t size1 = allOpcode[i.idx].size;
-
-      DisAsm->getInstruction(inst1, size1, instrBuf.slice(addr1), 0, nulls());
-
-      auto stubAddr = E.code.size();
-      auto relocIdx = E.relocs.size();
-      auto stype = kJmpTypeStrs[jmp.type];
-
-      if (debug) {
-        disamInstrBuf(formatStr("%s_inst1_before", stype), {&newText[addr1], size1});
-      }
-
-      emitDirectJmpStub(inst1, addr1+size1);
-      emitLongJmpNop(addr0, size0, stubAddr);
-      emitShortJmpNop(addr0, addr1, size1);
-
-      if (debug) {
-        disamInstrBuf(formatStr("%s_inst1_after", stype), {&newText[addr1], size1});
-        disamInstrBuf(formatStr("%s_stub", stype), E.codeSlice(stubAddr));
-      }
-
+      modifyPushFJmpInst(jmp.r1, jmp.r0);
+      modifyPushRspJmpInst(jmp.r0, stubAddr);
+      emitPushJmpStub(jmp.r0, jmp.r1);
     } else if (jmp.type == kDirectJmp) {
-      MCInst inst0;
-      uint64_t addr0 = i.addr;
-      uint64_t size0;
+      modifyLongJmpNop(jmp.r0, stubAddr);
+      emitDirectJmpStub(jmp.r0);
+    } else if (jmp.type == kCombineJmp) {
+      modifyLongJmpNop(jmp.r0, stubAddr);
+      emitDirectJmpStub(jmp.r0);
+    }
 
-      DisAsm->getInstruction(inst0, size0, instrBuf.slice(addr0), 0, nulls());
-
-      auto stubAddr = E.code.size();
-      auto relocIdx = E.relocs.size();
-      auto stype = kJmpTypeStrs[jmp.type];
-
-      if (debug) {
-        disamInstrBuf(formatStr("%s_inst_before", stype), {&newText[addr0], size0});
+    if (debug) {
+      if (jmp.r0.size) {
+        disamInstrBuf(formatStr("%s_inst0_before", stype), oldTextRange(jmp.r0));
+        disamInstrBuf(formatStr("%s_inst0_after", stype), newTextRange(jmp.r0));
       }
-
-      emitDirectJmpStub(inst0, addr0+size0);
-      emitLongJmpNop(addr0, size0, stubAddr);
-
-      if (debug) {
-        disamInstrBuf(formatStr("%s_inst_after", stype), {&newText[addr0], size0});
+      if (jmp.r1.size) {
+        disamInstrBuf(formatStr("%s_inst1_before", stype), oldTextRange(jmp.r1));
+        disamInstrBuf(formatStr("%s_inst1_after", stype), newTextRange(jmp.r1));
+      }
+      if (E.code.size() != stubAddr) {
         disamInstrBuf(formatStr("%s_stub", stype), E.codeSlice(stubAddr));
       }
-
-    } else if (jmp.type == kCombineJmp) {
-      uint64_t addr0 = jmp.i.addr;
-      uint64_t size0 = jmp.size;
-
-      auto stype = kJmpTypeStrs[jmp.type];
-      if (debug) {
-        disamInstrBuf(formatStr("%s_inst_before", stype), {&newText[addr0], size0});
-      }
-
     }
   };
 
-  auto forAllInstr = [&](std::function<void(AddrAndIdx)> fn) {
+  auto forAllInstr0 = [&](std::function<void(AddrAndIdx,const Section&)> fn) {
     for (auto sec: allSecs) {
       if (sec.startIdx == -1) {
         continue;
       }
-      if (debug) {
-        outs() << formatStr("disam section %s\n", sec.name.c_str());
-      }
       uint64_t addr = sec.start;
       for (int i = sec.startIdx; i < sec.endIdx; i++) {
-        fn({.addr = addr, .idx = i});
+        fn({.addr = addr, .idx = i}, sec);
         addr += allOpcode[i].size;
       }
     }
   };
 
+  auto forAllInstr = [&](std::function<void(AddrAndIdx)> fn) {
+    forAllInstr0([&](AddrAndIdx i, const Section& sec) {
+      fn(i);
+    });
+  };
+
+  auto markAllJmp = [&]() {
+    for (auto sec: allSecs) {
+      if (sec.startIdx == -1) {
+        continue;
+      }
+
+      std::vector<uint64_t> tos;
+      uint64_t addr = sec.start;
+      for (int i = sec.startIdx; i < sec.endIdx; addr += allOpcode[i].size, i++) {
+        auto &op = allOpcode[i];
+        if (op.bad) {
+          continue;
+        }
+        int32_t off;
+        if (op.op == X86::JCC_1 || op.op == X86::JMP_1) {
+          off = *(int8_t*)(instrBuf.data()+addr+op.size-1);
+        } else if (op.op == X86::JCC_4 || op.op == X86::JMP_4) {
+          off = *(int32_t*)(instrBuf.data()+addr+op.size-4);
+        } else {
+          continue;
+        }
+        auto to = addr+op.size+off;
+        if (to >= sec.start && to < sec.end) {
+          tos.push_back(to);
+        }
+      }
+
+      std::sort(tos.begin(), tos.end());
+      int n = 0;
+      int i = sec.startIdx;
+      addr = sec.start;
+      for (int ti = 0; ti < tos.size(); ti++) {
+        while (i < sec.endIdx && addr < tos[ti]) {
+          addr += allOpcode[i].size, i++;
+        }
+        if (addr == tos[ti]) {
+          allOpcode[i-1].jmpto = 1;
+          n++;
+        }
+      }
+
+      if (debug) {
+        outs() << formatStr("markjmp %d/%d\n", n, tos.size());
+      }
+    }
+  };
+
+  markAllJmp();
+
   if (forAll) {
     forAllInstr([&](AddrAndIdx i) {
-      doReplace(i);
+      handleInstr(i);
     });
   } else if (forSingleInstr != -1) {
     forAllInstr([&](AddrAndIdx i) {
       if (vaddr(i.addr) == forSingleInstr) {
-        doReplace(i);
+        handleInstr(i);
       }
     });
   } else {
     for (auto i: fsInstrs) {
-      doReplace(i);
+      handleInstr(i);
     }
   }
 
