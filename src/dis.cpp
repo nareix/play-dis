@@ -1081,6 +1081,18 @@ int main(int argc, char **argv) {
     return canReplaceInst(inst);
   };
 
+  auto markInstRangeUsed = [&](AddrRange r) {
+    for (int i = r.i.idx; i < r.i.idx+r.n; i++) {
+      allOpcode[i].used = 1;
+    }
+  };
+
+  auto markResInstUsed = [&](JmpRes r) -> JmpRes {
+    markInstRangeUsed(r.r0);
+    markInstRangeUsed(r.r1);
+    return r;
+  };
+
   auto checkPushJmp = [&](AddrAndIdx i, int minSize, int type) -> JmpRes {
     auto op = allOpcode[i.idx];
 
@@ -1098,12 +1110,11 @@ int main(int argc, char **argv) {
       }
       return -1;
     })) {
-      allOpcode[j.idx].used = 1;
-      return {
+      return markResInstUsed({
         .type = type,
         .r0 = singleAddrRange(j),
         .r1 = singleAddrRange(i),
-      };
+      });
     }
 
     return {.type = kJmpFail};
@@ -1126,7 +1137,7 @@ int main(int argc, char **argv) {
       }
       size += op.size;
       if (size >= 5) {
-        return {
+        return markResInstUsed({
           .type = kCombineJmp,
           .r0 = {
             .i = {
@@ -1136,7 +1147,7 @@ int main(int argc, char **argv) {
             .n = i0.idx - i + 1,
             .size = size,
           },
-        };
+        });
       }
       if (op.jmpto) {
         logJmpFail(addr, "jmpto");
@@ -1164,14 +1175,14 @@ int main(int argc, char **argv) {
       size += op.size;
       addr += op.size;
       if (size >= 5) {
-        return {
+        return markResInstUsed({
           .type = kCombineJmp,
           .r0 = {
             .i = i0,
             .n = i - i0.idx + 1,
             .size = size,
           },
-        };
+        });
       }
     }
 
