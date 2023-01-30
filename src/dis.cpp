@@ -86,6 +86,12 @@ int main(int argc, char **argv) {
       debug = true;
       continue;
     }
+    if (o == "-vad") {
+      debug = true;
+      forAll = true;
+      verbose = true;
+      continue;
+    }
     if (o == "-donlybefore") {
       debugOnlyBefore = true;
       continue;
@@ -454,6 +460,7 @@ int main(int argc, char **argv) {
     kIgnoreJmp,
     kDirectJmp,
     kPushJmp,
+    kPushJmp2,
     kCombineJmp,
     kJmpFail,
     kJmpTypeNr,
@@ -464,6 +471,7 @@ int main(int argc, char **argv) {
     "ignore_jmp",
     "direct_jmp",
     "push_jmp",
+    "push_jmp2",
     "combine_jmp",
     "jmp_fail",
   };
@@ -949,11 +957,11 @@ int main(int argc, char **argv) {
     emitJmpBack(r0);
   };
 
-  auto emitPushJmpStub = [&](AddrRange r0, AddrRange r1) {
+  auto emitPushJmpStub = [&](AddrRange r0, AddrRange r1, bool pushF = true) {
     /*
       push %rax; pushfq // save rax,eflags
-      mov 16(%rsp),%rax; cmp (%rsp),%rax // check jmpval == eflags
-      je 1f
+      lea -16(%rsp),%rax; cmp 16(%rsp),%rax // check jmpval == %rsp
+      jne 1f
     */
     E.emit(MCInstBuilder(X86::PUSH64r).addReg(X86::RAX));
     E.emit(MCInstBuilder(X86::PUSHF64));
@@ -961,40 +969,46 @@ int main(int argc, char **argv) {
       .addReg(X86::RAX).addReg(X86::RSP).addImm(1).addReg(0).addImm(16).addReg(0));
     E.emit(MCInstBuilder(X86::CMP64rm)
       .addReg(X86::RAX).addReg(X86::RSP).addImm(1).addReg(0).addImm(0).addReg(0));
-    E.emit(MCInstBuilder(X86::JCC_1).addImm(0).addImm(4));
+    E.emit(MCInstBuilder(X86::JCC_1).addImm(0).addImm(5)); // 4=je 5=jne
     auto jmp1Off = E.code.size();
     auto jmp1Fix = (uint8_t *)&E.code[E.code.size()-1];
 
-    auto recovery = [&]() {
+    auto recovery = [&](bool addRsp) {
+      /* 
+        popfd; pop %rax;
+        [optional] lea 8(%rsp),%rsp 
+      */
       E.emit(MCInstBuilder(X86::POPF64));
       E.emit(MCInstBuilder(X86::POP64r).addReg(X86::RAX));
-      E.emit(MCInstBuilder(X86::LEA64r)
-        .addReg(X86::RSP).addReg(X86::RSP).addImm(1).addReg(0).addImm(8).addReg(0));
+      if (addRsp) {
+        E.emit(MCInstBuilder(X86::LEA64r)
+          .addReg(X86::RSP).addReg(X86::RSP).addImm(1).addReg(0).addImm(8).addReg(0));
+      }
     };
 
     /*
-      popfd; pop %rax; lea 8(%rsp),%rsp // recover rax,eflags,rsp
+      recovery
       normal_op
       jmp back0
     */
-    recovery();
+    recovery(pushF);
     emitOldInsts(r0);
     emitJmpBack(r0);
 
     /*
     1:
-      popfd; pop %rax; lea 8(%rsp),%rsp // recover rax,eflags,rsp
+      recovery
       tls_op
       jmp back1
     */
     auto label1Off = E.code.size();
     *jmp1Fix = int8_t(label1Off - jmp1Off);
-    recovery();
+    recovery(true);
     emitOldInsts(r1);
     emitJmpBack(r1);
   };
 
-  auto modifyLongJmpNop = [&](AddrRange r0, uint64_t stubAddr) {
+  auto modifyLongJmp = [&](AddrRange r0, uint64_t stubAddr) {
     while (r0.size > 5) {
       newText[r0.i.addr] = 0xf2; // repne
       r0.i.addr++;
@@ -1004,7 +1018,7 @@ int main(int argc, char **argv) {
     E.relocText(r0.i.addr+1, stubAddr);
   };
 
-  auto modifyShortJmpNop = [&](AddrRange r0, AddrRange r1) {
+  auto modifyShortJmp = [&](AddrRange r0, AddrRange r1) {
     while (r0.size > 2) {
       newText[r0.i.addr] = 0xf2; // repne
       r0.i.addr++;
@@ -1014,19 +1028,19 @@ int main(int argc, char **argv) {
     newText[r0.i.addr+1] = uint8_t(int8_t(int64_t(r0.i.addr+2)-int64_t(r1.i.addr)));
   };
 
-  auto modifyPushRspJmpInst = [&](AddrRange r0, uint64_t stubAddr) {
+  auto modifyPushRspJmp = [&](AddrRange r0, uint64_t stubAddr) {
     newText[r0.i.addr] = 0x54; // push %rsp
     r0.i.addr++;
     r0.size--;
-    modifyLongJmpNop(r0, stubAddr);
+    modifyLongJmp(r0, stubAddr);
   };
 
-  auto modifyPushFJmpInst = [&](AddrRange r0, AddrRange r1) {
+  auto modifyPushFJmp = [&](AddrRange r0, AddrRange r1) {
     newText[r0.i.addr] = 0x9c; // pushf
     r0.i.addr++;
     r0.size--;
     r1.i.addr++; // skip push %rsp
-    modifyShortJmpNop(r0, r1);
+    modifyShortJmp(r0, r1);
   };
 
   auto singleAddrRange = [&](AddrAndIdx i) -> AddrRange {
@@ -1067,10 +1081,10 @@ int main(int argc, char **argv) {
     return canReplaceInst(inst);
   };
 
-  auto checkPushJmp = [&](AddrAndIdx i) -> JmpRes {
+  auto checkPushJmp = [&](AddrAndIdx i, int minSize, int type) -> JmpRes {
     auto op = allOpcode[i.idx];
 
-    if (op.size < 3) {
+    if (op.size < minSize) {
       return {.type = kJmpFail};
     }
 
@@ -1086,7 +1100,7 @@ int main(int argc, char **argv) {
     })) {
       allOpcode[j.idx].used = 1;
       return {
-        .type = kPushJmp,
+        .type = type,
         .r0 = singleAddrRange(j),
         .r1 = singleAddrRange(i),
       };
@@ -1186,16 +1200,21 @@ int main(int argc, char **argv) {
       };
     }
 
-    if (op.type == kTlsOp) {
-      auto res = checkPushJmp(i);
-      if (res.type != kJmpFail) {
-        return res;
-      }
-      return checkCombineJmp(i);
+    JmpRes res;
+
+    res = checkPushJmp(i, 3, kPushJmp);
+    if (res.type != kJmpFail) {
+      return res;
     }
 
-    if (op.type == kSyscall) {
-      return checkCombineJmp(i);
+    res = checkPushJmp(i, 2, kPushJmp2);
+    if (res.type != kJmpFail) {
+      return res;
+    }
+
+    res = checkCombineJmp(i);
+    if (res.type != kJmpFail) {
+      return res;
     }
 
     return {.type = kJmpFail};
@@ -1218,14 +1237,18 @@ int main(int argc, char **argv) {
     auto stype = kJmpTypeStrs[jmp.type];
 
     if (jmp.type == kPushJmp) {
-      modifyPushFJmpInst(jmp.r1, jmp.r0);
-      modifyPushRspJmpInst(jmp.r0, stubAddr);
+      modifyPushFJmp(jmp.r1, jmp.r0);
+      modifyPushRspJmp(jmp.r0, stubAddr);
       emitPushJmpStub(jmp.r0, jmp.r1);
+    } else if (jmp.type == kPushJmp2) {
+      modifyShortJmp(jmp.r1, jmp.r0);
+      modifyPushRspJmp(jmp.r0, stubAddr);
+      emitPushJmpStub(jmp.r0, jmp.r1, false);
     } else if (jmp.type == kDirectJmp) {
-      modifyLongJmpNop(jmp.r0, stubAddr);
+      modifyLongJmp(jmp.r0, stubAddr);
       emitDirectJmpStub(jmp.r0);
     } else if (jmp.type == kCombineJmp) {
-      modifyLongJmpNop(jmp.r0, stubAddr);
+      modifyLongJmp(jmp.r0, stubAddr);
       emitDirectJmpStub(jmp.r0);
     }
 
@@ -1234,17 +1257,11 @@ int main(int argc, char **argv) {
         disamInstrBuf(fmt("%s_inst0_before", stype), oldTextRange(jmp.r0));
         disamInstrBuf(fmt("%s_inst1_before", stype), oldTextRange(jmp.r1));
       } else {
-        if (jmp.r0.size) {
-          disamInstrBuf(fmt("%s_inst0_before", stype), oldTextRange(jmp.r0));
-          disamInstrBuf(fmt("%s_inst0_after", stype), newTextRange(jmp.r0));
-        }
-        if (jmp.r1.size) {
-          disamInstrBuf(fmt("%s_inst1_before", stype), oldTextRange(jmp.r1));
-          disamInstrBuf(fmt("%s_inst1_after", stype), newTextRange(jmp.r1));
-        }
-        if (E.code.size() != stubAddr) {
-          disamInstrBuf(fmt("%s_stub", stype), E.codeSlice(stubAddr));
-        }
+        disamInstrBuf(fmt("%s_inst0_before", stype), oldTextRange(jmp.r0));
+        disamInstrBuf(fmt("%s_inst0_after", stype), newTextRange(jmp.r0));
+        disamInstrBuf(fmt("%s_inst1_before", stype), oldTextRange(jmp.r1));
+        disamInstrBuf(fmt("%s_inst1_after", stype), newTextRange(jmp.r1));
+        disamInstrBuf(fmt("%s_stub", stype), E.codeSlice(stubAddr));
       }
     }
   };
