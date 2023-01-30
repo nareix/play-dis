@@ -92,7 +92,7 @@ int main(int argc, char **argv) {
       verbose = true;
       continue;
     }
-    if (o == "-donlybefore") {
+    if (o == "-dob") {
       debugOnlyBefore = true;
       continue;
     }
@@ -274,6 +274,7 @@ int main(int argc, char **argv) {
   };
 
   auto gpFreeStart = gpRegIdx(X86::RCX);
+  auto gpRspIdx = gpRegIdx(X86::RSP);
 
   auto gpFindFreeReg = [&](unsigned mask) -> int {
     for (int i = gpFreeStart; i < gpRegs.size(); i++) {
@@ -526,7 +527,7 @@ int main(int argc, char **argv) {
 
   using SmallCode = SmallString<256>;
 
-  auto disamInstrBuf = [&](const std::string &prefix, ArrayRef<uint8_t> buf) {
+  auto disamInstrBuf = [&](const std::string &prefix, ArrayRef<uint8_t> buf, uint64_t va = 0) {
     MCInst Inst;
     uint64_t Size;
     for (int addr = 0; addr < buf.size(); ) {
@@ -541,7 +542,7 @@ int main(int argc, char **argv) {
         dump = instrDumpStr(Inst);
       }
     print:
-      outs() << prefix << " " << fmt("%lx", addr) << 
+      outs() << prefix << " " << fmt("%lx", addr+va) << 
         " " << dis << 
         " " << dump << 
         " " << instrHexStr(buf.slice(addr,  Size)) << 
@@ -865,8 +866,9 @@ int main(int argc, char **argv) {
     auto backAddr1 = addr1+size1;
 
     /*
-      push %tmp // save tmp
+      push %tmp; lea 8(%rsp), %rsp // save tmp,rsp(optional)
       lea inst1.mem, %tmp // get orig value
+      lea -8(%rsp), %rsp // recovery rsp(optional)
       push %rax; call get_fs; lea (%rax,%tmp), %tmp; pop %rax // add fs
       inst1.op inst1.reg, (%tmp) // modified instr
       pop %tmp // recovery tmp
@@ -875,13 +877,20 @@ int main(int argc, char **argv) {
     if (info.mIdx == -1) {
       panicUnsupportedInstr(inst1);
     }
-    int ti = gpFindFreeReg(instrUsedRegMask(inst1));
+    unsigned used = instrUsedRegMask(inst1);
+    int ti = gpFindFreeReg(used);
     if (ti == -1) {
       panicUnsupportedInstr(inst1);
     }
     unsigned tmpReg = gpRegs[ti];
+    bool useRsp = used & (1<<gpRspIdx);
 
     E.emit(MCInstBuilder(X86::PUSH64r).addReg(tmpReg));
+
+    if (useRsp) {
+      E.emit(MCInstBuilder(X86::LEA64r)
+        .addReg(X86::RSP).addReg(X86::RSP).addImm(1).addReg(0).addImm(-8).addReg(0));
+    }
 
     MCInst lea;
     lea.setOpcode(X86::LEA64r);
@@ -892,6 +901,11 @@ int main(int argc, char **argv) {
     lea.getOperand(5).setReg(0);
     E.emit(lea);
     adjustImm4(lea, backAddr1);
+
+    if (useRsp) {
+      E.emit(MCInstBuilder(X86::LEA64r)
+        .addReg(X86::RSP).addReg(X86::RSP).addImm(1).addReg(0).addImm(8).addReg(0));
+    }
 
     E.emit(MCInstBuilder(X86::PUSH64r).addReg(X86::RAX));
 
@@ -1018,14 +1032,15 @@ int main(int argc, char **argv) {
     E.relocText(r0.i.addr+1, stubAddr);
   };
 
-  auto modifyShortJmp = [&](AddrRange r0, AddrRange r1) {
+  auto modifyShortJmp = [&](AddrRange r0, AddrRange r1, int off1 = 0) {
     while (r0.size > 2) {
       newText[r0.i.addr] = 0xf2; // repne
       r0.i.addr++;
       r0.size--;
     }
-    newText[r0.i.addr] = 0x74; // jmp
-    newText[r0.i.addr+1] = uint8_t(int8_t(int64_t(r0.i.addr+2)-int64_t(r1.i.addr)));
+    auto addr1 = r1.i.addr + off1;
+    newText[r0.i.addr] = 0xeb; // jmp
+    newText[r0.i.addr+1] = uint8_t(int8_t(int64_t(r0.i.addr+2)-int64_t(addr1)));
   };
 
   auto modifyPushRspJmp = [&](AddrRange r0, uint64_t stubAddr) {
@@ -1039,8 +1054,7 @@ int main(int argc, char **argv) {
     newText[r0.i.addr] = 0x9c; // pushf
     r0.i.addr++;
     r0.size--;
-    r1.i.addr++; // skip push %rsp
-    modifyShortJmp(r0, r1);
+    modifyShortJmp(r0, r1, 1); // skip push %rsp
   };
 
   auto singleAddrRange = [&](AddrAndIdx i) -> AddrRange {
@@ -1252,7 +1266,7 @@ int main(int argc, char **argv) {
       modifyPushRspJmp(jmp.r0, stubAddr);
       emitPushJmpStub(jmp.r0, jmp.r1);
     } else if (jmp.type == kPushJmp2) {
-      modifyShortJmp(jmp.r1, jmp.r0);
+      modifyShortJmp(jmp.r1, jmp.r0, 1);
       modifyPushRspJmp(jmp.r0, stubAddr);
       emitPushJmpStub(jmp.r0, jmp.r1, false);
     } else if (jmp.type == kDirectJmp) {
@@ -1264,15 +1278,23 @@ int main(int argc, char **argv) {
     }
 
     if (debug) {
+      auto D = [&](const char *s, ArrayRef<uint8_t> buf, uint64_t va) {
+        disamInstrBuf(fmt("%s_%s", stype, s), buf, va);
+      };
+      auto D2 = [&](const char *s, const uint8_t *base, AddrRange r) {
+        D(s, {base+r.i.addr,r.size}, vaddr(r.i.addr));
+      };
+      auto oldp = instrBuf.data();
+      auto newp = newText.data();
       if (debugOnlyBefore) {
-        disamInstrBuf(fmt("%s_inst0_before", stype), oldTextRange(jmp.r0));
-        disamInstrBuf(fmt("%s_inst1_before", stype), oldTextRange(jmp.r1));
+        D2("inst0_before", oldp, jmp.r0);
+        D2("inst1_before", oldp, jmp.r1);
       } else {
-        disamInstrBuf(fmt("%s_inst0_before", stype), oldTextRange(jmp.r0));
-        disamInstrBuf(fmt("%s_inst0_after", stype), newTextRange(jmp.r0));
-        disamInstrBuf(fmt("%s_inst1_before", stype), oldTextRange(jmp.r1));
-        disamInstrBuf(fmt("%s_inst1_after", stype), newTextRange(jmp.r1));
-        disamInstrBuf(fmt("%s_stub", stype), E.codeSlice(stubAddr));
+        D2("inst0_before", oldp, jmp.r0);
+        D2("inst0_after", newp, jmp.r0);
+        D2("inst1_before", oldp, jmp.r1);
+        D2("inst1_after", newp, jmp.r1);
+        D("stub", E.codeSlice(stubAddr), stubAddr);
       }
     }
   };
