@@ -1160,8 +1160,16 @@ int main(int argc, char **argv) {
     return res;
   };
 
-  auto replaceTls = [&](AddrAndIdx i) -> JmpRes {
+  auto doReplace = [&](AddrAndIdx i) -> JmpRes {
     auto op = allOpcode[i.idx];
+
+    if (op.type == kNormalOp) {
+      return {.type = kNoJmp};
+    }
+
+    if (op.bad) {
+      return {.type = kIgnoreJmp};
+    }
 
     if (op.size >= 5) {
       return {
@@ -1170,38 +1178,19 @@ int main(int argc, char **argv) {
       };
     }
 
-    auto res = checkPushJmp(i);
-    if (res.type != kJmpFail) {
-      return res;
+    if (op.type == kTlsOp) {
+      auto res = checkPushJmp(i);
+      if (res.type != kJmpFail) {
+        return res;
+      }
+      return checkCombineJmp(i);
     }
 
-    res = checkCombineJmp(i);
-    if (res.type != kJmpFail) {
-      return res;
+    if (op.type == kSyscall) {
+      return checkCombineJmp(i);
     }
 
     return {.type = kJmpFail};
-  };
-
-  auto replaceSyscall = [&](AddrAndIdx i) -> JmpRes {
-    return checkCombineJmp(i);
-  };
-
-  auto doReplace = [&](AddrAndIdx i) -> JmpRes {
-    auto op = allOpcode[i.idx];
-    if (op.type == kTlsOp || op.type == kSyscall) {
-      if (op.bad) {
-        return {.type = kIgnoreJmp};
-      }
-    }
-
-    if (op.type == kTlsOp) {
-      return replaceTls(i);
-    } else if (op.type == kSyscall) {
-      return replaceSyscall(i);
-    } else {
-      return {.type = kNoJmp};
-    }
   };
 
   auto handleInstr = [&](AddrAndIdx i) {
