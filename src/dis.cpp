@@ -480,10 +480,10 @@ int main(int argc, char **argv) {
   struct OpcodeAndSize {
     uint16_t op;
     unsigned size:5;
-    char used:1;
-    char type:3;
-    char jmpto:1;
-    char bad:1;
+    unsigned used:1;
+    unsigned type:3;
+    unsigned jmpto:1;
+    unsigned bad:1;
   } __attribute__((packed, aligned(4)));
   static_assert(sizeof(OpcodeAndSize) == 4, "");
 
@@ -516,14 +516,6 @@ int main(int argc, char **argv) {
   };
 
   std::vector<OpcodeAndSize> allOpcode;
-
-  auto newTextRange = [&](AddrRange r) -> ArrayRef<uint8_t> {
-    return {newText.data() + r.i.addr, r.size};
-  };
-
-  auto oldTextRange = [&](AddrRange r) -> ArrayRef<uint8_t> {
-    return {instrBuf.data() + r.i.addr, r.size};
-  };
 
   using SmallCode = SmallString<256>;
 
@@ -589,8 +581,8 @@ int main(int argc, char **argv) {
     }
 
     auto &idesc = MII->get(Inst.getOpcode());
-    char type = kNormalOp;
-    char used = 0;
+    unsigned type = kNormalOp;
+    unsigned used = 0;
 
     if (Inst.getOpcode() == X86::SYSCALL) {
       type = kSyscall;
@@ -627,14 +619,22 @@ int main(int argc, char **argv) {
   std::vector<AddrAndIdx> badRanges;
   const int BadMaxDiff = 100;
 
-  std::hash<std::string_view> strhash;
-
   auto instStrview = [&](AddrAndIdx i) -> std::string_view {
     return {(char *)instrBuf.data()+i.addr, allOpcode[i.idx].size};
   };
 
-  using OccurPair = std::pair<std::string_view, int>;
-  std::unordered_map<size_t, OccurPair> instOccur;
+  std::hash<std::string_view> strhash;
+
+  auto instHash = [&](AddrAndIdx i) -> size_t {
+    return strhash(instStrview(i));
+  };
+
+  struct OccurPair {
+    AddrAndIdx i;
+    int n;
+  };
+  std::vector<OccurPair> instOccur;
+  std::unordered_map<size_t, int> instOccurMap;
 
   for (auto &sec: allSecs) {
     sec.startIdx = allOpcode.size();
@@ -664,45 +664,45 @@ int main(int argc, char **argv) {
 
       if (op.type != kNormalOp) {
         if (op.size >= 5) {
-          auto view = instStrview(ai);
-          auto h = strhash(view);
-          auto v = instOccur.try_emplace(h);
-          auto &p = v.first->second;
-          p.first = view;
-          p.second++;
+          auto h = instHash(ai);
+          auto mi = instOccurMap.emplace(h, (int)instOccur.size());
+          int oi;
+          if (mi.second) {
+            oi = instOccur.size();
+            instOccur.push_back({});
+          } else {
+            oi = mi.first->second;
+          }
+          auto &p = instOccur[oi];
+          p.i = ai;
+          p.n++;
         }
       }
     }
     sec.endIdx = allOpcode.size();
   }
 
-  std::unordered_map<size_t, int> instOccur2;
-  {
-    std::vector<std::pair<size_t,OccurPair>> a;
-    for (auto v: instOccur) {
-      a.push_back(v);
+  if (debug) {
+    std::vector<int> sortIdx;
+    for (int i = 0; i < instOccur.size(); i++) {
+      sortIdx.push_back(i);
     }
-    std::sort(a.begin(), a.end(), [](auto &l, auto &r) {
-      return l.second.second > r.second.second;
+    std::sort(sortIdx.begin(), sortIdx.end(), [&](auto &l, auto &r) {
+      return instOccur[l].n > instOccur[r].n;
     });
-    for (int i = 0; i < a.size(); i++) {
-      auto h = a[i].first;
-      instOccur2[h] = i;
-    }
 
-    if (debug) {
-      for (int i = 0; i < a.size(); i++) {
-        MCInst Inst;
-        uint64_t Size;
-        auto p = a[i].second;
-        auto view = p.first;
-        auto n = p.second;
-        DisAsm->getInstruction(Inst, Size, {(uint8_t*)view.data(), view.size()}, 0, nulls());
-        auto s = instrDisStr(Inst);
-        outsfmt("instoccur %d %s %d\n", i, s.c_str(), n);
-      }
+      for (int i = 0; i < sortIdx.size(); i++) {
+      MCInst Inst;
+      uint64_t Size;
+      auto p = instOccur[sortIdx[i]];
+      auto op = allOpcode[p.i.idx];
+      ArrayRef<uint8_t> b = {instrBuf.data() + p.i.addr, op.size};
+      DisAsm->getInstruction(Inst, Size, b, 0, nulls());
+      auto s = instrDisStr(Inst);
+      auto bs = instrHexStr(b);
+      outsfmt("instoccur %d %s %s %d\n", i, s.c_str(), bs.c_str(), p.n);
     }
-  }
+   }
 
   for (auto bi: badRanges) {
     for (int i = 0; i < badRanges.size(); i += 2) {
@@ -789,6 +789,7 @@ int main(int argc, char **argv) {
   enum {
     kFnGetTls,
     kFnSyscall,
+    kFnNr,
   };
 
   struct SimpleReloc {
@@ -858,6 +859,11 @@ int main(int argc, char **argv) {
     }
   };
 
+  auto emitCallFn = [&](int fn) {
+    E.emit(MCInstBuilder(X86::CALL64pcrel32).addImm(0));
+    E.relocStub(fn, kRelCall);
+  };
+
   auto emitOldTlsInst = [&](AddrAndIdx i) {
     MCInst inst1;
     uint64_t size1;
@@ -909,8 +915,7 @@ int main(int argc, char **argv) {
 
     E.emit(MCInstBuilder(X86::PUSH64r).addReg(X86::RAX));
 
-    E.emit(MCInstBuilder(X86::CALL64pcrel32).addImm(0));
-    E.relocStub(kFnGetTls, kRelCall);
+    emitCallFn(kFnGetTls);
 
     E.emit(MCInstBuilder(X86::LEA64r)
       .addReg(tmpReg).addReg(X86::RAX).addImm(1).addReg(tmpReg).addImm(0).addReg(0));
@@ -935,8 +940,7 @@ int main(int argc, char **argv) {
     auto backAddr = addr+size;
 
     if (inst.getOpcode() == X86::SYSCALL) {
-      E.emit(MCInstBuilder(X86::CALL64pcrel32).addImm(0));
-      E.relocStub(kFnSyscall, kRelCall);
+      emitCallFn(kFnSyscall);
       return;
     }
 
@@ -969,6 +973,12 @@ int main(int argc, char **argv) {
   auto emitDirectJmpStub = [&](AddrRange r0) {
     emitOldInsts(r0);
     emitJmpBack(r0);
+  };
+
+  auto emitDirectCallStub = [&](AddrRange r0) {
+    E.emit(MCInstBuilder(X86::ENDBR64));
+    emitOldInsts(r0);
+    E.emit(MCInstBuilder(X86::RET));
   };
 
   auto emitPushJmpStub = [&](AddrRange r0, AddrRange r1, bool pushF = true) {
@@ -1055,6 +1065,16 @@ int main(int argc, char **argv) {
     r0.i.addr++;
     r0.size--;
     modifyShortJmp(r0, r1, 1); // skip push %rsp
+  };
+
+  auto modifyCall = [&](AddrRange r0, int fn) {
+    assert(r0.size >= 5);
+    while (r0.size > 5) {
+      newText[r0.i.addr++] = 0xf2;
+      r0.size--;
+    }
+    newText[r0.i.addr++] = 0xe8;
+    *(int32_t *)&newText[r0.i.addr] = fn;
   };
 
   auto singleAddrRange = [&](AddrAndIdx i) -> AddrRange {
@@ -1270,8 +1290,10 @@ int main(int argc, char **argv) {
       modifyPushRspJmp(jmp.r0, stubAddr);
       emitPushJmpStub(jmp.r0, jmp.r1, false);
     } else if (jmp.type == kDirectJmp) {
-      modifyLongJmp(jmp.r0, stubAddr);
-      emitDirectJmpStub(jmp.r0);
+      auto i = instOccurMap.find(instHash(jmp.r0.i));
+      assert(i != instOccurMap.end());
+      int fn = i->second;
+      modifyCall(jmp.r0, fn);
     } else if (jmp.type == kCombineJmp) {
       modifyLongJmp(jmp.r0, stubAddr);
       emitDirectJmpStub(jmp.r0);
