@@ -329,6 +329,7 @@ int main(int argc, char **argv) {
     int immIdx;
     int regIdx;
     int regIdx1;
+    int useReg;
   };
 
   #define panicUnsupportedInstr(inst) {\
@@ -342,39 +343,53 @@ int main(int argc, char **argv) {
 
   auto isOpSupported = [&](unsigned op) -> bool {
     #define C(op) case X86::op: 
-    #define R0(...) return true;
-    #define R(...) return true;
+    #define E() return true;
 
     switch (op) {
       #include "inst.inc"
     }
-    return false;
 
-    #undef C
-    #undef R
-    #undef R0
+    return false;
   };
 
   auto getInstrInfo = [&](const MCInst &inst) -> InstrInfo {
     auto n = inst.getNumOperands();
+    InstrInfo r = {
+      .mIdx = -1,
+      .immIdx = -1,
+      .regIdx = -1,
+      .regIdx1 = -1,
+      .useReg = -1,
+    };
+
     #define C(op) case X86::op: 
-    #define R0(m, imm, r0, r1) return {.mIdx = m, .immIdx = imm, .regIdx = r0, .regIdx1 = r1};
-    #define R(n_, m, imm, r0, r1) if (n != n_) panicUnsupportedInstr(inst); R0(m, imm, r0, r1)
+    #define M(v) r.mIdx = v;
+    #define IMM(v) r.immIdx = v;
+    #define R(v) r.regIdx = v;
+    #define R1(v) r.regIdx1 = v;
+    #define N(v) if (inst.getNumOperands() != v) panicUnsupportedInstr(inst);
+    #define E() return r;
+    #define USE(v) r.useReg = X86::v;
 
     switch (inst.getOpcode()) {
       #include "inst.inc"
     }
 
     panicUnsupportedInstr(inst);
-
-    #undef C
-    #undef R
-    #undef R0
   };
 
   auto instrUsedRegMask = [&](const MCInst &inst) -> unsigned {
     unsigned mask = 0;
     auto info = getInstrInfo(inst);
+
+    auto addR = [&](unsigned r) {
+      unsigned sr = superReg(r);
+      int i = gpRegIdx(sr);
+      if (i == -1) {
+        panicUnsupportedInstr(inst);
+      }
+      mask |= 1<<i;
+    };
 
     auto add = [&](int oi) {
       auto o = inst.getOperand(oi);
@@ -385,13 +400,12 @@ int main(int argc, char **argv) {
       if (r == 0) {
         return;
       }
-      unsigned sr = superReg(r);
-      int i = gpRegIdx(sr);
-      if (i == -1) {
-        panicUnsupportedInstr(inst);
-      }
-      mask |= 1<<i;
+      addR(r);
     };
+
+    if (info.useReg != -1) {
+      addR(info.useReg);
+    }
 
     if (info.mIdx != -1) {
       add(info.mIdx + 0);
@@ -471,6 +485,7 @@ int main(int argc, char **argv) {
     AddrRange r0;
     AddrRange r1;
     int err;
+    int err1;
   };
 
   std::vector<OpcodeAndSize> allOpcode;
@@ -941,15 +956,8 @@ int main(int argc, char **argv) {
     return r;
   };
 
-  auto replaceTls = [&](AddrAndIdx i) -> JmpRes {
+  auto checkPushJmp = [&](AddrAndIdx i) -> JmpRes {
     auto op = allOpcode[i.idx];
-
-    if (op.size >= 5) {
-      return {
-        .type = kDirectJmp,
-        .r0 = singleAddrRange(i),
-      };
-    }
 
     AddrAndIdx j;
 
@@ -972,19 +980,18 @@ int main(int argc, char **argv) {
     return {.type = kJmpFail};
   };
 
-  auto replaceSyscall = [&](AddrAndIdx i0) -> JmpRes {
-    JmpRes res;
-    int err0, err1;
+  auto checkCombineJmp = [&](AddrAndIdx i0) -> JmpRes {
+    JmpRes res = {.type = kJmpFail};
 
     uint64_t size = 0;
     for (int i = i0.idx; i > 0; i--) {
       auto &op = allOpcode[i];
       if (!isOpSupported(op.op)) {
-        err0 = 1;
+        res.err = 1;
         break;
       }
       if (op.used && i != i0.idx) {
-        err0 = 2;
+        res.err = 2;
         break;
       }
       size += op.size;
@@ -1002,7 +1009,7 @@ int main(int argc, char **argv) {
         };
       }
       if (op.jmpto) {
-        err0 = 3;
+        res.err = 3;
         break;
       }
     }
@@ -1010,15 +1017,15 @@ int main(int argc, char **argv) {
     for (int i = i0.idx; i < allOpcode.size(); i++) {
       auto &op = allOpcode[i];
       if (!isOpSupported(op.op)) {
-        err1 = 1;
+        res.err1 = 1;
         break;
       }
       if (op.used && i != i0.idx) {
-        err1 = 2;
+        res.err1 = 2;
         break;
       }
       if (op.jmpto && i != i0.idx) {
-        err1 = 3;
+        res.err1 = 3;
         break;
       }
       size += op.size;
@@ -1034,8 +1041,41 @@ int main(int argc, char **argv) {
       }
     }
 
-    if (debug) {
-      outs() << formatStr("syscall fail %d %d\n", err0, err1);
+    return res;
+  };
+
+  auto replaceTls = [&](AddrAndIdx i) -> JmpRes {
+    auto op = allOpcode[i.idx];
+
+    if (op.size >= 5) {
+      return {
+        .type = kDirectJmp,
+        .r0 = singleAddrRange(i),
+      };
+    }
+
+    auto res = checkPushJmp(i);
+    if (res.type != kJmpFail) {
+      return res;
+    }
+
+    res = checkCombineJmp(i);
+    if (res.type != kJmpFail) {
+      return res;
+    }
+
+    return {.type = kJmpFail};
+  };
+
+  auto replaceSyscall = [&](AddrAndIdx i) -> JmpRes {
+    auto res = checkCombineJmp(i);
+    if (res.type != kJmpFail) {
+      return res;
+    }
+
+    res = checkPushJmp(i);
+    if (res.type != kJmpFail) {
+      return res;
     }
 
     return {.type = kJmpFail};
