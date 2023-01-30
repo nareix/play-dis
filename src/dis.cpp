@@ -686,6 +686,10 @@ int main(int argc, char **argv) {
       tag += formatStr(":%d,%d", jmp.r0.size, jmp.r0.n);
     }
 
+    if (op.jmpto) {
+      tag += ":jmpto";
+    }
+
     outs() << formatInstHeader(addr, Size) <<
       IP->getOpcodeName(Inst.getOpcode()) <<
       sep << kOpTypeStrs[op.type] <<
@@ -1217,7 +1221,7 @@ int main(int argc, char **argv) {
           addr += allOpcode[i].size, i++;
         }
         if (addr == tos[ti]) {
-          allOpcode[i-1].jmpto = 1;
+          allOpcode[i].jmpto = 1;
           n++;
         }
       }
