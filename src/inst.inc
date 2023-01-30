@@ -35,6 +35,7 @@ N(6) M(0) R(5) E()
 C(MOV64ri32)
 C(MOV32ri)
 C(CMP32ri8)
+C(MOV8ri)
 N(2) R(0) IMM(1)  E()
 
 C(XOR8ri)
