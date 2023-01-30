@@ -44,11 +44,16 @@
 using namespace llvm;
 
 template <typename... Types>
-std::string formatStr(const char *fmt, Types... args) {
-  ssize_t n = snprintf(NULL, 0, fmt, args...);
+std::string fmt(const char *f, Types... args) {
+  ssize_t n = snprintf(NULL, 0, f, args...);
   char buf[n+1];
-  snprintf(buf, n+1, fmt, args...);
+  snprintf(buf, n+1, f, args...);
   return std::string(buf);
+}
+
+template <typename... Types>
+void outsfmt(const char *f, Types... args) {
+  outs() << fmt(f, args...);
 }
 
 int main(int argc, char **argv) {
@@ -136,7 +141,7 @@ int main(int argc, char **argv) {
   }
 
   if (debug) {
-    outs() << formatStr("filesize %lx e_ehsize %d e_phoff %lx size %d e_shoff %lx size %d\n",
+    outsfmt("filesize %lx e_ehsize %d e_phoff %lx size %d e_shoff %lx size %d\n",
       sb.st_size, eh->e_ehsize,
       eh->e_phoff, eh->e_phentsize*eh->e_phnum,
       eh->e_shoff, eh->e_shentsize*eh->e_shnum
@@ -164,8 +169,8 @@ int main(int argc, char **argv) {
   vaddrStubStart = alignAddr(vaddrLoadEnd, 0x1000);
 
   if (debug) {
-    outs() << formatStr("load off %lx size %lx\n", phX->p_offset, phX->p_filesz);
-    outs() << formatStr("load end %lx stub start %lx\n", vaddrLoadEnd, vaddrStubStart);
+    outsfmt("load off %lx size %lx\n", phX->p_offset, phX->p_filesz);
+    outsfmt("load end %lx stub start %lx\n", vaddrLoadEnd, vaddrStubStart);
   }
 
   ArrayRef<uint8_t> instrBuf((uint8_t *)eh + phX->p_offset, phX->p_filesz);
@@ -199,7 +204,7 @@ int main(int argc, char **argv) {
     uint64_t start = addr;
     uint64_t end = addr + sh->sh_size;
     if (debug) {
-      outs() << formatStr("section %s %lx %lx\n", name.c_str(), vaddr(start), vaddr(end));
+      outsfmt("section %s %lx %lx\n", name.c_str(), vaddr(start), vaddr(end));
     }
     allSecs.push_back({.start = addr, .end = end, .name = name, .startIdx = -1});
   }
@@ -278,7 +283,7 @@ int main(int argc, char **argv) {
   auto instrHexStr = [&](ArrayRef<uint8_t> buf) -> std::string {
     std::string hex = "[";
     for (int i = 0; i < buf.size(); i++) {
-      hex += formatStr("%.2X", buf[i]);
+      hex += fmt("%.2X", buf[i]);
       if (i < buf.size()-1) {
         hex += " ";
       }
@@ -301,13 +306,13 @@ int main(int argc, char **argv) {
 
   auto instrDumpStr = [&](const MCInst &inst) -> std::string {
     auto n = inst.getNumOperands();
-    std::string s = formatStr("%d,n=%d[", inst.getOpcode(), n);
+    std::string s = fmt("%d,n=%d[", inst.getOpcode(), n);
     for (int i = 0; i < n; i++) {
       auto op = inst.getOperand(i);
       if (op.isReg()) {
-        s += formatStr("r%d", op.getReg());
+        s += fmt("r%d", op.getReg());
       } else if (op.isImm()) {
-        s += formatStr("i%d", op.getImm());
+        s += fmt("i%d", op.getImm());
       }
       if (i < n-1) {
         s += ",";
@@ -522,7 +527,7 @@ int main(int argc, char **argv) {
         dump = instrDumpStr(Inst);
       }
     print:
-      outs() << prefix << " " << formatStr("%lx", addr) << 
+      outs() << prefix << " " << fmt("%lx", addr) << 
         " " << dis << 
         " " << dump << 
         " " << instrHexStr(buf.slice(addr,  Size)) << 
@@ -651,7 +656,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < badRanges.size(); i += 2) {
       auto start = badRanges[i];
       auto end = badRanges[i+1];
-      outs() << formatStr("bad range %d addr %lx %lx len %lu n %d\n", i/2, vaddr(start.addr), vaddr(end.addr),
+      outsfmt("bad range %d addr %lx %lx len %lu n %d\n", i/2, vaddr(start.addr), vaddr(end.addr),
         end.addr-start.addr, end.idx-start.idx);
     }
   }
@@ -663,7 +668,7 @@ int main(int argc, char **argv) {
     std::string sep = " ";
 
     auto formatInstHeader = [&](uint64_t addr, uint64_t size) -> std::string {
-      return formatStr("%lx%sn=%lu%s", vaddr(addr), sep.c_str(), size, sep.c_str());
+      return fmt("%lx%sn=%lu%s", vaddr(addr), sep.c_str(), size, sep.c_str());
     };
 
     if (op.op == X86_BAD) {
@@ -681,9 +686,9 @@ int main(int argc, char **argv) {
     if (jmp.type == kPushJmp) {
       auto rop = allOpcode[jmp.r0.i.idx];
       std::string name = IP->getOpcodeName(rop.op).str();
-      tag += formatStr(":%lu,%s,%d", rop.size, name.c_str(), std::abs((int64_t)(jmp.r0.i.addr-addr)));
+      tag += fmt(":%lu,%s,%d", rop.size, name.c_str(), std::abs((int64_t)(jmp.r0.i.addr-addr)));
     } else if (jmp.type == kCombineJmp) {
-      tag += formatStr(":%d,%d", jmp.r0.size, jmp.r0.n);
+      tag += fmt(":%d,%d", jmp.r0.size, jmp.r0.n);
     }
 
     if (op.jmpto) {
@@ -1129,7 +1134,7 @@ int main(int argc, char **argv) {
 
     if (debug) {
       for (auto f: jmpFails) {
-        outs() << formatStr("jmpfailat %s:%d addr %lx\n", f.file, f.line, vaddr(f.addr));
+        outsfmt("jmpfailat %s:%d addr %lx\n", f.file, f.line, vaddr(f.addr));
       }
     }
 
@@ -1153,15 +1158,15 @@ int main(int argc, char **argv) {
 
     if (debug) {
       if (jmp.r0.size) {
-        disamInstrBuf(formatStr("%s_inst0_before", stype), oldTextRange(jmp.r0));
-        disamInstrBuf(formatStr("%s_inst0_after", stype), newTextRange(jmp.r0));
+        disamInstrBuf(fmt("%s_inst0_before", stype), oldTextRange(jmp.r0));
+        disamInstrBuf(fmt("%s_inst0_after", stype), newTextRange(jmp.r0));
       }
       if (jmp.r1.size) {
-        disamInstrBuf(formatStr("%s_inst1_before", stype), oldTextRange(jmp.r1));
-        disamInstrBuf(formatStr("%s_inst1_after", stype), newTextRange(jmp.r1));
+        disamInstrBuf(fmt("%s_inst1_before", stype), oldTextRange(jmp.r1));
+        disamInstrBuf(fmt("%s_inst1_after", stype), newTextRange(jmp.r1));
       }
       if (E.code.size() != stubAddr) {
-        disamInstrBuf(formatStr("%s_stub", stype), E.codeSlice(stubAddr));
+        disamInstrBuf(fmt("%s_stub", stype), E.codeSlice(stubAddr));
       }
     }
   };
@@ -1227,7 +1232,7 @@ int main(int argc, char **argv) {
       }
 
       if (debug) {
-        outs() << formatStr("markjmp %d/%d\n", n, tos.size());
+        outsfmt("markjmp %d/%d\n", n, tos.size());
       }
     }
   };
@@ -1260,6 +1265,8 @@ int main(int argc, char **argv) {
     }
     outs() << "\n";
   }
+
+  outsfmt("%p %p\n", newText.data(), instrBuf.data());
 
   return 0;
 }
