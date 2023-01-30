@@ -452,7 +452,6 @@ int main(int argc, char **argv) {
   enum {
     kNoJmp,
     kIgnoreJmp,
-    kCanaryImm,
     kDirectJmp,
     kPushJmp,
     kCombineJmp,
@@ -463,7 +462,6 @@ int main(int argc, char **argv) {
   const char *kJmpTypeStrs[] = {
     "no_jmp",
     "ignore_jmp",
-    "canary_imm",
     "direct_jmp",
     "push_jmp",
     "combine_jmp",
@@ -499,12 +497,14 @@ int main(int argc, char **argv) {
 
   struct JmpFailLog {
     uint64_t addr;
-    const char *file;
-    const int line;
+    const char *tag;
   };
 
-  SmallVector<JmpFailLog, 16> jmpFails;
-  #define LOG_JMP_FAIL(addr) jmpFails.push_back({addr, __FILE__, __LINE__})
+  auto logJmpFail = [&](uint64_t addr, const char *tag) {
+    if (debug) {
+      outsfmt("jmpfailat addr %lx %s\n", vaddr(addr), tag);
+    }
+  };
 
   std::vector<OpcodeAndSize> allOpcode;
 
@@ -831,9 +831,9 @@ int main(int argc, char **argv) {
 
   SimpleCE E(CE2, STI, newText.data());
 
-  auto adjustImm4 = [&](MCInst &inst, uint64_t backAddr, bool noRsp) {
+  auto adjustImm4 = [&](MCInst &inst, uint64_t backAddr) {
     if ([&]() -> bool {
-      if (inst.getOpcode() == X86::JCC_4) {
+      if (inst.getOpcode() == X86::JCC_4 || inst.getOpcode() == X86::JMP_4) {
         return true;
       }
       auto info = getInstrInfo(inst);
@@ -883,7 +883,7 @@ int main(int argc, char **argv) {
     }
     lea.getOperand(5).setReg(0);
     E.emit(lea);
-    adjustImm4(lea, backAddr1, true);
+    adjustImm4(lea, backAddr1);
 
     E.emit(MCInstBuilder(X86::PUSH64r).addReg(X86::RAX));
 
@@ -919,7 +919,7 @@ int main(int argc, char **argv) {
     }
 
     E.emit(inst);
-    adjustImm4(inst, backAddr, false);
+    adjustImm4(inst, backAddr);
   };
 
   auto emitOldInst = [&](AddrAndIdx i) {
@@ -1103,11 +1103,11 @@ int main(int argc, char **argv) {
     for (int i = i0.idx; i > 0; i--) {
       auto &op = allOpcode[i];
       if (!canReplaceIdx({addr,i})) {
-        LOG_JMP_FAIL(addr);
+        logJmpFail(addr, "cantrep");
         break;
       }
       if (op.used && i != i0.idx) {
-        LOG_JMP_FAIL(addr);
+        logJmpFail(addr, "used");
         break;
       }
       size += op.size;
@@ -1125,7 +1125,7 @@ int main(int argc, char **argv) {
         };
       }
       if (op.jmpto) {
-        LOG_JMP_FAIL(addr);
+        logJmpFail(addr, "jmpto");
         break;
       }
       addr -= allOpcode[i-1].size;
@@ -1136,15 +1136,15 @@ int main(int argc, char **argv) {
     for (int i = i0.idx; i < allOpcode.size(); i++) {
       auto &op = allOpcode[i];
       if (!canReplaceIdx({addr,i})) {
-        LOG_JMP_FAIL(addr);
+        logJmpFail(addr, "cantrep");
         break;
       }
       if (op.used && i != i0.idx) {
-        LOG_JMP_FAIL(addr);
+        logJmpFail(addr, "used");
         break;
       }
       if (op.jmpto && i != i0.idx) {
-        LOG_JMP_FAIL(addr);
+        logJmpFail(addr, "jmpto");
         break;
       }
       size += op.size;
@@ -1212,14 +1212,6 @@ int main(int argc, char **argv) {
     if (verbose) {
       printInstr(i, jmp);
     }
-
-    if (debug) {
-      for (auto f: jmpFails) {
-        outsfmt("jmpfailat %s:%d addr %lx\n", f.file, f.line, vaddr(f.addr));
-      }
-    }
-
-    jmpFails.clear();
 
     auto stubAddr = E.code.size();
     auto relocIdx = E.relocs.size();
