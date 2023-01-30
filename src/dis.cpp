@@ -1042,10 +1042,7 @@ int main(int argc, char **argv) {
     return r == X86::ESP || r == X86::RSP;
   };
 
-  auto canReplace = [&](AddrAndIdx i) -> bool {
-    MCInst inst;
-    uint64_t size;
-    DisAsm->getInstruction(inst, size, instrBuf.slice(i.addr), 0, nulls());
+  auto canReplaceInst = [&](const MCInst &inst) -> bool {
     auto op = inst.getOpcode();
     if (op == X86::JCC_1 || op == X86::JMP_1) {
       return false;
@@ -1063,6 +1060,13 @@ int main(int argc, char **argv) {
     return true;
   };
 
+  auto canReplaceIdx = [&](AddrAndIdx i) -> bool {
+    MCInst inst;
+    uint64_t size;
+    DisAsm->getInstruction(inst, size, instrBuf.slice(i.addr), 0, nulls());
+    return canReplaceInst(inst);
+  };
+
   auto checkPushJmp = [&](AddrAndIdx i) -> JmpRes {
     auto op = allOpcode[i.idx];
 
@@ -1074,7 +1078,7 @@ int main(int argc, char **argv) {
 
     if (forInstrAround(i, 127, [&](AddrAndIdx i) -> int {
       auto op = allOpcode[i.idx];
-      if (canReplace(i) && !op.used && op.size >= 6) {
+      if (canReplaceIdx(i) && !op.used && op.size >= 6) {
         j = i;
         return 0;
       }
@@ -1098,7 +1102,7 @@ int main(int argc, char **argv) {
     auto addr = i0.addr;
     for (int i = i0.idx; i > 0; i--) {
       auto &op = allOpcode[i];
-      if (!canReplace({addr,i})) {
+      if (!canReplaceIdx({addr,i})) {
         LOG_JMP_FAIL(addr);
         break;
       }
@@ -1131,7 +1135,7 @@ int main(int argc, char **argv) {
     addr = i0.addr;
     for (int i = i0.idx; i < allOpcode.size(); i++) {
       auto &op = allOpcode[i];
-      if (!canReplace({addr,i})) {
+      if (!canReplaceIdx({addr,i})) {
         LOG_JMP_FAIL(addr);
         break;
       }
@@ -1171,6 +1175,10 @@ int main(int argc, char **argv) {
       return {.type = kIgnoreJmp};
     }
 
+    if (!canReplaceIdx(i)) {
+      return {.type = kJmpFail};
+    }
+
     if (op.size >= 5) {
       return {
         .type = kDirectJmp,
@@ -1195,6 +1203,7 @@ int main(int argc, char **argv) {
 
   auto handleInstr = [&](AddrAndIdx i) {
     auto op = allOpcode[i.idx];
+
     JmpRes jmp = doReplace(i);
 
     totOpType[op.type]++;
