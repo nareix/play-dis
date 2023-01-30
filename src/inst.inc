@@ -74,6 +74,7 @@ C(SUB64ri8)
 N(3) R(0) IMM(2)  E()
 
 C(MOV32rr)
+C(MOV64rr)
 C(TEST32rr)
 N(2) R(0) R1(1) E()
 
@@ -88,6 +89,7 @@ C(SYSCALL)
 N(0) E()
 
 C(CMP64i32)
+C(CMP32i32)
 N(1) IMM(0) USE(RAX) E()
 
 #ifdef C

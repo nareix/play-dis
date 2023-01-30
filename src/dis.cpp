@@ -484,9 +484,16 @@ int main(int argc, char **argv) {
     int type;
     AddrRange r0;
     AddrRange r1;
-    int err;
-    int err1;
   };
+
+  struct JmpFailLog {
+    uint64_t addr;
+    const char *file;
+    const int line;
+  };
+
+  SmallVector<JmpFailLog, 16> jmpFails;
+  #define LOG_JMP_FAIL(addr) jmpFails.push_back({addr, __FILE__, __LINE__})
 
   std::vector<OpcodeAndSize> allOpcode;
 
@@ -959,6 +966,10 @@ int main(int argc, char **argv) {
   auto checkPushJmp = [&](AddrAndIdx i) -> JmpRes {
     auto op = allOpcode[i.idx];
 
+    if (op.size < 3) {
+      return {.type = kJmpFail};
+    }
+
     AddrAndIdx j;
 
     if (forInstrAround(i, 127, [&](AddrAndIdx i) -> int {
@@ -984,18 +995,19 @@ int main(int argc, char **argv) {
     JmpRes res = {.type = kJmpFail};
 
     uint64_t size = 0;
+    auto addr = i0.addr;
     for (int i = i0.idx; i > 0; i--) {
       auto &op = allOpcode[i];
       if (!isOpSupported(op.op)) {
-        res.err = 1;
+        LOG_JMP_FAIL(addr);
         break;
       }
       if (op.op == X86::JCC_1 || op.op == X86::JMP_1) {
-        res.err = 4;
+        LOG_JMP_FAIL(addr);
         break;
       }
       if (op.used && i != i0.idx) {
-        res.err = 2;
+        LOG_JMP_FAIL(addr);
         break;
       }
       size += op.size;
@@ -1004,7 +1016,7 @@ int main(int argc, char **argv) {
           .type = kCombineJmp,
           .r0 = {
             .i = {
-              .addr = i0.addr + allOpcode[i0.idx].size - size,
+              .addr = addr,
               .idx = i,
             },
             .n = i0.idx - i + 1,
@@ -1013,30 +1025,34 @@ int main(int argc, char **argv) {
         };
       }
       if (op.jmpto) {
-        res.err = 3;
+        LOG_JMP_FAIL(addr);
         break;
       }
+      addr -= allOpcode[i-1].size;
     }
 
+    size = 0;
+    addr = i0.addr;
     for (int i = i0.idx; i < allOpcode.size(); i++) {
       auto &op = allOpcode[i];
       if (!isOpSupported(op.op)) {
-        res.err1 = 1;
+        LOG_JMP_FAIL(addr);
         break;
       }
       if (op.op == X86::JCC_1 || op.op == X86::JMP_1) {
-        res.err1 = 4;
+        LOG_JMP_FAIL(addr);
         break;
       }
       if (op.used && i != i0.idx) {
-        res.err1 = 2;
+        LOG_JMP_FAIL(addr);
         break;
       }
       if (op.jmpto && i != i0.idx) {
-        res.err1 = 3;
+        LOG_JMP_FAIL(addr);
         break;
       }
       size += op.size;
+      addr += op.size;
       if (size >= 5) {
         return {
           .type = kCombineJmp,
@@ -1076,17 +1092,7 @@ int main(int argc, char **argv) {
   };
 
   auto replaceSyscall = [&](AddrAndIdx i) -> JmpRes {
-    auto res = checkCombineJmp(i);
-    if (res.type != kJmpFail) {
-      return res;
-    }
-
-    res = checkPushJmp(i);
-    if (res.type != kJmpFail) {
-      return res;
-    }
-
-    return {.type = kJmpFail};
+    return checkCombineJmp(i);
   };
 
   auto doReplace = [&](AddrAndIdx i) -> JmpRes {
@@ -1116,6 +1122,14 @@ int main(int argc, char **argv) {
     if (verbose) {
       printInstr(i, jmp);
     }
+
+    if (debug) {
+      for (auto f: jmpFails) {
+        outs() << formatStr("jmpfailat %s:%d addr %lx\n", f.file, f.line, vaddr(f.addr));
+      }
+    }
+
+    jmpFails.clear();
 
     auto stubAddr = E.code.size();
     auto relocIdx = E.relocs.size();
