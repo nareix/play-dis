@@ -161,7 +161,6 @@ int main(int argc, char **argv) {
   }
 
   uint64_t vaddrLoadEnd = 0;
-  uint64_t vaddrStubStart = 0;
   Elf64_Phdr *phX = NULL;
   uint8_t *phStart = (uint8_t *)eh + eh->e_phoff;
   for (int i = 0; i < eh->e_phnum; i++) {
@@ -178,11 +177,9 @@ int main(int argc, char **argv) {
     return (base + (align - 1)) & ~(align - 1);
   };
 
-  vaddrStubStart = alignAddr(vaddrLoadEnd, 0x1000);
-
   if (debug) {
     outsfmt("load off %lx size %lx\n", phX->p_offset, phX->p_filesz);
-    outsfmt("load end %lx stub start %lx\n", vaddrLoadEnd, vaddrStubStart);
+    outsfmt("load end %lx\n", vaddrLoadEnd);
   }
 
   ArrayRef<uint8_t> instrBuf((uint8_t *)eh + phX->p_offset, phX->p_filesz);
@@ -412,12 +409,12 @@ int main(int argc, char **argv) {
       C(MOV32ri)
       C(CMP32ri8)
       C(MOV8ri)
-      N(2) R(0) IMM(1)  E()
+      N(2) R(0) IMM(1) E()
 
       C(XOR8ri)
       C(AND32ri)
       C(SUB64ri8)
-      N(3) R(0) IMM(2)  E()
+      N(3) R(0) IMM(2) E()
 
       C(MOV32rr)
       C(MOV64rr)
@@ -1083,7 +1080,7 @@ int main(int argc, char **argv) {
       tls_op
       jmp back1
     */
-    E.code[jmp1Off-1] = int8_t(E.code.size() - jmp1Off);
+    E.code[jmp1Off-1] = E.code.size() - jmp1Off;
     recovery(true);
     emitOldInsts(r1);
     emitJmpBack(r1);
