@@ -335,16 +335,9 @@ int main(int argc, char **argv) {
     return s;
   };
 
-  /*
-    M: [BaseReg, ScaleAmt, IndexReg, Disp, Segment]
-    MRM0m/MRM7m -> M,Imm
-    MRMDestMem -> M,Reg
-    MRMSrcMem -> Reg,M
-  */
-
   struct InstrInfo {
     bool ok;
-    int mIdx;
+    int mIdx; // [BaseReg, ScaleAmt, IndexReg, Disp, Segment]
     int immIdx;
     int regIdx;
     int regIdx1;
@@ -733,7 +726,7 @@ int main(int argc, char **argv) {
     std::string sep = " ";
 
     auto formatInstHeader = [&](uint64_t addr, uint64_t size) -> std::string {
-      return fmt("%lx%sn=%lu%s", vaddr(addr), sep.c_str(), size, sep.c_str());
+      return fmt("%lx", vaddr(addr));
     };
 
     if (op.op == X86_BAD) {
@@ -761,12 +754,12 @@ int main(int argc, char **argv) {
     }
 
     outs() << formatInstHeader(addr, Size) <<
-      IP->getOpcodeName(Inst.getOpcode()) <<
-      sep << kOpTypeStrs[op.type] <<
-      sep << tag << 
       sep << instrDisStr(Inst) <<
+      sep << IP->getOpcodeName(Inst.getOpcode()) <<
       sep << instrDumpStr(Inst) << 
       sep << instrHexStr(instrBuf.slice(addr, Size)) << 
+      sep << kOpTypeStrs[op.type] <<
+      sep << tag << 
       "\n";
   };
 
@@ -860,7 +853,11 @@ int main(int argc, char **argv) {
   };
 
   auto emitCallFn = [&](int fn) {
-    E.emit(MCInstBuilder(X86::CALL64pcrel32).addImm(0));
+    E.code.push_back(0xe8);
+    E.code.push_back(0);
+    E.code.push_back(0);
+    E.code.push_back(0);
+    E.code.push_back(0);
     E.relocStub(fn, kRelCall);
   };
 
@@ -995,7 +992,6 @@ int main(int argc, char **argv) {
       .addReg(X86::RAX).addReg(X86::RSP).addImm(1).addReg(0).addImm(0).addReg(0));
     E.emit(MCInstBuilder(X86::JCC_1).addImm(0).addImm(5)); // 4=je 5=jne
     auto jmp1Off = E.code.size();
-    auto jmp1Fix = (uint8_t *)&E.code[E.code.size()-1];
 
     auto recovery = [&](bool addRsp) {
       /* 
@@ -1025,8 +1021,7 @@ int main(int argc, char **argv) {
       tls_op
       jmp back1
     */
-    auto label1Off = E.code.size();
-    *jmp1Fix = int8_t(label1Off - jmp1Off);
+    E.code[jmp1Off-1] = int8_t(E.code.size() - jmp1Off);
     recovery(true);
     emitOldInsts(r1);
     emitJmpBack(r1);
