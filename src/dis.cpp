@@ -187,6 +187,13 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
   std::unique_ptr<MCDisassembler> DisAsm(T->createMCDisassembler(*STI, Ctx));
 
   auto constexpr X86_BAD = X86::INSTRUCTION_LIST_END+1;
+  auto mcDecode = [&](MCInst &Inst, uint64_t &Size, ArrayRef<uint8_t> buf) {
+    auto r = DisAsm->getInstruction(Inst, Size, buf, 0, nulls());
+    if (r != MCDisassembler::DecodeStatus::Success) {
+      Inst.setOpcode(X86_BAD);
+      Size = 1;
+    }
+  };
 
   std::vector<unsigned> gpRegs = {
     // keep order
@@ -521,11 +528,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     MCInst Inst;
     uint64_t Size;
     for (int addr = 0; addr < buf.size(); ) {
-      auto r = DisAsm->getInstruction(Inst, Size, buf.slice(addr), 0, nulls());
-      if (r != MCDisassembler::DecodeStatus::Success) {
-        Inst.setOpcode(X86_BAD);
-        Size = 1;
-      }
+      mcDecode(Inst, Size, buf.slice(addr));
     print:
       outs() << prefix << " " << fmt("%lx", addr+va) << 
         " " << instrAllStr(Inst, buf.slice(addr,  Size)) << 
@@ -563,9 +566,9 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
   auto decodeInstr = [&](uint64_t addr) -> OpcodeAndSize {
     MCInst Inst;
     uint64_t Size;
-    auto S = DisAsm->getInstruction(Inst, Size, instrBuf.slice(addr), 0, nulls());
+    mcDecode(Inst, Size, instrBuf.slice(addr));
 
-    if (S != MCDisassembler::DecodeStatus::Success) {
+    if (Inst.getOpcode() == X86_BAD) {
       return {.op = X86_BAD, .size = 1, .type = kNormalOp};
     }
 
@@ -686,7 +689,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
       auto p = instOccur[sortIdx[i]];
       auto op = allOpcode[p.i.idx];
       ArrayRef<uint8_t> b = {instrBuf.data() + p.i.addr, op.size};
-      DisAsm->getInstruction(Inst, Size, b, 0, nulls());
+      mcDecode(Inst, Size, b);
       auto s = instrAllStr(Inst);
       outsfmt("instoccur %d %s %d\n", i, s.c_str(), p.n);
     }
@@ -724,15 +727,9 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
       return fmt("%lx", vaddr(addr));
     };
 
-    if (op.op == X86_BAD) {
-      outs() << formatInstHeader(addr, op.size) << "BAD " << "\n";
-      return;
-    }
-
     MCInst Inst;
     uint64_t Size;
-
-    DisAsm->getInstruction(Inst, Size, instrBuf.slice(addr), addr, nulls());
+    mcDecode(Inst, Size, instrBuf.slice(addr));
 
     std::string tag = kJmpTypeStrs[jmp.type];
 
@@ -857,7 +854,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     MCInst inst1;
     uint64_t size1;
     auto addr1 = i.addr;
-    DisAsm->getInstruction(inst1, size1, instrBuf.slice(addr1), 0, nulls());
+    mcDecode(inst1, size1, instrBuf.slice(addr1));
     auto backAddr1 = addr1+size1;
 
     /*
@@ -926,7 +923,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     MCInst inst;
     uint64_t size;
     auto addr = i.addr;
-    DisAsm->getInstruction(inst, size, instrBuf.slice(addr), 0, nulls());
+    mcDecode(inst, size, instrBuf.slice(addr));
     auto backAddr = addr+size;
 
     if (inst.getOpcode() == X86::SYSCALL) {
@@ -1099,7 +1096,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
   auto canReplaceIdx = [&](AddrAndIdx i) -> bool {
     MCInst inst;
     uint64_t size;
-    DisAsm->getInstruction(inst, size, instrBuf.slice(i.addr), 0, nulls());
+    mcDecode(inst, size, instrBuf.slice(i.addr));
     return canReplaceInst(inst);
   };
 
