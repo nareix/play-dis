@@ -186,6 +186,8 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
   std::unique_ptr<MCCodeEmitter> CE2(T->createMCCodeEmitter(*MCII, Ctx));
   std::unique_ptr<MCDisassembler> DisAsm(T->createMCDisassembler(*STI, Ctx));
 
+  auto constexpr X86_BAD = X86::INSTRUCTION_LIST_END+1;
+
   std::vector<unsigned> gpRegs = {
     // keep order
     X86::RIP, X86::RSP, X86::RBP, X86::RAX,
@@ -248,7 +250,8 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
 
   auto instrDumpStr = [&](const MCInst &inst) -> std::string {
     auto n = inst.getNumOperands();
-    std::string s = fmt("%d,n=%d[", inst.getOpcode(), n);
+    std::string s = std::string(IP->getOpcodeName(inst.getOpcode())) + 
+        fmt("(%d),n=%d[", inst.getOpcode(), n);
     for (int i = 0; i < n; i++) {
       auto op = inst.getOperand(i);
       if (op.isReg()) {
@@ -264,6 +267,19 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     return s;
   };
 
+  auto instrAllStr = [&](const MCInst &inst, ArrayRef<uint8_t> buf = {}) -> std::string {
+    std::string s;
+    if (inst.getOpcode() == X86_BAD) {
+      s += "bad";
+    } else {
+      s += instrDisStr(inst) + " " + instrDumpStr(inst);
+    }
+    if (buf.size()) {
+      s += " " + instrHexStr(buf);
+    }
+    return s;
+  };
+
   struct InstrInfo {
     bool ok;
     int mIdx; // [BaseReg, ScaleAmt, IndexReg, Disp, Segment]
@@ -274,10 +290,8 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
   };
 
   #define panicUnsupportedInstr(inst) {\
-    auto s0 = instrDisStr(inst); \
-    auto s1 = instrDumpStr(inst); \
-    auto s2 = IP->getOpcodeName(inst.getOpcode()).str(); \
-    fprintf(stderr, "%s:%d: unsupported instr %s %s %s\n", __FILE__, __LINE__, s2.c_str(), s0.c_str(), s1.c_str()); \
+    auto s0 = instrAllStr(inst); \
+    fprintf(stderr, "%s:%d: unsupported instr %s\n", __FILE__, __LINE__, s0.c_str()); \
     exit(-1); \
     __builtin_unreachable(); \
   }
@@ -508,20 +522,13 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     uint64_t Size;
     for (int addr = 0; addr < buf.size(); ) {
       auto r = DisAsm->getInstruction(Inst, Size, buf.slice(addr), 0, nulls());
-      std::string dis, dump;
       if (r != MCDisassembler::DecodeStatus::Success) {
+        Inst.setOpcode(X86_BAD);
         Size = 1;
-        dis = "bad";
-        dump = "bad";
-      } else {
-        dis = instrDisStr(Inst);
-        dump = instrDumpStr(Inst);
       }
     print:
       outs() << prefix << " " << fmt("%lx", addr+va) << 
-        " " << dis << 
-        " " << dump << 
-        " " << instrHexStr(buf.slice(addr,  Size)) << 
+        " " << instrAllStr(Inst, buf.slice(addr,  Size)) << 
         "\n";
       addr += Size;
     }
@@ -552,8 +559,6 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     }
     return false;
   };
-
-  auto constexpr X86_BAD = X86::INSTRUCTION_LIST_END+1;
 
   auto decodeInstr = [&](uint64_t addr) -> OpcodeAndSize {
     MCInst Inst;
@@ -675,16 +680,15 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
       return instOccur[l].n > instOccur[r].n;
     });
 
-      for (int i = 0; i < sortIdx.size(); i++) {
+    for (int i = 0; i < sortIdx.size(); i++) {
       MCInst Inst;
       uint64_t Size;
       auto p = instOccur[sortIdx[i]];
       auto op = allOpcode[p.i.idx];
       ArrayRef<uint8_t> b = {instrBuf.data() + p.i.addr, op.size};
       DisAsm->getInstruction(Inst, Size, b, 0, nulls());
-      auto s = instrDisStr(Inst);
-      auto bs = instrHexStr(b);
-      outsfmt("instoccur %d %s %s %d\n", i, s.c_str(), bs.c_str(), p.n);
+      auto s = instrAllStr(Inst);
+      outsfmt("instoccur %d %s %d\n", i, s.c_str(), p.n);
     }
    }
 
@@ -745,10 +749,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     }
 
     outs() << formatInstHeader(addr, Size) <<
-      sep << instrDisStr(Inst) <<
-      sep << IP->getOpcodeName(Inst.getOpcode()) <<
-      sep << instrDumpStr(Inst) << 
-      sep << instrHexStr(instrBuf.slice(addr, Size)) << 
+      sep << instrAllStr(Inst, instrBuf.slice(addr, Size)) <<
       sep << kOpTypeStrs[op.type] <<
       sep << tag << 
       "\n";
