@@ -57,86 +57,18 @@ void outsfmt(const char *f, Types... args) {
   outs() << fmt(f, args...);
 }
 
-int main(int argc, char **argv) {
-  std::vector<std::string> args;
-  std::vector<std::string> args0;
-  bool verbose = false;
-  bool forAll = false;
-  int forSingleInstr = -1;
-  bool summary = false;
-  bool debug = false;
-  bool debugOnlyBefore = false;
+bool verbose = false;
+bool forAll = false;
+int forSingleInstr = -1;
+bool summary = false;
+bool debug = false;
+bool debugOnlyBefore = false;
 
-  for (int i = 1; i < argc; i++) {
-    args0.push_back(std::string(argv[i]));
-  }
+void loadBin() {
+}
 
-  for (int i = 0; i < args0.size(); i++) {
-    auto &o = args0[i];
-    if (o == "-i") {
-      if (i+1 >= args0.size()) {
-        fprintf(stderr, "need param\n");
-        return -1;
-      }
-      sscanf(args0[i+1].c_str(), "%x", &forSingleInstr);
-      i++;
-      continue;
-    }
-    if (o == "-d") {
-      debug = true;
-      continue;
-    }
-    if (o == "-vad") {
-      debug = true;
-      forAll = true;
-      verbose = true;
-      continue;
-    }
-    if (o == "-dob") {
-      debugOnlyBefore = true;
-      continue;
-    }
-    if (o == "-v") {
-      verbose = true;
-      continue;
-    }
-    if (o == "-a") {
-      forAll = true;
-      continue;
-    }
-    if (o == "-s") {
-      summary = true;
-      continue;
-    }
-    args.push_back(o);
-  }
-
-  if (args.size() == 0) {
-    errs() << "need filename\n";
-    return -1;
-  }
-
-  auto filename = args[0];
-  int fd = open(filename.c_str(), O_RDONLY);
-  if (fd == -1) {
-    fprintf(stderr, "open %s failed\n", filename.c_str());
-    return -1;
-  }
-
-  struct stat sb;
-  if (fstat(fd, &sb) == -1) {
-    fprintf(stderr, "stat %s failed\n", filename.c_str());
-    return -1;
-  }
-  auto fileSize = sb.st_size;
-
-  uint8_t *faddr = (uint8_t *)mmap(NULL, fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
-  if (faddr == MAP_FAILED) {
-    fprintf(stderr, "mmap %s failed\n", filename.c_str());
-    return -1;
-  }
-
-  Elf64_Ehdr *eh = (Elf64_Ehdr *)faddr;
+void transBin(uint8_t *fileAddr, size_t fileSize) {
+  Elf64_Ehdr *eh = (Elf64_Ehdr *)fileAddr;
   uint8_t osabi = eh->e_ident[EI_OSABI];
   if (
     eh->e_ident[EI_MAG0] != ELFMAG0 || eh->e_ident[EI_MAG1] != ELFMAG1 ||
@@ -148,13 +80,13 @@ int main(int argc, char **argv) {
     (eh->e_type != ET_EXEC && eh->e_type != ET_DYN)
     )
   {
-    fprintf(stderr, "%s elf not supported\n", filename.c_str());
-    return -1;
+    fprintf(stderr, "elf not supported\n");
+    return;
   }
 
   if (debug) {
     outsfmt("filesize %lx e_ehsize %d e_phoff %lx size %d e_shoff %lx size %d\n",
-      sb.st_size, eh->e_ehsize,
+      fileSize, eh->e_ehsize,
       eh->e_phoff, eh->e_phentsize*eh->e_phnum,
       eh->e_shoff, eh->e_shentsize*eh->e_shnum
     );
@@ -223,7 +155,7 @@ int main(int argc, char **argv) {
   LLVMInitializeX86AsmParser();
   LLVMInitializeX86Disassembler();
 
-  const MCTargetOptions MCOptions = mc::InitMCTargetOptionsFromFlags();
+  MCTargetOptions MCOptions;
 
   std::string tripleName = sys::getDefaultTargetTriple();
   Triple TheTriple(Triple::normalize(tripleName));
@@ -245,7 +177,7 @@ int main(int argc, char **argv) {
   SmallString<128> ss;
   raw_svector_ostream osv(ss);
   auto FOut = std::make_unique<formatted_raw_ostream>(osv);
-  MCInstPrinter *IP = T->createMCInstPrinter(Triple(tripleName), 0, *MAI, *MCII, *MRI);
+  auto IP = T->createMCInstPrinter(Triple(tripleName), 0, *MAI, *MCII, *MRI);
   std::unique_ptr<MCStreamer> Str(
       T->createAsmStreamer(Ctx, std::move(FOut), /*asmverbose*/false,
                            /*useDwarfDirectory*/false, IP,
@@ -928,9 +860,10 @@ int main(int argc, char **argv) {
     auto backAddr1 = addr1+size1;
 
     /*
-      push %tmp; lea 8(%rsp), %rsp // save tmp,rsp(optional)
+      push %tmp // save tmp
+      [optional] lea 8(%rsp), %rsp // save rsp
       lea inst1.mem, %tmp // get orig value
-      lea -8(%rsp), %rsp // recovery rsp(optional)
+      [optional] lea -8(%rsp), %rsp // recovery rsp
       push %rax; call get_fs; lea (%rax,%tmp), %tmp; pop %rax // add fs
       inst1.op inst1.reg, (%tmp) // modified instr
       pop %tmp // recovery tmp
@@ -1460,7 +1393,6 @@ int main(int argc, char **argv) {
   }
 
   if (summary) {
-    outs() << filename << " ";
     for (int i = 0; i < kOpTypeNr; i++) {
       outs() << kOpTypeStrs[i] << " " << totOpType[i] << " ";
     }
@@ -1469,6 +1401,82 @@ int main(int argc, char **argv) {
     }
     outs() << "\n";
   }
+}
+
+int main(int argc, char **argv) {
+  std::vector<std::string> args;
+  std::vector<std::string> args0;
+
+  for (int i = 1; i < argc; i++) {
+    args0.push_back(std::string(argv[i]));
+  }
+
+  for (int i = 0; i < args0.size(); i++) {
+    auto &o = args0[i];
+    if (o == "-i") {
+      if (i+1 >= args0.size()) {
+        fprintf(stderr, "need param\n");
+        return -1;
+      }
+      sscanf(args0[i+1].c_str(), "%x", &forSingleInstr);
+      i++;
+      continue;
+    }
+    if (o == "-d") {
+      debug = true;
+      continue;
+    }
+    if (o == "-vad") {
+      debug = true;
+      forAll = true;
+      verbose = true;
+      continue;
+    }
+    if (o == "-dob") {
+      debugOnlyBefore = true;
+      continue;
+    }
+    if (o == "-v") {
+      verbose = true;
+      continue;
+    }
+    if (o == "-a") {
+      forAll = true;
+      continue;
+    }
+    if (o == "-s") {
+      summary = true;
+      continue;
+    }
+    args.push_back(o);
+  }
+
+  if (args.size() == 0) {
+    errs() << "need filename\n";
+    return -1;
+  }
+
+  auto filename = args[0];
+  int fd = open(filename.c_str(), O_RDONLY);
+  if (fd == -1) {
+    fprintf(stderr, "open %s failed\n", filename.c_str());
+    return -1;
+  }
+
+  struct stat sb;
+  if (fstat(fd, &sb) == -1) {
+    fprintf(stderr, "stat %s failed\n", filename.c_str());
+    return -1;
+  }
+  auto fileSize = sb.st_size;
+
+  auto fileAddr = (uint8_t *)mmap(NULL, fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (fileAddr == MAP_FAILED) {
+    fprintf(stderr, "mmap %s failed\n", filename.c_str());
+    return -1;
+  }
+
+  transBin(fileAddr, fileSize);
 
   return 0;
 }

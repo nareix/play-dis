@@ -13,8 +13,8 @@ list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
 include(AddLLVM)
 
 set (CMAKE_CXX_STANDARD 20)
-# add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
-# add_link_options(-fsanitize=address -fno-omit-frame-pointer)
+add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
+add_link_options(-fsanitize=address -fno-omit-frame-pointer)
 
 set(LLVM_LINK_COMPONENTS
   x86asmparser 
