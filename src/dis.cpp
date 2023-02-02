@@ -27,6 +27,7 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/WithColor.h"
+#include "llvm/Support/ConvertUTF.h"
 #include "X86BaseInfo.h"
 
 #include <vector>
@@ -57,12 +58,12 @@ void outsfmt(const char *f, Types... args) {
   outs() << fmt(f, args...);
 }
 
-bool verbose;
-bool summary;
-bool debug;
-bool debugOnlyBefore;
-bool forAll;
-int forSingleInstr = -1;
+static bool verbose;
+static bool summary;
+static bool debug;
+static bool debugOnlyBefore;
+static bool forAll;
+static int forSingleInstr = -1;
 
 uint64_t alignAddr(uint64_t base, uint64_t align) {
   return (base + (align - 1)) & ~(align - 1);
@@ -170,11 +171,11 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
   std::unique_ptr<MCDisassembler> DisAsm(T->createMCDisassembler(*STI, Ctx));
 
   auto constexpr X86_BAD = X86::INSTRUCTION_LIST_END+1;
-  auto mcDecode = [&](MCInst &Inst, uint64_t &Size, ArrayRef<uint8_t> buf) {
-    auto r = DisAsm->getInstruction(Inst, Size, buf, 0, nulls());
+  auto mcDecode = [&](MCInst &inst, uint64_t &size, ArrayRef<uint8_t> buf) {
+    auto r = DisAsm->getInstruction(inst, size, buf, 0, nulls());
     if (r != MCDisassembler::DecodeStatus::Success) {
-      Inst.setOpcode(X86_BAD);
-      Size = 1;
+      inst.setOpcode(X86_BAD);
+      size = 1;
     }
   };
 
@@ -226,8 +227,8 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     return hex;
   };
 
-  auto instrDisStr = [&](const MCInst &Inst) -> std::string {
-    Str->emitInstruction(Inst, *STI);
+  auto instrDisStr = [&](const MCInst &inst) -> std::string {
+    Str->emitInstruction(inst, *STI);
     auto r = ss.slice(1, ss.size()-1).str();
     for (int i = 0; i < r.size(); i++) {
       if (r[i] == '\t') {
@@ -508,15 +509,15 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
   using SmallCode = SmallString<256>;
 
   auto dismInstBuf = [&](const std::string &prefix, ArrayRef<uint8_t> buf, uint64_t va = 0) {
-    MCInst Inst;
-    uint64_t Size;
+    MCInst inst;
+    uint64_t size;
     for (int addr = 0; addr < buf.size(); ) {
-      mcDecode(Inst, Size, buf.slice(addr));
+      mcDecode(inst, size, buf.slice(addr));
     print:
       outs() << prefix << " " << fmt("%lx", addr+va) << 
-        " " << instAllStr(Inst, buf.slice(addr,  Size)) << 
+        " " << instAllStr(inst, buf.slice(addr, size)) << 
         "\n";
-      addr += Size;
+      addr += size;
     }
   };
 
@@ -663,13 +664,13 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     });
 
     for (int i = 0; i < sortIdx.size(); i++) {
-      MCInst Inst;
-      uint64_t Size;
+      MCInst inst;
+      uint64_t size;
       auto p = instOccur[sortIdx[i]];
       auto op = allOpcode[p.i.idx];
       ArrayRef<uint8_t> b = {instBuf.data() + p.i.addr, op.size};
-      mcDecode(Inst, Size, b);
-      auto s = instAllStr(Inst);
+      mcDecode(inst, size, b);
+      auto s = instAllStr(inst);
       outsfmt("instoccur %d %s %d\n", i, s.c_str(), p.n);
     }
    }
@@ -706,9 +707,9 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
       return fmt("%lx", vaddr(addr));
     };
 
-    MCInst Inst;
-    uint64_t Size;
-    mcDecode(Inst, Size, instBuf.slice(addr));
+    MCInst inst;
+    uint64_t size;
+    mcDecode(inst, size, instBuf.slice(addr));
 
     std::string tag = kJmpTypeStrs[jmp.type];
 
@@ -724,8 +725,8 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
       tag += ":jmpto";
     }
 
-    outs() << formatInstHeader(addr, Size) <<
-      sep << instAllStr(Inst, instBuf.slice(addr, Size)) <<
+    outs() << formatInstHeader(addr, size) <<
+      sep << instAllStr(inst, instBuf.slice(addr, size)) <<
       sep << kOpTypeStrs[op.type] <<
       sep << tag << 
       "\n";
