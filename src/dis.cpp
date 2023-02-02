@@ -57,32 +57,19 @@ void outsfmt(const char *f, Types... args) {
   outs() << fmt(f, args...);
 }
 
-bool verbose = false;
-bool forAll = false;
+bool verbose;
+bool summary;
+bool debug;
+bool debugOnlyBefore;
+bool forAll;
 int forSingleInstr = -1;
-bool summary = false;
-bool debug = false;
-bool debugOnlyBefore = false;
 
-void loadBin() {
-}
+uint64_t alignAddr(uint64_t base, uint64_t align) {
+  return (base + (align - 1)) & ~(align - 1);
+};
 
 void transBin(uint8_t *fileAddr, size_t fileSize) {
   Elf64_Ehdr *eh = (Elf64_Ehdr *)fileAddr;
-  uint8_t osabi = eh->e_ident[EI_OSABI];
-  if (
-    eh->e_ident[EI_MAG0] != ELFMAG0 || eh->e_ident[EI_MAG1] != ELFMAG1 ||
-    eh->e_ident[EI_MAG2] != ELFMAG2 || eh->e_ident[EI_MAG3] != ELFMAG3 ||
-    eh->e_ident[EI_CLASS] != ELFCLASS64 ||
-    eh->e_ident[EI_DATA] != ELFDATA2LSB ||
-    (osabi != ELFOSABI_LINUX && osabi != ELFOSABI_SYSV) ||
-    eh->e_machine != EM_X86_64 ||
-    (eh->e_type != ET_EXEC && eh->e_type != ET_DYN)
-    )
-  {
-    fprintf(stderr, "elf not supported\n");
-    return;
-  }
 
   if (debug) {
     outsfmt("filesize %lx e_ehsize %d e_phoff %lx size %d e_shoff %lx size %d\n",
@@ -105,21 +92,17 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     }
   }
 
-  auto alignAddr = [&](uint64_t base, uint64_t align) {
-    return (base + (align - 1)) & ~(align - 1);
-  };
-
   if (debug) {
     outsfmt("load off %lx size %lx\n", phX->p_offset, phX->p_filesz);
     outsfmt("load end %lx\n", vaddrLoadEnd);
   }
 
-  ArrayRef<uint8_t> instrBuf((uint8_t *)eh + phX->p_offset, phX->p_filesz);
+  ArrayRef<uint8_t> instBuf((uint8_t *)eh + phX->p_offset, phX->p_filesz);
   auto vaddr = [&](uint64_t addr) -> uint64_t {
     return addr + phX->p_vaddr;
   };
 
-  auto newText = std::vector<uint8_t>(instrBuf.begin(), instrBuf.end());
+  auto newText = std::vector<uint8_t>(instBuf.begin(), instBuf.end());
 
   struct Section {
     uint64_t start, end;
@@ -274,7 +257,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     return s;
   };
 
-  auto instrAllStr = [&](const MCInst &inst, ArrayRef<uint8_t> buf = {}) -> std::string {
+  auto instAllStr = [&](const MCInst &inst, ArrayRef<uint8_t> buf = {}) -> std::string {
     std::string s;
     if (inst.getOpcode() == X86_BAD) {
       s += "bad";
@@ -297,13 +280,13 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
   };
 
   #define panicUnsupportedInstr(inst) {\
-    auto s0 = instrAllStr(inst); \
+    auto s0 = instAllStr(inst); \
     fprintf(stderr, "%s:%d: unsupported instr %s\n", __FILE__, __LINE__, s0.c_str()); \
     exit(-1); \
     __builtin_unreachable(); \
   }
 
-  auto getInstrInfo = [&](const MCInst &inst, bool panic = true) -> InstrInfo {
+  auto getInstInfo = [&](const MCInst &inst, bool panic = true) -> InstrInfo {
     auto n = inst.getNumOperands();
     InstrInfo r = {
       .mIdx = -1,
@@ -401,9 +384,9 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     #undef RET
   };
 
-  auto instrUsedRegMask = [&](const MCInst &inst) -> unsigned {
+  auto instUsedRegMask = [&](const MCInst &inst) -> unsigned {
     unsigned mask = 0;
-    auto info = getInstrInfo(inst);
+    auto info = getInstInfo(inst);
 
     auto addR = [&](unsigned r) {
       unsigned sr = superReg(r);
@@ -457,7 +440,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
   const char *kOpTypeStrs[] = {
     "normal_op",
     "tls_stack_canary",
-    "tls_op_normal",
+    "tls_op",
     "syscall",
   };
 
@@ -524,20 +507,20 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
 
   using SmallCode = SmallString<256>;
 
-  auto disamInstrBuf = [&](const std::string &prefix, ArrayRef<uint8_t> buf, uint64_t va = 0) {
+  auto dismInstBuf = [&](const std::string &prefix, ArrayRef<uint8_t> buf, uint64_t va = 0) {
     MCInst Inst;
     uint64_t Size;
     for (int addr = 0; addr < buf.size(); ) {
       mcDecode(Inst, Size, buf.slice(addr));
     print:
       outs() << prefix << " " << fmt("%lx", addr+va) << 
-        " " << instrAllStr(Inst, buf.slice(addr,  Size)) << 
+        " " << instAllStr(Inst, buf.slice(addr,  Size)) << 
         "\n";
       addr += Size;
     }
   };
 
-  auto forInstrAround = [&](AddrAndIdx ai, int maxDist, std::function<int(AddrAndIdx i)> fn) -> bool {
+  auto forInstAround = [&](AddrAndIdx ai, int maxDist, std::function<int(AddrAndIdx i)> fn) -> bool {
     auto addr = ai.addr;
     for (int i = ai.idx; i > 0 && ai.addr-addr < maxDist; i--) {
       if (i != ai.idx) {
@@ -563,32 +546,32 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     return false;
   };
 
-  auto decodeInstr = [&](uint64_t addr) -> OpcodeAndSize {
-    MCInst Inst;
-    uint64_t Size;
-    mcDecode(Inst, Size, instrBuf.slice(addr));
+  auto decodeInst = [&](uint64_t addr) -> OpcodeAndSize {
+    MCInst inst;
+    uint64_t size;
+    mcDecode(inst, size, instBuf.slice(addr));
 
-    if (Inst.getOpcode() == X86_BAD) {
+    if (inst.getOpcode() == X86_BAD) {
       return {.op = X86_BAD, .size = 1, .type = kNormalOp};
     }
 
-    auto &idesc = MII->get(Inst.getOpcode());
+    auto &idesc = MII->get(inst.getOpcode());
     unsigned type = kNormalOp;
     unsigned used = 0;
 
-    if (Inst.getOpcode() == X86::SYSCALL) {
+    if (inst.getOpcode() == X86::SYSCALL) {
       type = kSyscall;
       used = 1;
     } else {
       for (int i = 0; i < idesc.NumOperands; i++) {
-        auto od = Inst.getOperand(i);
+        auto od = inst.getOperand(i);
         auto opinfo = idesc.OpInfo[i];
         if (opinfo.RegClass == X86::SEGMENT_REGRegClassID) {
           if (od.getReg() == X86::FS) {
             type = kTlsOp;
             used = 1;
             if (i > 0) {
-              auto preOp = Inst.getOperand(i-1);
+              auto preOp = inst.getOperand(i-1);
               if (preOp.isImm() && preOp.getImm() == 40) {
                 type = kTlsStackCanary;
               }
@@ -600,25 +583,21 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     }
 
     return {
-      .op = (uint16_t)Inst.getOpcode(),
-      .size = (uint8_t)Size,
+      .op = (uint16_t)inst.getOpcode(),
+      .size = (uint8_t)size,
       .used = used,
       .type = type,
     };
   };
 
-  std::vector<AddrAndIdx> fsInstrs;
+  std::vector<AddrAndIdx> fsInsts;
   std::vector<AddrAndIdx> badRanges;
   const int BadMaxDiff = 100;
 
-  auto instStrview = [&](AddrAndIdx i) -> std::string_view {
-    return {(char *)instrBuf.data()+i.addr, allOpcode[i.idx].size};
-  };
-
-  std::hash<std::string_view> strhash;
+  std::hash<std::string_view> strHash;
 
   auto instHash = [&](AddrAndIdx i) -> size_t {
-    return strhash(instStrview(i));
+    return strHash({(char *)instBuf.data()+i.addr, allOpcode[i.idx].size});
   };
 
   struct OccurPair {
@@ -631,7 +610,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
   for (auto &sec: allSecs) {
     sec.startIdx = allOpcode.size();
     for (uint64_t addr = sec.start; addr < sec.end; ) {
-      auto op = decodeInstr(addr);
+      auto op = decodeInst(addr);
 
       auto idx = (int)allOpcode.size();
 
@@ -651,7 +630,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
       addr += op.size;
 
       if (op.type >= kTlsStackCanary) {
-        fsInstrs.push_back(ai);
+        fsInsts.push_back(ai);
       }
 
       if (op.type != kNormalOp) {
@@ -688,9 +667,9 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
       uint64_t Size;
       auto p = instOccur[sortIdx[i]];
       auto op = allOpcode[p.i.idx];
-      ArrayRef<uint8_t> b = {instrBuf.data() + p.i.addr, op.size};
+      ArrayRef<uint8_t> b = {instBuf.data() + p.i.addr, op.size};
       mcDecode(Inst, Size, b);
-      auto s = instrAllStr(Inst);
+      auto s = instAllStr(Inst);
       outsfmt("instoccur %d %s %d\n", i, s.c_str(), p.n);
     }
    }
@@ -701,7 +680,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
         allOpcode[j].bad = 1;
       }
     }
-    forInstrAround(bi, BadMaxDiff, [&](AddrAndIdx i) -> int {
+    forInstAround(bi, BadMaxDiff, [&](AddrAndIdx i) -> int {
       allOpcode[i.idx].bad = 1;
       allOpcode[i.idx].used = 1;
       return -1;
@@ -717,7 +696,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     }
   }
 
-  auto printInstr = [&](AddrAndIdx ai, JmpRes jmp) {
+  auto printInst = [&](AddrAndIdx ai, JmpRes jmp) {
     auto op = allOpcode[ai.idx];
     auto addr = ai.addr;
 
@@ -729,7 +708,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
 
     MCInst Inst;
     uint64_t Size;
-    mcDecode(Inst, Size, instrBuf.slice(addr));
+    mcDecode(Inst, Size, instBuf.slice(addr));
 
     std::string tag = kJmpTypeStrs[jmp.type];
 
@@ -746,7 +725,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     }
 
     outs() << formatInstHeader(addr, Size) <<
-      sep << instrAllStr(Inst, instrBuf.slice(addr, Size)) <<
+      sep << instAllStr(Inst, instBuf.slice(addr, Size)) <<
       sep << kOpTypeStrs[op.type] <<
       sep << tag << 
       "\n";
@@ -828,7 +807,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
       if (inst.getOpcode() == X86::JCC_4 || inst.getOpcode() == X86::JMP_4) {
         return true;
       }
-      auto info = getInstrInfo(inst);
+      auto info = getInstInfo(inst);
       if (info.mIdx != -1) {
         auto reg = superReg(inst.getOperand(info.mIdx).getReg());
         if (reg == X86::RIP) {
@@ -854,7 +833,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     MCInst inst1;
     uint64_t size1;
     auto addr1 = i.addr;
-    mcDecode(inst1, size1, instrBuf.slice(addr1));
+    mcDecode(inst1, size1, instBuf.slice(addr1));
     auto backAddr1 = addr1+size1;
 
     /*
@@ -866,11 +845,11 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
       inst1.op inst1.reg, (%tmp) // modified instr
       pop %tmp // recovery tmp
     */
-    auto info = getInstrInfo(inst1);
+    auto info = getInstInfo(inst1);
     if (info.mIdx == -1) {
       panicUnsupportedInstr(inst1);
     }
-    unsigned used = instrUsedRegMask(inst1);
+    unsigned used = instUsedRegMask(inst1);
     int ti = gpFindFreeReg(used);
     if (ti == -1) {
       panicUnsupportedInstr(inst1);
@@ -923,7 +902,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     MCInst inst;
     uint64_t size;
     auto addr = i.addr;
-    mcDecode(inst, size, instrBuf.slice(addr));
+    mcDecode(inst, size, instBuf.slice(addr));
     auto backAddr = addr+size;
 
     if (inst.getOpcode() == X86::SYSCALL) {
@@ -1080,7 +1059,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     if (op == X86::JCC_1 || op == X86::JMP_1) {
       return false;
     }
-    auto info = getInstrInfo(inst, false);
+    auto info = getInstInfo(inst, false);
     if (!info.ok) {
       return false;
     }
@@ -1096,7 +1075,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
   auto canReplaceIdx = [&](AddrAndIdx i) -> bool {
     MCInst inst;
     uint64_t size;
-    mcDecode(inst, size, instrBuf.slice(i.addr));
+    mcDecode(inst, size, instBuf.slice(i.addr));
     return canReplaceInst(inst);
   };
 
@@ -1121,7 +1100,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
 
     AddrAndIdx j;
 
-    if (forInstrAround(i, 127, [&](AddrAndIdx i) -> int {
+    if (forInstAround(i, 127, [&](AddrAndIdx i) -> int {
       auto op = allOpcode[i.idx];
       if (canReplaceIdx(i) && !op.used && op.size >= 6) {
         j = i;
@@ -1250,7 +1229,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     return {.type = kJmpFail};
   };
 
-  auto handleInstr = [&](AddrAndIdx i) {
+  auto handleInst = [&](AddrAndIdx i) {
     auto op = allOpcode[i.idx];
 
     JmpRes jmp = doReplace(i);
@@ -1259,7 +1238,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     totJmpType[jmp.type]++;
 
     if (verbose) {
-      printInstr(i, jmp);
+      printInst(i, jmp);
     }
 
     auto stubAddr = E.code.size();
@@ -1286,12 +1265,12 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
 
     if (debug) {
       auto D = [&](const char *s, ArrayRef<uint8_t> buf, uint64_t va) {
-        disamInstrBuf(fmt("%s_%s", stype, s), buf, va);
+        dismInstBuf(fmt("%s_%s", stype, s), buf, va);
       };
       auto D2 = [&](const char *s, const uint8_t *base, AddrRange r) {
         D(s, {base+r.i.addr,r.size}, vaddr(r.i.addr));
       };
-      auto oldp = instrBuf.data();
+      auto oldp = instBuf.data();
       auto newp = newText.data();
       if (debugOnlyBefore) {
         D2("inst0_before", oldp, jmp.r0);
@@ -1306,7 +1285,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     }
   };
 
-  auto forAllInstr0 = [&](std::function<void(AddrAndIdx,const Section&)> fn) {
+  auto forAllInst0 = [&](std::function<void(AddrAndIdx,const Section&)> fn) {
     for (auto sec: allSecs) {
       if (sec.startIdx == -1) {
         continue;
@@ -1319,8 +1298,8 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     }
   };
 
-  auto forAllInstr = [&](std::function<void(AddrAndIdx)> fn) {
-    forAllInstr0([&](AddrAndIdx i, const Section& sec) {
+  auto forAllInst = [&](std::function<void(AddrAndIdx)> fn) {
+    forAllInst0([&](AddrAndIdx i, const Section& sec) {
       fn(i);
     });
   };
@@ -1340,9 +1319,9 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
         }
         int32_t off;
         if (op.op == X86::JCC_1 || op.op == X86::JMP_1) {
-          off = *(int8_t*)(instrBuf.data()+addr+op.size-1);
+          off = *(int8_t*)(instBuf.data()+addr+op.size-1);
         } else if (op.op == X86::JCC_4 || op.op == X86::JMP_4) {
-          off = *(int32_t*)(instrBuf.data()+addr+op.size-4);
+          off = *(int32_t*)(instBuf.data()+addr+op.size-4);
         } else {
           continue;
         }
@@ -1375,18 +1354,18 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
   markAllJmp();
 
   if (forAll) {
-    forAllInstr([&](AddrAndIdx i) {
-      handleInstr(i);
+    forAllInst([&](AddrAndIdx i) {
+      handleInst(i);
     });
   } else if (forSingleInstr != -1) {
-    forAllInstr([&](AddrAndIdx i) {
+    forAllInst([&](AddrAndIdx i) {
       if (vaddr(i.addr) == forSingleInstr) {
-        handleInstr(i);
+        handleInst(i);
       }
     });
   } else {
-    for (auto i: fsInstrs) {
-      handleInstr(i);
+    for (auto i: fsInsts) {
+      handleInst(i);
     }
   }
 
@@ -1399,6 +1378,58 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     }
     outs() << "\n";
   }
+}
+
+bool isElfValid(Elf64_Ehdr *eh) {
+  uint8_t osabi = eh->e_ident[EI_OSABI];
+  if (
+    eh->e_ident[EI_MAG0] != ELFMAG0 || eh->e_ident[EI_MAG1] != ELFMAG1 ||
+    eh->e_ident[EI_MAG2] != ELFMAG2 || eh->e_ident[EI_MAG3] != ELFMAG3 ||
+    eh->e_ident[EI_CLASS] != ELFCLASS64 ||
+    eh->e_ident[EI_DATA] != ELFDATA2LSB ||
+    (osabi != ELFOSABI_LINUX && osabi != ELFOSABI_SYSV) ||
+    eh->e_machine != EM_X86_64 ||
+    (eh->e_type != ET_EXEC && eh->e_type != ET_DYN)
+    )
+  {
+    return false;
+  }
+  return true;
+}
+
+void loadBin(uint8_t *fileAddr, uint64_t fileSize, int fd) {
+  Elf64_Ehdr *eh = (Elf64_Ehdr *)fileAddr;
+
+  uint64_t vaddrStart = 0;
+  uint64_t vaddrLoadEnd = 0;
+  uint8_t *phStart = (uint8_t *)eh + eh->e_phoff;
+
+  SmallVector<Elf64_Phdr*, 4> loads;
+
+  for (int i = 0; i < eh->e_phnum; i++) {
+    Elf64_Phdr *ph = (Elf64_Phdr *)(phStart + eh->e_phentsize*i);
+    if (ph->p_type == PT_LOAD) {
+      loads.push_back(ph);
+    }
+  }
+
+  if (loads.size() == 0) {
+    return;
+  }
+
+  auto lastLoad = loads[loads.size()-1];
+  auto loadSize = lastLoad->p_vaddr + lastLoad->p_memsz + loads[0]->p_vaddr;
+  void *loadAddr = mmap(NULL, loadSize, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (loadAddr == MAP_FAILED) {
+    return;
+  }
+}
+
+bool oPlayTest;
+
+void playTest() {
+  void *loadAddr = mmap((void *)0xf0000000, 4096, PROT_READ, MAP_PRIVATE|MAP_FIXED, -1, 0);
+  printf("p=%p\n", loadAddr);
 }
 
 int main(int argc, char **argv) {
@@ -1446,7 +1477,16 @@ int main(int argc, char **argv) {
       summary = true;
       continue;
     }
+    if (o == "-pt") {
+      oPlayTest = true;
+      continue;
+    }
     args.push_back(o);
+  }
+
+  if (oPlayTest) {
+    playTest();
+    return 0;
   }
 
   if (args.size() == 0) {
@@ -1471,6 +1511,11 @@ int main(int argc, char **argv) {
   auto fileAddr = (uint8_t *)mmap(NULL, fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
   if (fileAddr == MAP_FAILED) {
     fprintf(stderr, "mmap %s failed\n", filename.c_str());
+    return -1;
+  }
+
+  if (!isElfValid((Elf64_Ehdr*)fileAddr)) {
+    fprintf(stderr, "elf not supported\n");
     return -1;
   }
 
