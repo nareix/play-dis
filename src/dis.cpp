@@ -215,7 +215,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     return super;
   };
 
-  auto instrHexStr = [&](ArrayRef<uint8_t> buf) -> std::string {
+  auto instHexStr = [&](ArrayRef<uint8_t> buf) -> std::string {
     std::string hex = "[";
     for (int i = 0; i < buf.size(); i++) {
       hex += fmt("%.2X", buf[i]);
@@ -227,7 +227,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     return hex;
   };
 
-  auto instrDisStr = [&](const MCInst &inst) -> std::string {
+  auto instDisStr = [&](const MCInst &inst) -> std::string {
     Str->emitInstruction(inst, *STI);
     auto r = ss.slice(1, ss.size()-1).str();
     for (int i = 0; i < r.size(); i++) {
@@ -239,7 +239,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     return r;
   };
 
-  auto instrDumpStr = [&](const MCInst &inst) -> std::string {
+  auto instDumpStr = [&](const MCInst &inst) -> std::string {
     auto n = inst.getNumOperands();
     std::string s = std::string(IP->getOpcodeName(inst.getOpcode())) + 
         fmt("(%d),n=%d[", inst.getOpcode(), n);
@@ -263,10 +263,10 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
     if (inst.getOpcode() == X86_BAD) {
       s += "bad";
     } else {
-      s += instrDisStr(inst) + " " + instrDumpStr(inst);
+      s += instDisStr(inst) + " " + instDumpStr(inst);
     }
     if (buf.size()) {
-      s += " " + instrHexStr(buf);
+      s += " " + instHexStr(buf);
     }
     return s;
   };
@@ -951,7 +951,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
   auto emitPushJmpStub = [&](AddrRange r0, AddrRange r1, bool pushF = true) {
     /*
       push %rax; pushfq // save rax,eflags
-      lea -16(%rsp),%rax; cmp 16(%rsp),%rax // check jmpval == %rsp
+      lea -16(%rsp),%rax; cmp 16(%rsp),%rax // check push_val == %rsp
       jne 1f
     */
     E.emit(MCInstBuilder(X86::PUSH64r).addReg(X86::RAX));
@@ -1381,7 +1381,7 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
   }
 }
 
-bool isElfValid(Elf64_Ehdr *eh) {
+bool isElfSupported(Elf64_Ehdr *eh) {
   uint8_t osabi = eh->e_ident[EI_OSABI];
   if (
     eh->e_ident[EI_MAG0] != ELFMAG0 || eh->e_ident[EI_MAG1] != ELFMAG1 ||
@@ -1515,7 +1515,7 @@ int main(int argc, char **argv) {
     return -1;
   }
 
-  if (!isElfValid((Elf64_Ehdr*)fileAddr)) {
+  if (!isElfSupported((Elf64_Ehdr*)fileAddr)) {
     fprintf(stderr, "elf not supported\n");
     return -1;
   }
