@@ -1,5 +1,11 @@
 #include "elf_file.h"
 
+#include <unistd.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
 static bool elfGetPhs(u8_view file, ElfPhs &phs) {
   auto eh = (Elf64_Ehdr *)file.data();
   uint8_t *phStart = (uint8_t *)eh + eh->e_phoff;
@@ -88,6 +94,35 @@ bool parseElf(u8_view buf, ElfFile &file) {
   file.buf = buf;
   file.phX = phX;
   file.loads = std::move(loads);
+  return true;
+}
+
+bool loadElfFile(const std::string &filename, ElfFile &file, int &fd) {
+  fd = open(filename.c_str(), O_RDONLY);
+  if (fd == -1) {
+    fprintf(stderr, "open %s failed\n", filename.c_str());
+    return false;
+  }
+
+  struct stat sb;
+  if (fstat(fd, &sb) == -1) {
+    fprintf(stderr, "stat %s failed\n", filename.c_str());
+    return false;
+  }
+  auto fileSize = sb.st_size;
+
+  auto fileAddr = (uint8_t *)mmap(NULL, fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (fileAddr == MAP_FAILED) {
+    fprintf(stderr, "mmap %s failed\n", filename.c_str());
+    return false;
+  }
+
+  u8_view buf = {fileAddr, (size_t)fileSize};
+  if (!parseElf(buf, file)) {
+    fprintf(stderr, "elf not supported\n");
+    return false;
+  }
+
   return true;
 }
 

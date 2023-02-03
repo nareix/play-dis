@@ -12,9 +12,10 @@ struct ElfFile {
   Elf64_Phdr *phX;
   ElfPhs loads;
 
-  Elf64_Ehdr *eh() {
+  Elf64_Ehdr *eh() const {
     return (Elf64_Ehdr *)buf.data();
   }
 };
 
 bool parseElf(u8_view buf, ElfFile &file);
+bool loadElfFile(const std::string &filename, ElfFile &file, int &fd);

@@ -37,13 +37,9 @@
 #include <string>
 #include <string_view>
 
-#include <unistd.h>
 #include <stdint.h>
-#include <stdlib.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
 
+#include "translater.h"
 #include "utils.h"
 #include "elf_file.h"
 
@@ -73,7 +69,7 @@ public:
   }
 };
 
-void translateBin(ElfFile &file) {
+void translateBin(const ElfFile &file, TranslateResult &res) {
   Elf64_Ehdr *eh = file.eh();
 
   if (debug) {
@@ -725,32 +721,7 @@ void translateBin(ElfFile &file) {
   int totOpType[kOpTypeNr] = {};
   int totJmpType[kJmpTypeNr] = {};
 
-  enum {
-    kStubReloc,
-    kTextReloc,
-    kRelocNr,
-  };
-
-  enum {
-    kRelText,
-    kRelStub,
-    kRelCall,
-    kRelRIP,
-  };
-
-  enum {
-    kFnGetTls,
-    kFnSyscall,
-    kFnNr,
-  };
-
-  struct SimpleReloc {
-    uint32_t addr;
-    unsigned slot:2;
-    unsigned type:3;
-  };
-
-  class SimpleCE {
+  class StubCE {
   public:
     const std::unique_ptr<MCCodeEmitter> &CE2;
     const std::unique_ptr<MCSubtargetInfo> &STI;
@@ -760,7 +731,7 @@ void translateBin(ElfFile &file) {
     SmallVector<MCFixup, 4> fixups;
     std::vector<SimpleReloc> relocs;
 
-    SimpleCE(typeof(CE2) &CE2, typeof(STI) &STI, uint8_t *text): 
+    StubCE(typeof(CE2) &CE2, typeof(STI) &STI, uint8_t *text): 
       CE2(CE2), STI(STI), vcode(code), text(text) {
     }
 
@@ -791,7 +762,7 @@ void translateBin(ElfFile &file) {
     }
   };
 
-  SimpleCE E(CE2, STI, newText.data());
+  StubCE E(CE2, STI, newText.data());
 
   auto adjustImm4 = [&](MCInst &inst, uint64_t backAddr) {
     if ([&]() -> bool {
@@ -1369,23 +1340,9 @@ void translateBin(ElfFile &file) {
     }
     outs() << "\n";
   }
-}
 
-bool loadBin(ElfFile &file, int fd) {
-  auto eh = file.eh();
-  auto &loads = file.loads;
-
-  auto lastLoad = loads[loads.size()-1];
-  auto loadSize = lastLoad->p_vaddr + lastLoad->p_memsz + loads[0]->p_vaddr;
-  void *loadAddr = mmap(NULL, loadSize, PROT_READ, MAP_PRIVATE, fd, 0);
-  if (loadAddr == MAP_FAILED) {
-    return false;
-  }
-
-  for (auto ph: loads) {
-  }
-
-  return true;
+  res.newText = std::move(newText);
+  res.relocs = std::move(E.relocs);
 }
 
 int translateBinMain(const std::vector<std::string> &args0) {
@@ -1437,34 +1394,15 @@ int translateBinMain(const std::vector<std::string> &args0) {
   }
 
   auto filename = args[0];
-  int fd = open(filename.c_str(), O_RDONLY);
-  if (fd == -1) {
-    fprintf(stderr, "open %s failed\n", filename.c_str());
-    return -1;
-  }
 
-  struct stat sb;
-  if (fstat(fd, &sb) == -1) {
-    fprintf(stderr, "stat %s failed\n", filename.c_str());
-    return -1;
-  }
-  auto fileSize = sb.st_size;
-
-  auto fileAddr = (uint8_t *)mmap(NULL, fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
-  if (fileAddr == MAP_FAILED) {
-    fprintf(stderr, "mmap %s failed\n", filename.c_str());
-    return -1;
-  }
-
-  u8_view buf = {fileAddr, (size_t)fileSize};
   ElfFile file;
-
-  if (!parseElf(buf, file)) {
-    fprintf(stderr, "elf not supported\n");
+  int fd;
+  if (!loadElfFile(filename, file, fd)) {
     return -1;
   }
 
-  translateBin(file);
+  TranslateResult res;
+  translateBin(file, res);
 
   return 0;
 }

@@ -35,6 +35,7 @@ add_executable(
   src/translater.cpp
   src/loader.cpp
   src/elf_file.cpp
+  src/utils.cpp
   src/main.cpp
 )
 target_link_libraries(dis llvmdeps)

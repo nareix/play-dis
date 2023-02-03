@@ -3,4 +3,37 @@
 #include <vector>
 #include <string>
 
-int translateBinMain(const std::vector<std::string> &args0);
+#include "elf_file.h"
+
+enum {
+  kStubReloc,
+  kTextReloc,
+  kRelocNr,
+};
+
+enum {
+  kRelText,
+  kRelStub,
+  kRelCall,
+  kRelRIP,
+};
+
+enum {
+  kFnGetTls,
+  kFnSyscall,
+  kFnNr,
+};
+
+struct SimpleReloc {
+  uint32_t addr;
+  unsigned slot:2;
+  unsigned type:3;
+};
+
+struct TranslateResult {
+  std::vector<SimpleReloc> relocs;
+  std::vector<uint8_t> newText;
+};
+
+void translateBin(const ElfFile &file, TranslateResult &res);
+int translateBinMain(const std::vector<std::string> &args);
