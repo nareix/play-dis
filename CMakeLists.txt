@@ -28,5 +28,11 @@ set(LLVM_LINK_COMPONENTS
 
 add_llvm_library(llvmdeps empty.cpp)
 
-add_executable(dis src/dis.cpp src/elf_file.cpp)
+add_executable(
+  dis 
+  src/translater.cpp
+  src/loader.cpp
+  src/elf_file.cpp
+  src/main.cpp
+)
 target_link_libraries(dis llvmdeps)

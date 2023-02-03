@@ -64,7 +64,7 @@ bool parseElf(u8_view buf, ElfFile &file) {
 
   Elf64_Phdr *phX = nullptr;
   auto iphX = std::find_if(loads.begin(), loads.end(), [](auto ph) {
-    return ph->p_type == PT_LOAD && ph->p_flags & PF_X;
+    return ph->p_flags & PF_X;
   });
   if (iphX == phs.end()) {
     return false;

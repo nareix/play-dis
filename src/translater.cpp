@@ -16,6 +16,7 @@
 #include "llvm/MC/MCTargetOptionsCommandFlags.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/MC/MCInstBuilder.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Compression.h"
 #include "llvm/Support/FileUtilities.h"
@@ -59,7 +60,19 @@ static bool debugOnlyBefore;
 static bool forAll;
 static int forSingleInstr = -1;
 
-void transBin(ElfFile &file) {
+class raw_u8_ostream : public raw_ostream {
+  std::vector<uint8_t> &OS;
+  void write_impl(const char *Ptr, size_t Size) override {
+    OS.insert(OS.end(), (uint8_t*)Ptr, (uint8_t*)Ptr+Size);
+  }
+  uint64_t current_pos() const override { return OS.size(); }
+public:
+  explicit raw_u8_ostream(std::vector<uint8_t> &O) : OS(O) {
+    SetUnbuffered();
+  }
+};
+
+void translateBin(ElfFile &file) {
   Elf64_Ehdr *eh = file.eh();
 
   if (debug) {
@@ -484,8 +497,6 @@ void transBin(ElfFile &file) {
 
   std::vector<OpcodeAndSize> allOpcode;
 
-  using SmallCode = SmallString<256>;
-
   auto dismInstBuf = [&](const std::string &prefix, u8_view buf, uint64_t va = 0) {
     MCInst inst;
     uint64_t size;
@@ -742,8 +753,8 @@ void transBin(ElfFile &file) {
   public:
     const std::unique_ptr<MCCodeEmitter> &CE2;
     const std::unique_ptr<MCSubtargetInfo> &STI;
-    SmallCode code;
-    raw_svector_ostream vcode;
+    std::vector<uint8_t> code;
+    raw_u8_ostream vcode;
     uint8_t *text;
     SmallVector<MCFixup, 4> fixups;
     std::vector<SimpleReloc> relocs;
@@ -1376,20 +1387,8 @@ bool loadBin(ElfFile &file, int fd) {
   return true;
 }
 
-bool oPlayTest;
-
-void playTest() {
-  void *loadAddr = mmap((void *)0xf0000000, 4096, PROT_READ, MAP_PRIVATE|MAP_FIXED, -1, 0);
-  printf("p=%p\n", loadAddr);
-}
-
-int main(int argc, char **argv) {
+int translateBinMain(const std::vector<std::string> &args0) {
   std::vector<std::string> args;
-  std::vector<std::string> args0;
-
-  for (int i = 1; i < argc; i++) {
-    args0.push_back(std::string(argv[i]));
-  }
 
   for (int i = 0; i < args0.size(); i++) {
     auto &o = args0[i];
@@ -1428,16 +1427,7 @@ int main(int argc, char **argv) {
       summary = true;
       continue;
     }
-    if (o == "-pt") {
-      oPlayTest = true;
-      continue;
-    }
     args.push_back(o);
-  }
-
-  if (oPlayTest) {
-    playTest();
-    return 0;
   }
 
   if (args.size() == 0) {
@@ -1473,7 +1463,7 @@ int main(int argc, char **argv) {
     return -1;
   }
 
-  transBin(file);
+  translateBin(file);
 
   return 0;
 }
