@@ -42,17 +42,10 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
+#include "utils.h"
 #include "elf.h"
 
 using namespace llvm;
-
-template <typename... Types>
-std::string fmt(const char *f, Types... args) {
-  ssize_t n = snprintf(NULL, 0, f, args...);
-  char buf[n+1];
-  snprintf(buf, n+1, f, args...);
-  return std::string(buf);
-}
 
 template <typename... Types>
 void outsfmt(const char *f, Types... args) {
@@ -66,13 +59,23 @@ static bool debugOnlyBefore;
 static bool forAll;
 static int forSingleInstr = -1;
 
-uint64_t alignAddr(uint64_t base, uint64_t align) {
+static uint64_t alignAddr(uint64_t base, uint64_t align) {
   return (base + (align - 1)) & ~(align - 1);
 };
 
-using ElfPhs = SmallVector<Elf64_Phdr*, 4>;
+using ElfPhs = SmallVector<Elf64_Phdr*, 8>;
 
-bool elfAllPh(ArrayRef<uint8_t> file, ElfPhs &phs) {
+struct ElfFile {
+  u8_view buf;
+  Elf64_Phdr *phX;
+  ElfPhs loads;
+
+  Elf64_Ehdr *eh() {
+    return (Elf64_Ehdr *)buf.data();
+  }
+};
+
+bool elfGetPhs(u8_view file, ElfPhs &phs) {
   auto eh = (Elf64_Ehdr *)file.data();
   uint8_t *phStart = (uint8_t *)eh + eh->e_phoff;
   for (int i = 0; i < eh->e_phnum; i++) {
@@ -88,7 +91,7 @@ bool elfAllPh(ArrayRef<uint8_t> file, ElfPhs &phs) {
   return true;
 }
 
-bool elfDynFindTag(ArrayRef<uint8_t> file, Elf64_Phdr *ph, Elf64_Sxword tag, Elf64_Xword &v) {
+bool elfDynFindTag(u8_view file, Elf64_Phdr *ph, Elf64_Sxword tag, Elf64_Xword &v) {
   auto dynStart = file.data() + ph->p_offset;
   for (auto e = (Elf64_Dyn *)dynStart; (uint8_t *)e < file.end(); e++) {
     if (e->d_tag == DT_NULL) {
@@ -102,15 +105,7 @@ bool elfDynFindTag(ArrayRef<uint8_t> file, Elf64_Phdr *ph, Elf64_Sxword tag, Elf
   return false;
 }
 
-struct ElfFile {
-  ArrayRef<uint8_t> buf;
-  Elf64_Phdr *phX;
-  Elf64_Ehdr *eh() {
-    return (Elf64_Ehdr *)buf.data();
-  }
-};
-
-bool parseElf(ArrayRef<uint8_t> buf, ElfFile &file) {
+bool parseElf(u8_view buf, ElfFile &file) {
   auto eh = (Elf64_Ehdr *)buf.data();
   if (buf.size() < sizeof(Elf64_Ehdr)) {
     return false;
@@ -130,11 +125,20 @@ bool parseElf(ArrayRef<uint8_t> buf, ElfFile &file) {
     return false;
   }
 
-  ElfPhs phs;
-  elfAllPh(buf, phs);
+  ElfPhs phs, loads;
+  elfGetPhs(buf, phs);
+
+  for (auto ph: phs) {
+    if (ph->p_type == PT_LOAD) {
+      loads.push_back(ph);
+    }
+  }
+  if (loads.size() == 0) {
+    return false;
+  }
 
   Elf64_Phdr *phX = nullptr;
-  auto iphX = std::find_if(phs.begin(), phs.end(), [](auto ph) {
+  auto iphX = std::find_if(loads.begin(), loads.end(), [](auto ph) {
     return ph->p_type == PT_LOAD && ph->p_flags & PF_X;
   });
   if (iphX == phs.end()) {
@@ -158,6 +162,7 @@ bool parseElf(ArrayRef<uint8_t> buf, ElfFile &file) {
 
   file.buf = buf;
   file.phX = phX;
+  file.loads = loads;
   return true;
 }
 
@@ -178,7 +183,7 @@ void transBin(ElfFile &file) {
     outsfmt("load off %lx size %lx\n", phX->p_offset, phX->p_filesz);
   }
 
-  ArrayRef<uint8_t> instBuf((uint8_t *)eh + phX->p_offset, phX->p_filesz);
+  u8_view instBuf((uint8_t *)eh + phX->p_offset, phX->p_filesz);
   auto vaddr = [&](uint64_t addr) -> uint64_t {
     return addr + phX->p_vaddr;
   };
@@ -251,8 +256,8 @@ void transBin(ElfFile &file) {
   std::unique_ptr<MCDisassembler> DisAsm(T->createMCDisassembler(*STI, Ctx));
 
   auto constexpr X86_BAD = X86::INSTRUCTION_LIST_END+1;
-  auto mcDecode = [&](MCInst &inst, uint64_t &size, ArrayRef<uint8_t> buf) {
-    auto r = DisAsm->getInstruction(inst, size, buf, 0, nulls());
+  auto mcDecode = [&](MCInst &inst, uint64_t &size, u8_view buf) {
+    auto r = DisAsm->getInstruction(inst, size, {buf.data(), buf.size()}, 0, nulls());
     if (r != MCDisassembler::DecodeStatus::Success) {
       inst.setOpcode(X86_BAD);
       size = 1;
@@ -295,7 +300,7 @@ void transBin(ElfFile &file) {
     return super;
   };
 
-  auto instHexStr = [&](ArrayRef<uint8_t> buf) -> std::string {
+  auto instHexStr = [&](u8_view buf) -> std::string {
     std::string hex = "[";
     for (int i = 0; i < buf.size(); i++) {
       hex += fmt("%.2X", buf[i]);
@@ -338,7 +343,7 @@ void transBin(ElfFile &file) {
     return s;
   };
 
-  auto instAllStr = [&](const MCInst &inst, ArrayRef<uint8_t> buf = {}) -> std::string {
+  auto instAllStr = [&](const MCInst &inst, u8_view buf = {}) -> std::string {
     std::string s;
     if (inst.getOpcode() == X86_BAD) {
       s += "bad";
@@ -588,7 +593,7 @@ void transBin(ElfFile &file) {
 
   using SmallCode = SmallString<256>;
 
-  auto dismInstBuf = [&](const std::string &prefix, ArrayRef<uint8_t> buf, uint64_t va = 0) {
+  auto dismInstBuf = [&](const std::string &prefix, u8_view buf, uint64_t va = 0) {
     MCInst inst;
     uint64_t size;
     for (int addr = 0; addr < buf.size(); ) {
@@ -748,7 +753,7 @@ void transBin(ElfFile &file) {
       uint64_t size;
       auto p = instOccur[sortIdx[i]];
       auto op = allOpcode[p.i.idx];
-      ArrayRef<uint8_t> b = {instBuf.data() + p.i.addr, op.size};
+      u8_view b = {instBuf.data() + p.i.addr, (size_t)op.size};
       mcDecode(inst, size, b);
       auto s = instAllStr(inst);
       outsfmt("instoccur %d %s %d\n", i, s.c_str(), p.n);
@@ -858,7 +863,7 @@ void transBin(ElfFile &file) {
       CE2->encodeInstruction(inst, vcode, fixups, *STI);
     }
 
-    ArrayRef<uint8_t> codeSlice(size_t start) {
+    u8_view codeSlice(size_t start) {
       return {(uint8_t *)code.data()+start, code.size()-start};
     }
 
@@ -1345,7 +1350,7 @@ void transBin(ElfFile &file) {
     }
 
     if (debug) {
-      auto D = [&](const char *s, ArrayRef<uint8_t> buf, uint64_t va) {
+      auto D = [&](const char *s, u8_view buf, uint64_t va) {
         dismInstBuf(fmt("%s_%s", stype, s), buf, va);
       };
       auto D2 = [&](const char *s, const uint8_t *base, AddrRange r) {
@@ -1461,32 +1466,21 @@ void transBin(ElfFile &file) {
   }
 }
 
-void loadBin(uint8_t *fileAddr, uint64_t fileSize, int fd) {
-  Elf64_Ehdr *eh = (Elf64_Ehdr *)fileAddr;
-
-  uint64_t vaddrStart = 0;
-  uint64_t vaddrLoadEnd = 0;
-  uint8_t *phStart = (uint8_t *)eh + eh->e_phoff;
-
-  SmallVector<Elf64_Phdr*, 4> loads;
-
-  for (int i = 0; i < eh->e_phnum; i++) {
-    Elf64_Phdr *ph = (Elf64_Phdr *)(phStart + eh->e_phentsize*i);
-    if (ph->p_type == PT_LOAD) {
-      loads.push_back(ph);
-    }
-  }
-
-  if (loads.size() == 0) {
-    return;
-  }
+bool loadBin(ElfFile &file, int fd) {
+  auto eh = file.eh();
+  auto &loads = file.loads;
 
   auto lastLoad = loads[loads.size()-1];
   auto loadSize = lastLoad->p_vaddr + lastLoad->p_memsz + loads[0]->p_vaddr;
   void *loadAddr = mmap(NULL, loadSize, PROT_READ, MAP_PRIVATE, fd, 0);
   if (loadAddr == MAP_FAILED) {
-    return;
+    return false;
   }
+
+  for (auto ph: loads) {
+  }
+
+  return true;
 }
 
 bool oPlayTest;
@@ -1578,7 +1572,7 @@ int main(int argc, char **argv) {
     return -1;
   }
 
-  ArrayRef<uint8_t> buf = {fileAddr, (size_t)fileSize};
+  u8_view buf = {fileAddr, (size_t)fileSize};
   ElfFile file;
 
   if (!parseElf(buf, file)) {
