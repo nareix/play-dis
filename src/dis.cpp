@@ -31,6 +31,7 @@
 #include "X86BaseInfo.h"
 
 #include <vector>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -69,33 +70,112 @@ uint64_t alignAddr(uint64_t base, uint64_t align) {
   return (base + (align - 1)) & ~(align - 1);
 };
 
-void transBin(uint8_t *fileAddr, size_t fileSize) {
-  Elf64_Ehdr *eh = (Elf64_Ehdr *)fileAddr;
+using ElfPhs = SmallVector<Elf64_Phdr*, 4>;
+
+bool elfAllPh(ArrayRef<uint8_t> file, ElfPhs &phs) {
+  auto eh = (Elf64_Ehdr *)file.data();
+  uint8_t *phStart = (uint8_t *)eh + eh->e_phoff;
+  for (int i = 0; i < eh->e_phnum; i++) {
+    Elf64_Phdr *ph = (Elf64_Phdr *)(phStart + eh->e_phentsize*i);
+    if ((uint8_t *)ph + sizeof(Elf64_Phdr) > file.end()) {
+      return false;
+    }
+    if (ph->p_offset + ph->p_filesz >= file.size()) {
+      return false;
+    }
+    phs.push_back(ph);
+  }
+  return true;
+}
+
+bool elfDynFindTag(ArrayRef<uint8_t> file, Elf64_Phdr *ph, Elf64_Xword &v) {
+  auto dynStart = file.data() + ph->p_offset;
+  for (auto e = (Elf64_Dyn *)dynStart; (uint8_t *)e < file.end(); e++) {
+    if (e->d_tag == DT_NULL) {
+      break;
+    }
+    if (e->d_tag == DT_FLAGS_1) {
+      v = e->d_un.d_val;
+      return true;
+    }
+  }
+  return false;
+}
+
+struct ElfFile {
+  ArrayRef<uint8_t> buf;
+  Elf64_Phdr *phX;
+  Elf64_Ehdr *eh() {
+    return (Elf64_Ehdr *)buf.data();
+  }
+};
+
+bool parseElf(ArrayRef<uint8_t> buf, ElfFile &file) {
+  auto eh = (Elf64_Ehdr *)buf.data();
+  if (buf.size() < sizeof(Elf64_Ehdr)) {
+    return false;
+  }
+
+  uint8_t osabi = eh->e_ident[EI_OSABI];
+  if (
+    eh->e_ident[EI_MAG0] != ELFMAG0 || eh->e_ident[EI_MAG1] != ELFMAG1 ||
+    eh->e_ident[EI_MAG2] != ELFMAG2 || eh->e_ident[EI_MAG3] != ELFMAG3 ||
+    eh->e_ident[EI_CLASS] != ELFCLASS64 ||
+    eh->e_ident[EI_DATA] != ELFDATA2LSB ||
+    (osabi != ELFOSABI_LINUX && osabi != ELFOSABI_SYSV) ||
+    eh->e_machine != EM_X86_64 ||
+    (eh->e_type != ET_DYN && eh->e_type != ET_EXEC)
+    )
+  {
+    return false;
+  }
+
+  ElfPhs phs;
+  elfAllPh(buf, phs);
+
+  Elf64_Phdr *phX = nullptr;
+  auto iphX = std::find_if(phs.begin(), phs.end(), [](auto ph) {
+    return ph->p_type == PT_LOAD && ph->p_flags & PF_X;
+  });
+  if (iphX == phs.end()) {
+    return false;
+  }
+  phX = *iphX;
+
+  if (eh->e_type == ET_EXEC) {
+    auto it = std::find_if(phs.begin(), phs.end(), [](Elf64_Phdr *ph) -> bool {
+      return ph->p_type == PT_DYNAMIC;
+    });
+    if (it == phs.end()) {
+      return false;
+    }
+    Elf64_Xword flags1 = 0;
+    elfDynFindTag(buf, *it, flags1);
+    if (!(flags1 & DF_1_PIE)) {
+      return false;
+    }
+  }
+
+  file.buf = buf;
+  file.phX = phX;
+  return true;
+}
+
+void transBin(ElfFile &file) {
+  Elf64_Ehdr *eh = file.eh();
 
   if (debug) {
     outsfmt("filesize %lx e_ehsize %d e_phoff %lx size %d e_shoff %lx size %d\n",
-      fileSize, eh->e_ehsize,
+      file.buf.size(), eh->e_ehsize,
       eh->e_phoff, eh->e_phentsize*eh->e_phnum,
       eh->e_shoff, eh->e_shentsize*eh->e_shnum
     );
   }
 
-  uint64_t vaddrLoadEnd = 0;
-  Elf64_Phdr *phX = NULL;
-  uint8_t *phStart = (uint8_t *)eh + eh->e_phoff;
-  for (int i = 0; i < eh->e_phnum; i++) {
-    Elf64_Phdr *ph = (Elf64_Phdr *)(phStart + eh->e_phentsize*i);
-    if (ph->p_type == PT_LOAD) {
-      if (ph->p_flags & PF_X) {
-        phX = ph;
-      }
-      vaddrLoadEnd = ph->p_vaddr + ph->p_memsz;
-    }
-  }
+  auto phX = file.phX;
 
   if (debug) {
     outsfmt("load off %lx size %lx\n", phX->p_offset, phX->p_filesz);
-    outsfmt("load end %lx\n", vaddrLoadEnd);
   }
 
   ArrayRef<uint8_t> instBuf((uint8_t *)eh + phX->p_offset, phX->p_filesz);
@@ -1381,23 +1461,6 @@ void transBin(uint8_t *fileAddr, size_t fileSize) {
   }
 }
 
-bool isElfSupported(Elf64_Ehdr *eh) {
-  uint8_t osabi = eh->e_ident[EI_OSABI];
-  if (
-    eh->e_ident[EI_MAG0] != ELFMAG0 || eh->e_ident[EI_MAG1] != ELFMAG1 ||
-    eh->e_ident[EI_MAG2] != ELFMAG2 || eh->e_ident[EI_MAG3] != ELFMAG3 ||
-    eh->e_ident[EI_CLASS] != ELFCLASS64 ||
-    eh->e_ident[EI_DATA] != ELFDATA2LSB ||
-    (osabi != ELFOSABI_LINUX && osabi != ELFOSABI_SYSV) ||
-    eh->e_machine != EM_X86_64 ||
-    (eh->e_type != ET_EXEC && eh->e_type != ET_DYN)
-    )
-  {
-    return false;
-  }
-  return true;
-}
-
 void loadBin(uint8_t *fileAddr, uint64_t fileSize, int fd) {
   Elf64_Ehdr *eh = (Elf64_Ehdr *)fileAddr;
 
@@ -1515,12 +1578,15 @@ int main(int argc, char **argv) {
     return -1;
   }
 
-  if (!isElfSupported((Elf64_Ehdr*)fileAddr)) {
+  ArrayRef<uint8_t> buf = {fileAddr, (size_t)fileSize};
+  ElfFile file;
+
+  if (!parseElf(buf, file)) {
     fprintf(stderr, "elf not supported\n");
     return -1;
   }
 
-  transBin(fileAddr, fileSize);
+  transBin(file);
 
   return 0;
 }
