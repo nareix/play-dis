@@ -12,6 +12,8 @@ add_definitions(${LLVM_DEFINITIONS})
 list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
 include(AddLLVM)
 
+set(CMAKE_CXX_FLAGS "-fno-rtti")
+
 set (CMAKE_CXX_STANDARD 20)
 # add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
 # add_link_options(-fsanitize=address -fno-omit-frame-pointer)

@@ -31,6 +31,7 @@
 #include "llvm/Support/ConvertUTF.h"
 #include "X86BaseInfo.h"
 
+#include <iostream>
 #include <vector>
 #include <optional>
 #include <string>
