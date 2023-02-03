@@ -17,13 +17,15 @@ public:
     u8_view( Args&&... args ) 
        : std::basic_string_view<uint8_t>(std::forward<Args>(args)...) {  }
 
-  u8_view() { u8_view(nullptr, 0); }
+  u8_view() { 
+    u8_view(nullptr, 0); 
+  }
 
   u8_view slice(size_t start) {
-    return {data()+start, size()-start};
+    return {data() + start, size() - start};
   }
 
   u8_view slice(size_t start, size_t size) {
-    return {data()+start, size};
+    return {data() + start, size};
   }
 };
