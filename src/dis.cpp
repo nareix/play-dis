@@ -88,13 +88,13 @@ bool elfAllPh(ArrayRef<uint8_t> file, ElfPhs &phs) {
   return true;
 }
 
-bool elfDynFindTag(ArrayRef<uint8_t> file, Elf64_Phdr *ph, Elf64_Xword &v) {
+bool elfDynFindTag(ArrayRef<uint8_t> file, Elf64_Phdr *ph, Elf64_Sxword tag, Elf64_Xword &v) {
   auto dynStart = file.data() + ph->p_offset;
   for (auto e = (Elf64_Dyn *)dynStart; (uint8_t *)e < file.end(); e++) {
     if (e->d_tag == DT_NULL) {
       break;
     }
-    if (e->d_tag == DT_FLAGS_1) {
+    if (e->d_tag == tag) {
       v = e->d_un.d_val;
       return true;
     }
@@ -150,7 +150,7 @@ bool parseElf(ArrayRef<uint8_t> buf, ElfFile &file) {
       return false;
     }
     Elf64_Xword flags1 = 0;
-    elfDynFindTag(buf, *it, flags1);
+    elfDynFindTag(buf, *it, DT_FLAGS_1, flags1);
     if (!(flags1 & DF_1_PIE)) {
       return false;
     }
