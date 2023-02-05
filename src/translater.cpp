@@ -83,7 +83,7 @@ void translateBin(const ElfFile &file, TranslateResult &res) {
   auto phX = file.phX;
 
   if (debug) {
-    outsfmt("load off %lx size %lx\n", phX->p_offset, phX->p_filesz);
+    outsfmt("load off %lx size %lx secs %d\n", phX->p_offset, phX->p_filesz, file.secs.size());
   }
 
   u8_view instBuf((uint8_t *)eh + phX->p_offset, phX->p_filesz);
@@ -95,31 +95,26 @@ void translateBin(const ElfFile &file, TranslateResult &res) {
 
   struct Section {
     uint64_t start, end;
-    std::string name;
+    const std::string &name;
     int startIdx, endIdx;
   };
   std::vector<Section> allSecs;
   std::string plt = ".plt";
 
-  uint8_t *shStart = (uint8_t *)eh + eh->e_shoff;
-  Elf64_Shdr *shStrtab = (Elf64_Shdr *)(shStart + eh->e_shentsize*eh->e_shstrndx);
-  const char *strtab = (const char *)((uint8_t *)eh + shStrtab->sh_offset);
-  for (int i = 0; i < eh->e_shnum; i++) {
-    Elf64_Shdr *sh = (Elf64_Shdr *)(shStart + eh->e_shentsize*i);
-    auto name = std::string(strtab + sh->sh_name);
-    if (!(sh->sh_flags & SHF_EXECINSTR)) {
+  for (auto &s: file.secs) {
+    if (!(s.sh->sh_flags & SHF_EXECINSTR)) {
       continue;
     }
-    if (name.substr(0, plt.size()) == plt) {
+    if (s.name.substr(0, plt.size()) == plt) {
       continue;
     }
-    uint64_t addr = sh->sh_offset - phX->p_offset;
+    uint64_t addr = s.sh->sh_offset - phX->p_offset;
     uint64_t start = addr;
-    uint64_t end = addr + sh->sh_size;
+    uint64_t end = addr + s.sh->sh_size;
     if (debug) {
-      outsfmt("section %s %lx %lx\n", name.c_str(), vaddr(start), vaddr(end));
+      outsfmt("section %s %lx %lx\n", s.name.c_str(), vaddr(start), vaddr(end));
     }
-    allSecs.push_back({.start = addr, .end = end, .name = name, .startIdx = -1});
+    allSecs.push_back({.start = addr, .end = end, .name = s.name, .startIdx = -1});
   }
 
   LLVMInitializeX86TargetInfo();
@@ -687,12 +682,6 @@ void translateBin(const ElfFile &file, TranslateResult &res) {
     auto op = allOpcode[ai.idx];
     auto addr = ai.addr;
 
-    std::string sep = " ";
-
-    auto formatInstHeader = [&](uint64_t addr, uint64_t size) -> std::string {
-      return fmt("%lx", vaddr(addr));
-    };
-
     MCInst inst;
     uint64_t size;
     mcDecode(inst, size, instBuf.slice(addr));
@@ -711,7 +700,8 @@ void translateBin(const ElfFile &file, TranslateResult &res) {
       tag += ":jmpto";
     }
 
-    outs() << formatInstHeader(addr, size) <<
+    std::string sep = " ";
+    outs() << fmt("%lx", vaddr(addr)) <<
       sep << instAllStr(inst, instBuf.slice(addr, size)) <<
       sep << kOpTypeStrs[op.type] <<
       sep << tag << 
@@ -1397,7 +1387,7 @@ int translateBinMain(const std::vector<std::string> &args0) {
 
   ElfFile file;
   int fd;
-  if (!loadElfFile(filename, file, fd)) {
+  if (!openElfFile(filename, file, fd)) {
     return -1;
   }
 

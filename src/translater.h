@@ -31,8 +31,8 @@ struct SimpleReloc {
 };
 
 struct TranslateResult {
-  std::vector<SimpleReloc> relocs;
   std::vector<uint8_t> newText;
+  std::vector<SimpleReloc> relocs;
 };
 
 void translateBin(const ElfFile &file, TranslateResult &res);

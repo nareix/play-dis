@@ -5,8 +5,9 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <string.h>
 
-static bool elfGetPhs(u8_view file, ElfPhs &phs) {
+static bool elfGetPhs(u8_view file, std::vector<Elf64_Phdr*> &phs) {
   auto eh = (Elf64_Ehdr *)file.data();
   uint8_t *phStart = (uint8_t *)eh + eh->e_phoff;
   for (int i = 0; i < eh->e_phnum; i++) {
@@ -56,7 +57,17 @@ bool parseElf(u8_view buf, ElfFile &file) {
     return false;
   }
 
-  ElfPhs phs, loads;
+  uint8_t *shStart = (uint8_t *)eh + eh->e_shoff;
+  Elf64_Shdr *shStrtab = (Elf64_Shdr *)(shStart + eh->e_shentsize*eh->e_shstrndx);
+  const char *strtab = (const char *)((uint8_t *)eh + shStrtab->sh_offset);
+  for (int i = 0; i < eh->e_shnum; i++) {
+    Elf64_Shdr *sh = (Elf64_Shdr *)(shStart + eh->e_shentsize*i);
+    auto sstart = (char *)strtab + sh->sh_name;
+    std::string name = std::string(sstart);
+    file.secs.push_back({sh, std::move(name)});
+  }
+
+  std::vector<Elf64_Phdr*> phs, loads;
   elfGetPhs(buf, phs);
 
   for (auto ph: phs) {
@@ -97,7 +108,7 @@ bool parseElf(u8_view buf, ElfFile &file) {
   return true;
 }
 
-bool loadElfFile(const std::string &filename, ElfFile &file, int &fd) {
+bool openElfFile(const std::string &filename, ElfFile &file, int &fd) {
   fd = open(filename.c_str(), O_RDONLY);
   if (fd == -1) {
     fprintf(stderr, "open %s failed\n", filename.c_str());
