@@ -9,20 +9,19 @@
 
 class Translater {
 public:
-  enum class RelocType {
-    Stub,
+  enum class SlotType: int {
     Text,
-    Nr,
+    Stub,
   };
 
-  enum class RelType {
+  enum class RelType: int {
     Text,
     Stub,
-    Call,
     RIP,
+    Func,
   };
 
-  enum class FuncType {
+  enum class FuncType: int {
     GetTls,
     Syscall,
     Nr,
@@ -31,11 +30,19 @@ public:
   struct Reloc {
     uint32_t addr;
     unsigned slot:2;
-    unsigned type:3;
+    unsigned rel:3;
+  };
+
+  struct Patch {
+    uint32_t addr;
+    uint32_t off;
+    uint16_t size;
   };
 
   struct Result {
     std::vector<Reloc> relocs;
+    std::vector<uint8_t> patchCode;
+    std::vector<Patch> patches;
     std::vector<uint8_t> stubCode;
   };
 
@@ -46,7 +53,8 @@ public:
   static bool forAll;
   static int forSingleInstr;
 
-  static void translate(const ElfFile &file, u8_view newText, Result &res);
-  static void apply(u8_view newText, const Result &res);
+  static void translate(const ElfFile &file, Result &res);
+  static void applyPatch(u8_view code, const std::vector<Patch> &patches, const std::vector<uint8_t> &patchCode);
+  static void applyReloc(u8_view code, u8_view stubCode, const std::vector<Reloc> &relocs, void **funcs);
   static int cmdMain(const std::vector<std::string> &args);
 };

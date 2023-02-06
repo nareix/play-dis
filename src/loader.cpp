@@ -17,7 +17,7 @@ bool loadBin(const ElfFile &file, int fd, uint8_t *&loadAddr) {
   auto loadSize = (*loadn)->p_vaddr + (*loadn)->p_memsz + (*load0)->p_vaddr;
   auto fileSize = file.buf.size();
 
-  auto align = 1UL << (64 - __builtin_clzll((uint64_t)fileSize) + 8);
+  auto align = 1UL << (64 - __builtin_clzll(fileSize) + 8);
   if (debug) {
     fprintf(stderr, "loadbin: align %lx\n", loadSize);
   }
@@ -27,6 +27,7 @@ bool loadBin(const ElfFile &file, int fd, uint8_t *&loadAddr) {
     return false;
   }
 
+  munmap(loadAddr, fileSize);
   loadAddr = (uint8_t *)((uint64_t)loadAddr & ~(align-1));
   loadAddr = (uint8_t *)mmap(loadAddr, fileSize, PROT_READ, MAP_PRIVATE|MAP_FIXED, fd, 0);
   if (loadAddr == MAP_FAILED) {
@@ -52,7 +53,7 @@ bool loadBin(const ElfFile &file, int fd, uint8_t *&loadAddr) {
     if (ph->p_flags & PF_R) {
       prot |= PROT_READ;
     }
-    if (ph->p_flags & PF_W) {
+    if (ph->p_flags & (PF_W|PF_X)) {
       prot |= PROT_WRITE;
     }
 

@@ -29,7 +29,42 @@ static int doLoad(const std::vector<std::string> &args) {
     return -1;
   }
 
-  file.phX->p_vaddr;
+  struct Runtime {
+    static void *getTls() {
+      asm("ud2");
+      return nullptr;
+    }
+
+    static void syscall(uint64_t idx, ...) {
+      asm("ud2");
+    }
+  };
+
+  void *funcs[] = {
+    (void *)Runtime::getTls,
+    (void *)Runtime::syscall,
+  };
+
+  {
+    Translater::Result res;
+    Translater::translate(file, res);
+
+    auto p = (uint8_t *)mmap(NULL, res.stubCode.size(), PROT_READ|PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+      return -1;
+    }
+
+    u8_view stubCode = {p, res.stubCode.size()};
+    memcpy((void *)stubCode.data(), res.stubCode.data(), res.stubCode.size());
+    u8_view code = {loadAddr, file.phX->p_filesz};
+
+    if (std::abs(stubCode.data() - code.data()) > (1<<31)) {
+      return -1;
+    }
+
+    Translater::applyPatch(code, res.patches, res.patchCode);
+    Translater::applyReloc(code, stubCode, res.relocs, funcs);
+  }
 
   auto entryAddr = loadAddr + file.eh()->e_entry - (*file.loads.begin())->p_vaddr;
   int stackSize = 1024*128;
@@ -95,18 +130,14 @@ static int doLoad(const std::vector<std::string> &args) {
   stackStart -= vsize;
   memcpy(stackStart, v.data(), vsize);
 
-  auto text = std::find_if(file.secs.begin(), file.secs.end(), [](auto &s) {
-    return s.name == ".text";
-  });
-  if (text == file.secs.end()) {
-    return -1;
-  }
-
-  auto textLoadAddr = loadAddr + text->sh->sh_offset - file.loads[0]->p_offset;
-  fprintf(stderr, "add-symbol-file %s %p\n", filename.c_str(), textLoadAddr);
-
-  static void fn() {
-  }
+  // auto text = std::find_if(file.secs.begin(), file.secs.end(), [](auto &s) {
+  //   return s.name == ".text";
+  // });
+  // if (text == file.secs.end()) {
+  //   return -1;
+  // }
+  // auto textLoadAddr = loadAddr + text->sh->sh_offset - file.loads[0]->p_offset;
+  // fprintf(stderr, "add-symbol-file %s %p\n", filename.c_str(), textLoadAddr);
 
   asm("mov %0, %%rsp" :: "r"(stackStart));
   asm("jmpq *%0" :: "r"(entryAddr));
