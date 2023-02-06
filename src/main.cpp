@@ -105,6 +105,9 @@ static int doLoad(const std::vector<std::string> &args) {
   auto textLoadAddr = loadAddr + text->sh->sh_offset - file.loads[0]->p_offset;
   fprintf(stderr, "add-symbol-file %s %p\n", filename.c_str(), textLoadAddr);
 
+  static void fn() {
+  }
+
   asm("mov %0, %%rsp" :: "r"(stackStart));
   asm("jmpq *%0" :: "r"(entryAddr));
 
