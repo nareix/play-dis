@@ -1326,6 +1326,7 @@ void Translater::translate(const ElfFile &file, u8_view newText, Translater::Res
     for (int i = 1; i < kJmpTypeNr; i++) {
       outs() << kJmpTypeStrs[i] << " " << totJmpType[i] << " ";
     }
+    outs() << "stubCode " << E.code.size();
     outs() << "\n";
   }
 

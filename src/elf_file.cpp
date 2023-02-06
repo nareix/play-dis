@@ -87,23 +87,22 @@ bool ElfFile::parse(u8_view buf, ElfFile &file) {
   }
   phX = *iphX;
 
+  bool isPIE = false;
   if (eh->e_type == ET_EXEC) {
     auto it = std::find_if(phs.begin(), phs.end(), [](Elf64_Phdr *ph) -> bool {
       return ph->p_type == PT_DYNAMIC;
     });
-    if (it == phs.end()) {
-      return false;
-    }
-    Elf64_Xword flags1 = 0;
-    dynFindTag(buf, *it, DT_FLAGS_1, flags1);
-    if (!(flags1 & DF_1_PIE)) {
-      return false;
+    if (it != phs.end()) {
+      Elf64_Xword flags1 = 0;
+      dynFindTag(buf, *it, DT_FLAGS_1, flags1);
+      isPIE = flags1 & DF_1_PIE;
     }
   }
 
   file.buf = buf;
   file.phX = phX;
   file.loads = std::move(loads);
+  file.isPIE = isPIE;
   return true;
 }
 

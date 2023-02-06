@@ -16,6 +16,7 @@ struct ElfFile {
 
   std::vector<Elf64_Phdr*> loads;
   std::vector<Section> secs;
+  bool isPIE;
 
   Elf64_Ehdr *eh() const {
     return (Elf64_Ehdr *)buf.data();
