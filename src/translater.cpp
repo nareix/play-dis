@@ -756,43 +756,37 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     u8_view codeSlice(size_t start) {
       return {(uint8_t *)code.data()+start, code.size()-start};
     }
-
-    void patchReloc(int32_t v, RelType rel = RelType::Stub) {
-      auto addr = patchAddr();
-      int p = patchCode.size();
-      patchCode.resize(p+4);
-      *(int32_t *)&patchCode[p] = v;
-      relocs.push_back({(uint32_t)addr, (unsigned)SlotType::Text, (unsigned)rel});
-    }
-
-    void relocStub(int32_t v, RelType rel = RelType::Text, bool add = false) {
-      auto addr = code.size()-4;
-      auto p = (int32_t *)&code[addr];
-      if (add) {
-        *p += v;
-      } else {
-        *p = v;
-      }
-      relocs.push_back({(uint32_t)addr, (unsigned)SlotType::Stub, (unsigned)rel});
-    }
   };
 
   StubCE E(CE2, STI);
 
-  auto adjustRIPImm4 = [&](MCInst &inst) {
-    if ([&]() -> bool {
-      if (inst.getOpcode() == X86::JCC_4 || inst.getOpcode() == X86::JMP_4) {
-        return true;
+  // text jmp to stub (Add)
+  // v = v + stub - text
+  // v = v + (stubStart+stubAddr) - (loadStart+addr)
+  // v = v + stubAddr-addr + (stubStart-loadStart)
+
+  // stub jmp to text (Sub)
+  // v = v + text - stub
+  // v = v + (loadAddr+addr) - (stubStart+stubAddr)
+  // v = v + addr-stubAddr - (stubStart-loadStart)
+
+  auto adjustRIPImm4 = [&](MCInst &inst, uint64_t addr) {
+    if (inst.getOpcode() == X86::JCC_4 || inst.getOpcode() == X86::JMP_4) {
+      // v = v + text - stub (Sub)
+      // v = v + addr-stubAddr - (stubStart-loadStart)
+      *(int32_t *)&E.code[E.code.size()-4] += int(addr) - int(E.code.size());
+      E.relocs.push_back({(uint32_t)E.code.size(), (unsigned)SlotType::Stub, (unsigned)RelType::Sub});
+      return;
+    }
+    auto info = getInstInfo(inst);
+    if (info.mIdx != -1) {
+      if (inst.getOperand(info.mIdx).getReg() == X86::RIP) {
+        // v = v + stub - text (Add)
+        // v = v + stubAddr-addr + (stubStart-loadStart)
+        *(int32_t *)&E.code[E.code.size()-4] += int(E.code.size()) - int(addr);
+        E.relocs.push_back({(uint32_t)E.code.size(), (unsigned)SlotType::Stub, (unsigned)RelType::Add});
+        return;
       }
-      auto info = getInstInfo(inst);
-      if (info.mIdx != -1) {
-        if (inst.getOperand(info.mIdx).getReg() == X86::RIP) {
-          return true;
-        }
-      }
-      return false;
-    }()) {
-      E.relocStub(E.code.size(), RelType::RIP, true);
     }
   };
 
@@ -844,7 +838,7 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     }
     lea.getOperand(5).setReg(0);
     E.emit(lea);
-    adjustRIPImm4(lea);
+    adjustRIPImm4(lea, i.addr+size1);
 
     if (useRsp) {
       E.emit(MCInstBuilder(X86::LEA64r)
@@ -873,11 +867,10 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
   auto emitOldNormalInst = [&](AddrAndIdx i) {
     MCInst inst;
     uint64_t size;
-    auto addr = i.addr;
-    mcDecode(inst, size, instBuf.slice(addr));
+    mcDecode(inst, size, instBuf.slice(i.addr));
 
     E.emit(inst);
-    adjustRIPImm4(inst);
+    adjustRIPImm4(inst, i.addr+size);
   };
 
   auto emitOldInst = [&](AddrAndIdx i) {
@@ -901,7 +894,11 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
 
   auto emitJmpBack = [&](AddrRange r) {
     E.emit(MCInstBuilder(X86::JMP_4).addImm(128));
-    E.relocStub(r.i.addr+r.size);
+    // v = stub - text (Add)
+    // v = stubAddr-addr + (stubStart-loadStart)
+    auto addr = r.i.addr+r.size;
+    *(int32_t *)&E.code[E.code.size()-4] = int(E.code.size()) - int(addr);
+    E.relocs.push_back({(uint32_t)E.code.size(), (unsigned)SlotType::Stub, (unsigned)RelType::Add});
   };
 
   auto emitDirectJmpStub = [&](AddrRange r0, bool ret = false) {
@@ -968,6 +965,15 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     emitJmpBack(r1);
   };
 
+  auto patch32Reloc = [&](uint64_t stubAddr) {
+    auto p = E.patchCode.size();
+    E.patchCode.resize(p+4);
+    // v = stub - text (Add)
+    // v = stubAddr-addr + (stubStart-loadStart)
+    *(int32_t *)&E.patchCode[p] = int(stubAddr) - int(E.patchAddr());
+    E.relocs.push_back({(uint32_t)E.patchAddr(), (unsigned)SlotType::Patch, (unsigned)RelType::Add});
+  };
+
   auto modifyLongJmp = [&](AddrRange r0, uint64_t stubAddr, unsigned op = 0) {
     E.patchStart(r0.i.addr);
     int n = r0.size;
@@ -977,7 +983,7 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     }
     E.patchRep(0xf2, n-5); // repne call
     E.patch8(0xe9);
-    E.patchReloc(stubAddr);
+    patch32Reloc(stubAddr);
     E.patchEnd();
   };
 
@@ -1006,7 +1012,7 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     E.patchStart(r0.i.addr);
     E.patchRep(0xf2, r0.size-5); // repne call
     E.patch8(0xe8);
-    E.patchReloc(stubAddr);
+    patch32Reloc(stubAddr);
     E.patchEnd();
   };
 
@@ -1392,15 +1398,15 @@ void Translater::applyReloc(u8_view code, u8_view stubCode, const std::vector<Re
   for (auto r: relocs) {
     uint8_t *base = nullptr;
     switch ((SlotType)r.slot) {
-    case SlotType::Text: base = (uint8_t *)code.data(); break;
+    case SlotType::Patch: base = (uint8_t *)code.data(); break;
     case SlotType::Stub: base = (uint8_t *)stubCode.data(); break;
     }
 
     auto p = base + r.addr;
+    auto diff = int32_t(stubCode.data() - code.data());
     switch ((RelType)r.rel) {
-    case RelType::Text: break;
-    case RelType::Stub: break;
-    case RelType::RIP: *(int32_t *)p += stubCode.data() - code.data(); break;
+    case RelType::Add: *(int32_t *)p += diff; break;
+    case RelType::Sub: *(int32_t *)p -= diff; break;
     case RelType::Func: *(void **)p = funcs[*(uint64_t *)p]; break;
     }
   }

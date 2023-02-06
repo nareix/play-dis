@@ -10,14 +10,13 @@
 class Translater {
 public:
   enum class SlotType: int {
-    Text,
+    Patch,
     Stub,
   };
 
   enum class RelType: int {
-    Text,
-    Stub,
-    RIP,
+    Add,
+    Sub,
     Func,
   };
 
