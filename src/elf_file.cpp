@@ -7,23 +7,7 @@
 #include <fcntl.h>
 #include <string.h>
 
-static bool elfGetPhs(u8_view file, std::vector<Elf64_Phdr*> &phs) {
-  auto eh = (Elf64_Ehdr *)file.data();
-  uint8_t *phStart = (uint8_t *)eh + eh->e_phoff;
-  for (int i = 0; i < eh->e_phnum; i++) {
-    Elf64_Phdr *ph = (Elf64_Phdr *)(phStart + eh->e_phentsize*i);
-    if ((uint8_t *)ph + sizeof(Elf64_Phdr) > file.end()) {
-      return false;
-    }
-    if (ph->p_offset + ph->p_filesz >= file.size()) {
-      return false;
-    }
-    phs.push_back(ph);
-  }
-  return true;
-}
-
-static bool elfDynFindTag(u8_view file, Elf64_Phdr *ph, Elf64_Sxword tag, Elf64_Xword &v) {
+static bool dynFindTag(u8_view file, Elf64_Phdr *ph, Elf64_Sxword tag, Elf64_Xword &v) {
   auto dynStart = file.data() + ph->p_offset;
   for (auto e = (Elf64_Dyn *)dynStart; (uint8_t *)e < file.end(); e++) {
     if (e->d_tag == DT_NULL) {
@@ -62,13 +46,28 @@ bool parseElf(u8_view buf, ElfFile &file) {
   const char *strtab = (const char *)((uint8_t *)eh + shStrtab->sh_offset);
   for (int i = 0; i < eh->e_shnum; i++) {
     Elf64_Shdr *sh = (Elf64_Shdr *)(shStart + eh->e_shentsize*i);
-    auto sstart = (char *)strtab + sh->sh_name;
-    std::string name = std::string(sstart);
+    auto s = (const char *)strtab + sh->sh_name;
+    int maxlen = (uint8_t *)buf.end() - (uint8_t *)s;
+    if (maxlen < 0) {
+      return false;
+    }
+    std::string name = std::string(s, strnlen(s, maxlen));
     file.secs.push_back({sh, std::move(name)});
   }
 
   std::vector<Elf64_Phdr*> phs, loads;
-  elfGetPhs(buf, phs);
+
+  uint8_t *phStart = (uint8_t *)eh + eh->e_phoff;
+  for (int i = 0; i < eh->e_phnum; i++) {
+    Elf64_Phdr *ph = (Elf64_Phdr *)(phStart + eh->e_phentsize*i);
+    if ((uint8_t *)ph + sizeof(Elf64_Phdr) > buf.end()) {
+      return false;
+    }
+    if (ph->p_offset + ph->p_filesz >= buf.size()) {
+      return false;
+    }
+    phs.push_back(ph);
+  }
 
   for (auto ph: phs) {
     if (ph->p_type == PT_LOAD) {
@@ -96,7 +95,7 @@ bool parseElf(u8_view buf, ElfFile &file) {
       return false;
     }
     Elf64_Xword flags1 = 0;
-    elfDynFindTag(buf, *it, DT_FLAGS_1, flags1);
+    dynFindTag(buf, *it, DT_FLAGS_1, flags1);
     if (!(flags1 & DF_1_PIE)) {
       return false;
     }
