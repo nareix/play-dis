@@ -21,7 +21,7 @@ static bool dynFindTag(u8_view file, Elf64_Phdr *ph, Elf64_Sxword tag, Elf64_Xwo
   return false;
 }
 
-bool parseElf(u8_view buf, ElfFile &file) {
+bool ElfFile::parse(u8_view buf, ElfFile &file) {
   auto eh = (Elf64_Ehdr *)buf.data();
   if (buf.size() < sizeof(Elf64_Ehdr)) {
     return false;
@@ -107,8 +107,8 @@ bool parseElf(u8_view buf, ElfFile &file) {
   return true;
 }
 
-bool openElfFile(const std::string &filename, ElfFile &file, int &fd) {
-  fd = open(filename.c_str(), O_RDONLY);
+bool ElfFile::open(const std::string &filename, ElfFile &file, int &fd) {
+  fd = ::open(filename.c_str(), O_RDONLY);
   if (fd == -1) {
     fprintf(stderr, "open %s failed\n", filename.c_str());
     return false;
@@ -128,7 +128,7 @@ bool openElfFile(const std::string &filename, ElfFile &file, int &fd) {
   }
 
   u8_view buf = {fileAddr, (size_t)fileSize};
-  if (!parseElf(buf, file)) {
+  if (!parse(buf, file)) {
     fprintf(stderr, "elf not supported\n");
     return false;
   }

@@ -50,13 +50,6 @@ void outsfmt(const char *f, Types... args) {
   outs() << fmt(f, args...);
 }
 
-static bool verbose;
-static bool summary;
-static bool debug;
-static bool debugOnlyBefore;
-static bool forAll;
-static int forSingleInstr = -1;
-
 class raw_u8_ostream : public raw_ostream {
   std::vector<uint8_t> &OS;
   void write_impl(const char *Ptr, size_t Size) override {
@@ -69,7 +62,7 @@ public:
   }
 };
 
-void translateBin(const ElfFile &file, TranslateResult &res) {
+void Translater::translate(const ElfFile &file, u8_view newText, Translater::Result &res) {
   Elf64_Ehdr *eh = file.eh();
 
   if (debug) {
@@ -90,8 +83,6 @@ void translateBin(const ElfFile &file, TranslateResult &res) {
   auto vaddr = [&](uint64_t addr) -> uint64_t {
     return addr + phX->p_vaddr;
   };
-
-  auto newText = std::vector<uint8_t>(instBuf.begin(), instBuf.end());
 
   struct Section {
     uint64_t start, end;
@@ -711,6 +702,11 @@ void translateBin(const ElfFile &file, TranslateResult &res) {
   int totOpType[kOpTypeNr] = {};
   int totJmpType[kJmpTypeNr] = {};
 
+  using Reloc = Translater::Reloc;
+  using RelocType = Translater::RelocType;
+  using RelType = Translater::RelType;
+  using FuncType = Translater::FuncType;
+
   class StubCE {
   public:
     const std::unique_ptr<MCCodeEmitter> &CE2;
@@ -719,7 +715,7 @@ void translateBin(const ElfFile &file, TranslateResult &res) {
     raw_u8_ostream vcode;
     uint8_t *text;
     SmallVector<MCFixup, 4> fixups;
-    std::vector<SimpleReloc> relocs;
+    std::vector<Reloc> relocs;
 
     StubCE(typeof(CE2) &CE2, typeof(STI) &STI, uint8_t *text): 
       CE2(CE2), STI(STI), vcode(code), text(text) {
@@ -733,7 +729,7 @@ void translateBin(const ElfFile &file, TranslateResult &res) {
       return {(uint8_t *)code.data()+start, code.size()-start};
     }
 
-    void reloc(int slot, int type, uint8_t *base, uint32_t addr, int32_t v, bool add = false) {
+    void reloc(RelocType slot, RelType type, uint8_t *base, uint32_t addr, int32_t v, bool add = false) {
       auto p = (int32_t *)(base + addr);
       if (add) {
         *p += v;
@@ -743,16 +739,16 @@ void translateBin(const ElfFile &file, TranslateResult &res) {
       relocs.push_back({(uint32_t)addr, (unsigned)slot, (unsigned)type});
     }
 
-    void relocStub(int32_t v, int type = kRelText, bool add = false) {
-      reloc(kStubReloc, type, (uint8_t *)code.data(), code.size()-4, v, add);
+    void relocStub(int32_t v, RelType type = RelType::Text, bool add = false) {
+      reloc(RelocType::Stub, type, (uint8_t *)code.data(), code.size()-4, v, add);
     }
 
-    void relocText(uint64_t addr, int32_t v, int type = kRelStub) {
-      reloc(kTextReloc, type, text, addr, v);
+    void relocText(uint64_t addr, int32_t v, RelType type = RelType::Stub) {
+      reloc(RelocType::Text, type, text, addr, v);
     }
   };
 
-  StubCE E(CE2, STI, newText.data());
+  StubCE E(CE2, STI, (uint8_t *)newText.data());
 
   auto adjustImm4 = [&](MCInst &inst, uint64_t backAddr) {
     if ([&]() -> bool {
@@ -768,7 +764,7 @@ void translateBin(const ElfFile &file, TranslateResult &res) {
       }
       return false;
     }()) {
-      E.relocStub(-int32_t(backAddr), kRelRIP, true);
+      E.relocStub(-int32_t(backAddr), RelType::RIP, true);
     }
   };
 
@@ -778,7 +774,7 @@ void translateBin(const ElfFile &file, TranslateResult &res) {
     E.code.push_back(0);
     E.code.push_back(0);
     E.code.push_back(0);
-    E.relocStub(fn, kRelCall);
+    E.relocStub(fn, RelType::Call);
   };
 
   auto emitOldTlsInst = [&](AddrAndIdx i) {
@@ -833,7 +829,7 @@ void translateBin(const ElfFile &file, TranslateResult &res) {
 
     E.emit(MCInstBuilder(X86::PUSH64r).addReg(X86::RAX));
 
-    emitCallFn(kFnGetTls);
+    emitCallFn((int)FuncType::GetTls);
 
     E.emit(MCInstBuilder(X86::LEA64r)
       .addReg(tmpReg).addReg(X86::RAX).addImm(1).addReg(tmpReg).addImm(0).addReg(0));
@@ -858,7 +854,7 @@ void translateBin(const ElfFile &file, TranslateResult &res) {
     auto backAddr = addr+size;
 
     if (inst.getOpcode() == X86::SYSCALL) {
-      emitCallFn(kFnSyscall);
+      emitCallFn((int)FuncType::Syscall);
       return;
     }
 
@@ -948,36 +944,38 @@ void translateBin(const ElfFile &file, TranslateResult &res) {
     emitJmpBack(r1);
   };
 
+  auto newTextM = (uint8_t *)newText.data();
+
   auto modifyLongJmp = [&](AddrRange r0, uint64_t stubAddr) {
     while (r0.size > 5) {
-      newText[r0.i.addr] = 0xf2; // repne
+      newTextM[r0.i.addr] = 0xf2; // repne
       r0.i.addr++;
       r0.size--;
     }
-    newText[r0.i.addr] = 0xe9; // jmp
+    newTextM[r0.i.addr] = 0xe9; // jmp
     E.relocText(r0.i.addr+1, stubAddr);
   };
 
   auto modifyShortJmp = [&](AddrRange r0, AddrRange r1, int off1 = 0) {
     while (r0.size > 2) {
-      newText[r0.i.addr] = 0xf2; // repne
+      newTextM[r0.i.addr] = 0xf2; // repne
       r0.i.addr++;
       r0.size--;
     }
     auto addr1 = r1.i.addr + off1;
-    newText[r0.i.addr] = 0xeb; // jmp
-    newText[r0.i.addr+1] = uint8_t(int8_t(int64_t(r0.i.addr+2)-int64_t(addr1)));
+    newTextM[r0.i.addr] = 0xeb; // jmp
+    newTextM[r0.i.addr+1] = uint8_t(int8_t(int64_t(r0.i.addr+2)-int64_t(addr1)));
   };
 
   auto modifyPushRspJmp = [&](AddrRange r0, uint64_t stubAddr) {
-    newText[r0.i.addr] = 0x54; // push %rsp
+    newTextM[r0.i.addr] = 0x54; // push %rsp
     r0.i.addr++;
     r0.size--;
     modifyLongJmp(r0, stubAddr);
   };
 
   auto modifyPushFJmp = [&](AddrRange r0, AddrRange r1) {
-    newText[r0.i.addr] = 0x9c; // pushf
+    newTextM[r0.i.addr] = 0x9c; // pushf
     r0.i.addr++;
     r0.size--;
     modifyShortJmp(r0, r1, 1); // skip push %rsp
@@ -986,11 +984,11 @@ void translateBin(const ElfFile &file, TranslateResult &res) {
   auto modifyCall = [&](AddrRange r0, int fn) {
     assert(r0.size >= 5);
     while (r0.size > 5) {
-      newText[r0.i.addr++] = 0xf2;
+      newTextM[r0.i.addr++] = 0xf2;
       r0.size--;
     }
-    newText[r0.i.addr++] = 0xe8;
-    *(int32_t *)&newText[r0.i.addr] = fn;
+    newTextM[r0.i.addr++] = 0xe8;
+    *(int32_t *)&newTextM[r0.i.addr] = fn;
   };
 
   auto singleAddrRange = [&](AddrAndIdx i) -> AddrRange {
@@ -1331,11 +1329,18 @@ void translateBin(const ElfFile &file, TranslateResult &res) {
     outs() << "\n";
   }
 
-  res.newText = std::move(newText);
   res.relocs = std::move(E.relocs);
+  res.stubCode = std::move(E.code);
 }
 
-int translateBinMain(const std::vector<std::string> &args0) {
+bool Translater::verbose;
+bool Translater::summary;
+bool Translater::debug;
+bool Translater::debugOnlyBefore;
+bool Translater::forAll;
+int Translater::forSingleInstr = -1;
+
+int Translater::cmdMain(const std::vector<std::string> &args0) {
   std::vector<std::string> args;
 
   for (int i = 0; i < args0.size(); i++) {
@@ -1387,12 +1392,14 @@ int translateBinMain(const std::vector<std::string> &args0) {
 
   ElfFile file;
   int fd;
-  if (!openElfFile(filename, file, fd)) {
+  if (!ElfFile::open(filename, file, fd)) {
     return -1;
   }
 
-  TranslateResult res;
-  translateBin(file, res);
+  std::vector<uint8_t> newText;
+  newText.reserve(file.phX->p_filesz);
+  Translater::Result res;
+  translate(file, {newText.begin(), newText.end()}, res);
 
   return 0;
 }

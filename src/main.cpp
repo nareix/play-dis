@@ -20,7 +20,7 @@ static int doLoad(const std::vector<std::string> &args) {
   auto filename = args[0];
   ElfFile file;
   int fd;
-  if (!openElfFile(filename, file, fd)) {
+  if (!ElfFile::open(filename, file, fd)) {
     return -1;
   }
 
@@ -28,6 +28,8 @@ static int doLoad(const std::vector<std::string> &args) {
   if (!loadBin(file, fd, loadAddr)) {
     return -1;
   }
+
+  file.phX->p_vaddr;
 
   auto entryAddr = loadAddr + file.eh()->e_entry - (*file.loads.begin())->p_vaddr;
   int stackSize = 1024*128;
@@ -125,7 +127,7 @@ int main(int argc, char **argv) {
   args = {args.begin()+1, args.end()};
 
   if (action == "trans") {
-    return translateBinMain(args);
+    return Translater::cmdMain(args);
   } else if (action == "load") {
     return doLoad(args);
   } else {

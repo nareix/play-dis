@@ -2,38 +2,51 @@
 
 #include <vector>
 #include <string>
+#include <optional>
 
+#include "utils.h"
 #include "elf_file.h"
 
-enum {
-  kStubReloc,
-  kTextReloc,
-  kRelocNr,
-};
+class Translater {
+public:
+  enum class RelocType {
+    Stub,
+    Text,
+    Nr,
+  };
 
-enum {
-  kRelText,
-  kRelStub,
-  kRelCall,
-  kRelRIP,
-};
+  enum class RelType {
+    Text,
+    Stub,
+    Call,
+    RIP,
+  };
 
-enum {
-  kFnGetTls,
-  kFnSyscall,
-  kFnNr,
-};
+  enum class FuncType {
+    GetTls,
+    Syscall,
+    Nr,
+  };
 
-struct SimpleReloc {
-  uint32_t addr;
-  unsigned slot:2;
-  unsigned type:3;
-};
+  struct Reloc {
+    uint32_t addr;
+    unsigned slot:2;
+    unsigned type:3;
+  };
 
-struct TranslateResult {
-  std::vector<uint8_t> newText;
-  std::vector<SimpleReloc> relocs;
-};
+  struct Result {
+    std::vector<Reloc> relocs;
+    std::vector<uint8_t> stubCode;
+  };
 
-void translateBin(const ElfFile &file, TranslateResult &res);
-int translateBinMain(const std::vector<std::string> &args);
+  static bool verbose;
+  static bool summary;
+  static bool debug;
+  static bool debugOnlyBefore;
+  static bool forAll;
+  static int forSingleInstr;
+
+  static void translate(const ElfFile &file, u8_view newText, Result &res);
+  static void apply(u8_view newText, const Result &res);
+  static int cmdMain(const std::vector<std::string> &args);
+};

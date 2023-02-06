@@ -20,7 +20,7 @@ struct ElfFile {
   Elf64_Ehdr *eh() const {
     return (Elf64_Ehdr *)buf.data();
   }
-};
 
-bool parseElf(u8_view buf, ElfFile &file);
-bool openElfFile(const std::string &filename, ElfFile &file, int &fd);
+  static bool open(const std::string &filename, ElfFile &file, int &fd);
+  static bool parse(u8_view buf, ElfFile &file);
+};
