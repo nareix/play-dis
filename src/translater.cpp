@@ -732,7 +732,7 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
       patchCode.push_back(v);
     }
 
-    void patchRep(uint8_t v, int n) {
+    void patchn(uint8_t v, int n) {
       while (n > 0) {
         patchCode.push_back(v);
         n--;
@@ -981,7 +981,7 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
       E.patch8(op);
       n--;
     }
-    E.patchRep(0xf2, n-5); // repne call
+    E.patchn(0xf2, n-5); // repne call
     E.patch8(0xe9);
     patch32Reloc(stubAddr);
     E.patchEnd();
@@ -994,7 +994,7 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
       E.patch8(op);
       n--;
     }
-    E.patchRep(0xf2, n-2); // repne jmp
+    E.patchn(0xf2, n-2); // repne jmp
     E.patch8(0xeb);
     E.patch8(int(E.patchAddr() + 1) - int(r1.i.addr + off1));
     E.patchEnd();
@@ -1010,7 +1010,7 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
 
   auto modifyCall = [&](AddrRange r0, int stubAddr) {
     E.patchStart(r0.i.addr);
-    E.patchRep(0xf2, r0.size-5); // repne call
+    E.patchn(0xf2, r0.size-5); // repne call
     E.patch8(0xe8);
     patch32Reloc(stubAddr);
     E.patchEnd();
@@ -1206,7 +1206,7 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
 
   for (int i = 0; i < (int)FuncType::Nr; i++) {
     // repne jmpq *(%rip); .long addr // total 16 byte
-   for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 6; i++) {
       E.code.push_back(0xf2);
     }
     E.code.push_back(0xff);
@@ -1234,27 +1234,39 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     auto patchIdx = E.patches.size();
     auto stype = kJmpTypeStrs[jmp.type];
 
-    if (jmp.type == kPushJmp) {
-      modifyPushRspJmp(jmp.r0, stubAddr);
-      modifyPushFJmp(jmp.r1, jmp.r0);
-      emitPushJmpStub(jmp.r0, jmp.r1);
-    } else if (jmp.type == kPushJmp2) {
-      modifyPushRspJmp(jmp.r0, stubAddr);
-      modifyShortJmp(jmp.r1, jmp.r0, 1);
-      emitPushJmpStub(jmp.r0, jmp.r1, false);
-    } else if (jmp.type == kDirectJmp) {
-      auto i = instOccurMap.find(instHash(jmp.r0.i));
-      assert(i != instOccurMap.end());
-      int oi = i->second;
-      auto &o = instOccur[oi];
-      if (!o.addr) {
-        o.addr = stubAddr;
-        emitDirectJmpStub(jmp.r0, true);
+    switch (jmp.type) {
+      case kPushJmp: {
+        modifyPushRspJmp(jmp.r0, stubAddr);
+        modifyPushFJmp(jmp.r1, jmp.r0);
+        emitPushJmpStub(jmp.r0, jmp.r1);
+        break;
       }
-      modifyCall(jmp.r0, o.addr);
-    } else if (jmp.type == kCombineJmp) {
-      modifyLongJmp(jmp.r0, stubAddr);
-      emitDirectJmpStub(jmp.r0);
+
+      case kPushJmp2: {
+        modifyPushRspJmp(jmp.r0, stubAddr);
+        modifyShortJmp(jmp.r1, jmp.r0, 1);
+        emitPushJmpStub(jmp.r0, jmp.r1, false);
+        break;
+      }
+
+      case kDirectJmp: {
+        auto i = instOccurMap.find(instHash(jmp.r0.i));
+        assert(i != instOccurMap.end());
+        int oi = i->second;
+        auto &o = instOccur[oi];
+        if (!o.addr) {
+          o.addr = stubAddr;
+          emitDirectJmpStub(jmp.r0, true);
+        }
+        modifyCall(jmp.r0, o.addr);
+        break;
+      }
+
+      case kCombineJmp: {
+        modifyLongJmp(jmp.r0, stubAddr);
+        emitDirectJmpStub(jmp.r0);
+        break;
+      }
     }
 
     if (debug) {
@@ -1375,8 +1387,6 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     for (int i = 1; i < kJmpTypeNr; i++) {
       outs() << kJmpTypeStrs[i] << " " << totJmpType[i] << " ";
     }
-    outs() << "stubCode " << E.code.size() << " ";
-    outs() << "patches " << E.patches.size() << " ";
     outs() << "\n";
   }
 
@@ -1385,7 +1395,6 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
   res.patches = std::move(E.patches);
   res.patchCode = std::move(E.patchCode);
 }
-
 
 void Translater::applyPatch(u8_view code, const std::vector<Patch> &patches, const std::vector<uint8_t> &patchCode) {
   auto codep = (uint8_t *)code.data();
@@ -1407,7 +1416,7 @@ void Translater::applyReloc(u8_view code, u8_view stubCode, const std::vector<Re
     switch ((RelType)r.rel) {
     case RelType::Add: *(int32_t *)p += diff; break;
     case RelType::Sub: *(int32_t *)p -= diff; break;
-    case RelType::Func: *(void **)p = funcs[*(uint64_t *)p]; break;
+    case RelType::Func: *(uint64_t *)p = (uint64_t)funcs[*(uint64_t *)p]; break;
     }
   }
 }

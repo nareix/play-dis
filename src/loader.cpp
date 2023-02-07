@@ -8,7 +8,7 @@
 
 static const bool debug = true;
 
-bool loadBin(const ElfFile &file, int fd, uint8_t *&loadAddr) {
+bool loadBin(const ElfFile &file, int fd, uint8_t *&loadAddr, uint8_t *&loadAddrPhX) {
   auto eh = file.eh();
   auto &loads = file.loads;
 
@@ -57,12 +57,16 @@ bool loadBin(const ElfFile &file, int fd, uint8_t *&loadAddr) {
       prot |= PROT_WRITE;
     }
 
-    void *p = mmap(loadAddr + vaddrStart, mapSize, prot, MAP_PRIVATE|MAP_FIXED, fd, fileOff);
+    auto p = (uint8_t *)mmap(loadAddr + vaddrStart, mapSize, prot, MAP_PRIVATE|MAP_FIXED, fd, fileOff);
     if (debug) {
       fprintf(stderr, "loadbin: ph[%d] %p size %lx off %lx\n", i, p, mapSize, fileOff);
     }
     if (p == MAP_FAILED) {
       return false;
+    }
+
+    if (ph == file.phX) {
+      loadAddrPhX = p + diff;
     }
 
     auto vaddrEndAlign = (vaddrEnd + ph->p_align - 1) & ~(ph->p_align-1);

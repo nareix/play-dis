@@ -40,9 +40,9 @@ public:
 
   struct Result {
     std::vector<Reloc> relocs;
+    std::vector<uint8_t> stubCode;
     std::vector<uint8_t> patchCode;
     std::vector<Patch> patches;
-    std::vector<uint8_t> stubCode;
   };
 
   static bool verbose;
