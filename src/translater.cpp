@@ -37,7 +37,13 @@
 #include <string>
 #include <string_view>
 
+#include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 #include "translater.h"
 #include "utils.h"
@@ -151,6 +157,7 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
   std::unique_ptr<MCDisassembler> DisAsm(T->createMCDisassembler(*STI, Ctx));
 
   auto constexpr X86_BAD = X86::INSTRUCTION_LIST_END+1;
+
   auto mcDecode = [&](MCInst &inst, uint64_t &size, u8_view buf) {
     auto r = DisAsm->getInstruction(inst, size, {buf.data(), buf.size()}, 0, nulls());
     if (r != MCDisassembler::DecodeStatus::Success) {
@@ -251,8 +258,10 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     return s;
   };
 
-  struct InstrInfo {
+  struct InstInfo {
     bool ok;
+    bool hasRspR;
+    bool hasRspM;
     int mIdx; // [BaseReg, ScaleAmt, IndexReg, Disp, Segment]
     int immIdx;
     int regIdx;
@@ -267,9 +276,9 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     __builtin_unreachable(); \
   }
 
-  auto getInstInfo = [&](const MCInst &inst, bool panic = true) -> InstrInfo {
+  auto getInstInfo = [&](const MCInst &inst, bool panic = true) -> InstInfo {
     auto n = inst.getNumOperands();
-    InstrInfo r = {
+    InstInfo r = {
       .mIdx = -1,
       .immIdx = -1,
       .regIdx = -1,
@@ -277,14 +286,13 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
       .useReg = -1,
     };
 
-    #define RET if (panic) { panicUnsupportedInstr(inst); } else { return r; }
     #define C(op) case X86::op: 
     #define M(v) r.mIdx = v;
     #define IMM(v) r.immIdx = v;
     #define R(v) r.regIdx = v;
     #define R1(v) r.regIdx1 = v;
-    #define N(v) if (inst.getNumOperands() != v) { RET }
-    #define E() r.ok = true; return r;
+    #define N(v) if (inst.getNumOperands() != v) goto fail;
+    #define E() goto ok;
     #define USE(v) r.useReg = X86::v;
 
     switch (inst.getOpcode()) {
@@ -353,7 +361,27 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
       N(1) IMM(0) USE(RAX) E()
     }
 
-    RET
+    fail:
+    if (panic) { 
+      panicUnsupportedInstr(inst);
+    }
+    return r;
+
+    ok:
+    auto isRsp = [&](int i) -> bool {
+      auto r = inst.getOperand(i).getReg();
+      return r == X86::ESP || r == X86::RSP;
+    };
+
+    if (r.regIdx != -1 && isRsp(r.regIdx) || r.regIdx1 != -1 && isRsp(r.regIdx1)) {
+      r.hasRspR = true;
+    }
+    if (r.mIdx != -1 && (isRsp(r.mIdx) || isRsp(r.mIdx+2) || isRsp(r.mIdx+4))) {
+      r.hasRspM = true;
+    }
+
+    r.ok = true;
+    return r;
 
     #undef E
     #undef N
@@ -362,7 +390,6 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     #undef IMM
     #undef M
     #undef C
-    #undef RET
   };
 
   auto instUsedRegMask = [&](const MCInst &inst) -> unsigned {
@@ -428,7 +455,7 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
   enum {
     kNoJmp,
     kIgnoreJmp,
-    kDirectJmp,
+    kDirectCall,
     kPushJmp,
     kPushJmp2,
     kCombineJmp,
@@ -439,7 +466,7 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
   const char *kJmpTypeStrs[] = {
     "no_jmp",
     "ignore_jmp",
-    "direct_jmp",
+    "direct_call",
     "push_jmp",
     "push_jmp2",
     "combine_jmp",
@@ -485,6 +512,21 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
   };
 
   std::vector<OpcodeAndSize> allOpcode;
+
+  struct McDecode2Res {
+    MCInst inst;
+    u8_view buf;
+    OpcodeAndSize op;
+    uint64_t size;
+  };
+
+  auto mcDecode2 = [&](AddrAndIdx i) -> McDecode2Res {
+    McDecode2Res r;
+    r.op = allOpcode[i.idx];
+    r.buf = {instBuf.data() + i.addr, (size_t)r.op.size};
+    mcDecode(r.inst, r.size, r.buf);
+    return r;
+  };
 
   auto dismInstBuf = [&](const std::string &prefix, u8_view buf, uint64_t va = 0) {
     MCInst inst;
@@ -643,13 +685,9 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     });
 
     for (int i = 0; i < sortIdx.size(); i++) {
-      MCInst inst;
-      uint64_t size;
       auto p = instOccur[sortIdx[i]];
-      auto op = allOpcode[p.i.idx];
-      u8_view b = {instBuf.data() + p.i.addr, (size_t)op.size};
-      mcDecode(inst, size, b);
-      auto s = instAllStr(inst);
+      auto r = mcDecode2(p.i);
+      auto s = instAllStr(r.inst, r.buf);
       outsfmt("instoccur %d %s %d\n", i, s.c_str(), p.n);
     }
    }
@@ -677,31 +715,23 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
   }
 
   auto printInst = [&](AddrAndIdx ai, JmpRes jmp) {
-    auto op = allOpcode[ai.idx];
-    auto addr = ai.addr;
-
-    MCInst inst;
-    uint64_t size;
-    mcDecode(inst, size, instBuf.slice(addr));
-
+    auto r = mcDecode2(ai);
     std::string tag = kJmpTypeStrs[jmp.type];
 
     if (jmp.type == kPushJmp) {
-      auto rop = allOpcode[jmp.r0.i.idx];
-      std::string name = IP->getOpcodeName(rop.op).str();
-      tag += fmt(":%lu,%s,%d", rop.size, name.c_str(), std::abs((int64_t)(jmp.r0.i.addr-addr)));
+      tag += fmt(":%d", std::abs((int64_t)(jmp.r0.i.addr-ai.addr)));
     } else if (jmp.type == kCombineJmp) {
       tag += fmt(":%d,%d", jmp.r0.size, jmp.r0.n);
     }
 
-    if (op.jmpto) {
+    if (r.op.jmpto) {
       tag += ":jmpto";
     }
 
     std::string sep = " ";
-    outs() << fmt("%lx", vaddr(addr)) <<
-      sep << instAllStr(inst, instBuf.slice(addr, size)) <<
-      sep << kOpTypeStrs[op.type] <<
+    outs() << fmt("%lx", vaddr(ai.addr)) <<
+      sep << instAllStr(r.inst, r.buf) <<
+      sep << kOpTypeStrs[r.op.type] <<
       sep << tag << 
       "\n";
   };
@@ -770,7 +800,7 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
   // v = v + (loadAddr+addr) - (stubStart+stubAddr)
   // v = v + addr-stubAddr - (stubStart-loadStart)
 
-  auto adjustRIPImm4 = [&](MCInst &inst, uint64_t addr) {
+  auto adjustRIPImm4 = [&](const MCInst &inst, const InstInfo &info, uint64_t addr) {
     if (inst.getOpcode() == X86::JCC_4 || inst.getOpcode() == X86::JMP_4) {
       // v = v + text - stub (Sub)
       // v = v + addr-stubAddr - (stubStart-loadStart)
@@ -778,7 +808,6 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
       E.relocs.push_back({(uint32_t)E.code.size(), (unsigned)SlotType::Stub, (unsigned)RelType::Sub});
       return;
     }
-    auto info = getInstInfo(inst);
     if (info.mIdx != -1) {
       if (inst.getOperand(info.mIdx).getReg() == X86::RIP) {
         // v = v + stub - text (Add)
@@ -790,6 +819,25 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     }
   };
 
+  int rspFix = 0;
+
+  auto emitAndFix = [&](const MCInst &inst, uint64_t addr) {
+    auto info = getInstInfo(inst);
+
+    if (info.hasRspM && rspFix) {
+      E.emit(MCInstBuilder(X86::LEA64r)
+        .addReg(X86::RSP).addReg(X86::RSP).addImm(1).addReg(0).addImm(-rspFix).addReg(0));
+    }
+
+    E.emit(inst);
+    adjustRIPImm4(inst, info, addr);
+
+    if (info.hasRspM && rspFix) {
+      E.emit(MCInstBuilder(X86::LEA64r)
+        .addReg(X86::RSP).addReg(X86::RSP).addImm(1).addReg(0).addImm(rspFix).addReg(0));
+    }
+  };
+
   auto emitCallFn = [&](FuncType fn) {
     E.code.push_back(0xe8);
     auto p = E.code.size();
@@ -798,9 +846,9 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
   };
 
   auto emitOldTlsInst = [&](AddrAndIdx i) {
-    MCInst inst1;
-    uint64_t size1;
-    mcDecode(inst1, size1, instBuf.slice(i.addr));
+    auto r = mcDecode2(i);
+    auto inst1 = r.inst;
+    auto size1 = r.size;
 
     /*
       push %tmp // save tmp
@@ -815,20 +863,15 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     if (info.mIdx == -1) {
       panicUnsupportedInstr(inst1);
     }
-    unsigned used = instUsedRegMask(inst1);
+    auto used = instUsedRegMask(inst1);
     int ti = gpFindFreeReg(used);
     if (ti == -1) {
       panicUnsupportedInstr(inst1);
     }
-    unsigned tmpReg = gpRegs[ti];
-    bool useRsp = used & (1<<gpRspIdx);
+    auto tmpReg = gpRegs[ti];
 
     E.emit(MCInstBuilder(X86::PUSH64r).addReg(tmpReg));
-
-    if (useRsp) {
-      E.emit(MCInstBuilder(X86::LEA64r)
-        .addReg(X86::RSP).addReg(X86::RSP).addImm(1).addReg(0).addImm(-8).addReg(0));
-    }
+    rspFix += 8;
 
     MCInst lea;
     lea.setOpcode(X86::LEA64r);
@@ -837,14 +880,9 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
       lea.addOperand(inst1.getOperand(info.mIdx+i));
     }
     lea.getOperand(5).setReg(0);
-    E.emit(lea);
-    adjustRIPImm4(lea, i.addr+size1);
+    emitAndFix(lea, i.addr+size1);
 
-    if (useRsp) {
-      E.emit(MCInstBuilder(X86::LEA64r)
-        .addReg(X86::RSP).addReg(X86::RSP).addImm(1).addReg(0).addImm(8).addReg(0));
-    }
-
+    rspFix -= 8;
     E.emit(MCInstBuilder(X86::PUSH64r).addReg(X86::RAX));
 
     emitCallFn(FuncType::GetTls);
@@ -864,15 +902,6 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     E.emit(MCInstBuilder(X86::POP64r).addReg(tmpReg));
   };
 
-  auto emitOldNormalInst = [&](AddrAndIdx i) {
-    MCInst inst;
-    uint64_t size;
-    mcDecode(inst, size, instBuf.slice(i.addr));
-
-    E.emit(inst);
-    adjustRIPImm4(inst, i.addr+size);
-  };
-
   auto emitOldInst = [&](AddrAndIdx i) {
     auto op = allOpcode[i.idx];
     if (op.type == kTlsOp) {
@@ -880,7 +909,8 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     } else if (op.type == kSyscall) {
       emitCallFn(FuncType::Syscall);
     } else {
-      emitOldNormalInst(i);
+      auto r = mcDecode2(i);
+      emitAndFix(r.inst, i.addr+r.size);
     }
   };
 
@@ -901,19 +931,17 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     E.relocs.push_back({(uint32_t)E.code.size(), (unsigned)SlotType::Stub, (unsigned)RelType::Add});
   };
 
-  auto emitDirectJmpStub = [&](AddrRange r0, bool ret = false) {
+  auto emitDirectJmpStub = [&](AddrRange r0) {
     emitOldInsts(r0);
-    if (ret) {
-      E.code.push_back(0xc3);
-    } else {
-      emitJmpBack(r0);
-    }
+    emitJmpBack(r0);
   };
 
   auto emitDirectCallStub = [&](AddrRange r0) {
+    rspFix += 8;
     E.emit(MCInstBuilder(X86::ENDBR64));
     emitOldInsts(r0);
     E.emit(MCInstBuilder(X86::RET));
+    rspFix -= 8;
   };
 
   auto emitPushJmpStub = [&](AddrRange r0, AddrRange r1, bool pushF = true) {
@@ -974,7 +1002,7 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     E.relocs.push_back({(uint32_t)E.patchAddr(), (unsigned)SlotType::Patch, (unsigned)RelType::Add});
   };
 
-  auto modifyLongJmp = [&](AddrRange r0, uint64_t stubAddr, unsigned op = 0) {
+  auto patchLongJmp = [&](AddrRange r0, uint64_t stubAddr, unsigned op = 0) {
     E.patchStart(r0.i.addr);
     int n = r0.size;
     if (op) {
@@ -987,7 +1015,7 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     E.patchEnd();
   };
 
-  auto modifyShortJmp = [&](AddrRange r0, AddrRange r1, int off1, unsigned op = 0) {
+  auto patchShortJmp = [&](AddrRange r0, AddrRange r1, int off1, unsigned op = 0) {
     E.patchStart(r0.i.addr);
     int n = r0.size;
     if (op) {
@@ -1000,15 +1028,15 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     E.patchEnd();
   };
 
-  auto modifyPushRspJmp = [&](AddrRange r0, uint64_t stubAddr) {
-    modifyLongJmp(r0, stubAddr, 0x54); // push %rsp
+  auto patchPushRspJmp = [&](AddrRange r0, uint64_t stubAddr) {
+    patchLongJmp(r0, stubAddr, 0x54); // push %rsp
   };
 
-  auto modifyPushFJmp = [&](AddrRange r0, AddrRange r1) {
-    modifyShortJmp(r0, r1, 1, 0x9c); // pushf; skip push %rsp
+  auto patchPushFJmp = [&](AddrRange r0, AddrRange r1) {
+    patchShortJmp(r0, r1, 1, 0x9c); // pushf; skip push %rsp
   };
 
-  auto modifyCall = [&](AddrRange r0, int stubAddr) {
+  auto patchCall = [&](AddrRange r0, int stubAddr) {
     E.patchStart(r0.i.addr);
     E.patchn(0xf2, r0.size-5); // repne call
     E.patch8(0xe8);
@@ -1024,46 +1052,23 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     return r;
   };
 
-  auto regIsRsp = [](const MCInst &inst, int i) -> bool {
-    auto r = inst.getOperand(i).getReg();
-    return r == X86::ESP || r == X86::RSP;
-  };
-
   auto canReplaceInst = [&](const MCInst &inst) -> bool {
     auto op = inst.getOpcode();
     if (op == X86::JCC_1 || op == X86::JMP_1) {
       return false;
     }
     auto info = getInstInfo(inst, false);
-    if (!info.ok) {
-      return false;
-    }
-    if (info.regIdx != -1 && regIsRsp(inst, info.regIdx)) {
-      return false;
-    }
-    if (info.regIdx1 != -1 && regIsRsp(inst, info.regIdx1)) {
-      return false;
-    }
-    return true;
+    return info.ok && !info.hasRspR;
   };
 
   auto canReplaceIdx = [&](AddrAndIdx i) -> bool {
-    MCInst inst;
-    uint64_t size;
-    mcDecode(inst, size, instBuf.slice(i.addr));
-    return canReplaceInst(inst);
+    return canReplaceInst(mcDecode2(i).inst);
   };
 
   auto markInstRangeUsed = [&](AddrRange r) {
     for (int i = r.i.idx; i < r.i.idx+r.n; i++) {
       allOpcode[i].used = 1;
     }
-  };
-
-  auto markResInstUsed = [&](JmpRes r) -> JmpRes {
-    markInstRangeUsed(r.r0);
-    markInstRangeUsed(r.r1);
-    return r;
   };
 
   auto checkPushJmp = [&](AddrAndIdx i, int minSize, int type) -> JmpRes {
@@ -1083,11 +1088,11 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
       }
       return -1;
     })) {
-      return markResInstUsed({
+      return {
         .type = type,
         .r0 = singleAddrRange(j),
         .r1 = singleAddrRange(i),
-      });
+      };
     }
 
     return {.type = kJmpFail};
@@ -1101,7 +1106,7 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     for (int i = i0.idx; i > 0; i--) {
       auto &op = allOpcode[i];
       if (!canReplaceIdx({addr,i})) {
-        logJmpFail(addr, "cantrep");
+        logJmpFail(addr, "replace");
         break;
       }
       if (op.used && i != i0.idx) {
@@ -1110,7 +1115,7 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
       }
       size += op.size;
       if (size >= 5) {
-        return markResInstUsed({
+        return {
           .type = kCombineJmp,
           .r0 = {
             .i = {
@@ -1120,7 +1125,7 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
             .n = i0.idx - i + 1,
             .size = size,
           },
-        });
+        };
       }
       if (op.jmpto) {
         logJmpFail(addr, "jmpto");
@@ -1134,7 +1139,7 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     for (int i = i0.idx; i < allOpcode.size(); i++) {
       auto &op = allOpcode[i];
       if (!canReplaceIdx({addr,i})) {
-        logJmpFail(addr, "cantrep");
+        logJmpFail(addr, "replace");
         break;
       }
       if (op.used && i != i0.idx) {
@@ -1148,14 +1153,14 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
       size += op.size;
       addr += op.size;
       if (size >= 5) {
-        return markResInstUsed({
+        return {
           .type = kCombineJmp,
           .r0 = {
             .i = i0,
             .n = i - i0.idx + 1,
             .size = size,
           },
-        });
+        };
       }
     }
 
@@ -1179,7 +1184,7 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
 
     if (op.size >= 5) {
       return {
-        .type = kDirectJmp,
+        .type = kDirectCall,
         .r0 = singleAddrRange(i),
       };
     }
@@ -1204,6 +1209,12 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     return {.type = kJmpFail};
   };
 
+  auto emitFnGetTls = [&]() {
+  };
+
+  auto emitFnSyscall = [&]() {
+  };
+
   for (int i = 0; i < (int)FuncType::Nr; i++) {
     // repne jmpq *(%rip); .long addr // total 16 byte
     for (int i = 0; i < 6; i++) {
@@ -1221,6 +1232,8 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     auto op = allOpcode[i.idx];
 
     JmpRes jmp = doReplace(i);
+    markInstRangeUsed(jmp.r0);
+    markInstRangeUsed(jmp.r1);
 
     totOpType[op.type]++;
     totJmpType[jmp.type]++;
@@ -1236,34 +1249,34 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
 
     switch (jmp.type) {
       case kPushJmp: {
-        modifyPushRspJmp(jmp.r0, stubAddr);
-        modifyPushFJmp(jmp.r1, jmp.r0);
+        patchPushRspJmp(jmp.r0, stubAddr);
+        patchPushFJmp(jmp.r1, jmp.r0);
         emitPushJmpStub(jmp.r0, jmp.r1);
         break;
       }
 
       case kPushJmp2: {
-        modifyPushRspJmp(jmp.r0, stubAddr);
-        modifyShortJmp(jmp.r1, jmp.r0, 1);
+        patchPushRspJmp(jmp.r0, stubAddr);
+        patchShortJmp(jmp.r1, jmp.r0, 1);
         emitPushJmpStub(jmp.r0, jmp.r1, false);
         break;
       }
 
-      case kDirectJmp: {
+      case kDirectCall: {
         auto i = instOccurMap.find(instHash(jmp.r0.i));
         assert(i != instOccurMap.end());
         int oi = i->second;
         auto &o = instOccur[oi];
         if (!o.addr) {
           o.addr = stubAddr;
-          emitDirectJmpStub(jmp.r0, true);
+          emitDirectCallStub(jmp.r0);
         }
-        modifyCall(jmp.r0, o.addr);
+        patchCall(jmp.r0, o.addr);
         break;
       }
 
       case kCombineJmp: {
-        modifyLongJmp(jmp.r0, stubAddr);
+        patchLongJmp(jmp.r0, stubAddr);
         emitDirectJmpStub(jmp.r0);
         break;
       }
@@ -1471,21 +1484,27 @@ int Translater::cmdMain(const std::vector<std::string> &args0) {
     args.push_back(o);
   }
 
-  if (args.size() == 0) {
+  if (args.size() < 1) {
     errs() << "need filename\n";
     return -1;
   }
 
-  auto filename = args[0];
+  auto input = args[0];
+  // auto output = args[1];
 
   ElfFile file;
   int fd;
-  if (!ElfFile::open(filename, file, fd)) {
+  if (!ElfFile::open(input, file, fd)) {
     return -1;
   }
 
   Translater::Result res;
   translate(file, res);
+
+  // int fd = open(output.c_str(), O_RDWR|O_CREAT|O_TRUNC, 0744);
+
+  // ftruncate(fd, file.buf.size());
+  // void *newFile = mmap(fd);
 
   return 0;
 }
