@@ -41,6 +41,13 @@ bool ElfFile::parse(u8_view buf, ElfFile &file) {
     return false;
   }
 
+  if (eh->e_phentsize != sizeof(Elf64_Phdr)) {
+    return false;
+  }
+  if (eh->e_shentsize != sizeof(Elf64_Shdr)) {
+    return false;
+  }
+
   uint8_t *shStart = (uint8_t *)eh + eh->e_shoff;
   Elf64_Shdr *shStrtab = (Elf64_Shdr *)(shStart + eh->e_shentsize*eh->e_shstrndx);
   const char *strtab = (const char *)((uint8_t *)eh + shStrtab->sh_offset);

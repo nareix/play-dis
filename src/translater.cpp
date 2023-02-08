@@ -68,11 +68,9 @@ public:
   }
 };
 
-using Reloc = Translater::Reloc;
-using RelocType = Translater::SlotType;
-using RelType = Translater::RelType;
-using FuncType = Translater::FuncType;
-using Patch = Translater::Patch;
+static constexpr uint32_t kStubMagic = 0x53545542;
+static constexpr int kStubHeadSize = 16;
+static constexpr int kStubFuncSize = 32;
 
 void Translater::translate(const ElfFile &file, Translater::Result &res) {
   Elf64_Ehdr *eh = file.eh();
@@ -1210,23 +1208,36 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
   };
 
   auto emitFnGetTls = [&]() {
+    E.emit(MCInstBuilder(X86::ENDBR64));
+    E.emit(MCInstBuilder(X86::RDFSBASE).addReg(X86::RAX));
+    E.emit(MCInstBuilder(X86::RET));
   };
 
   auto emitFnSyscall = [&]() {
+    E.emit(MCInstBuilder(X86::ENDBR64));
+    E.emit(MCInstBuilder(X86::SYSCALL));
+    E.emit(MCInstBuilder(X86::RET));
   };
 
-  for (int i = 0; i < (int)FuncType::Nr; i++) {
-    // repne jmpq *(%rip); .long addr // total 16 byte
-    for (int i = 0; i < 6; i++) {
-      E.code.push_back(0xf2);
-    }
-    E.code.push_back(0xff);
-    E.code.push_back(0x25);
-    int p = E.code.size();
-    E.code.resize(p+8);
-    *(uint64_t *)&E.code[p] = i;
-    E.relocs.push_back({(uint32_t)p, (unsigned)SlotType::Stub, (unsigned)RelType::Func});
-  }
+  auto emitWithPad = [&](std::function<void()> fn, size_t size) {
+    auto i = E.code.size();
+    fn();
+    auto p = E.code.size();
+    auto left = size - (p - i);
+    assert(left >= 0);
+    E.code.resize(p + left);
+    memset(&E.code[p], 0x90, left); // nop
+  };
+
+  auto emitStubHead = [&]() {
+    auto p = E.code.size();
+    E.code.resize(p + kStubHeadSize);
+    *(uint32_t *)&E.code[p] = kStubMagic;
+  };
+
+  emitStubHead();
+  emitWithPad(emitFnGetTls, kStubFuncSize);
+  emitWithPad(emitFnSyscall, kStubFuncSize);
 
   auto handleInst = [&](AddrAndIdx i) {
     auto op = allOpcode[i.idx];
@@ -1409,30 +1420,87 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
   res.patchCode = std::move(E.patchCode);
 }
 
-void Translater::applyPatch(u8_view code, const std::vector<Patch> &patches, const std::vector<uint8_t> &patchCode) {
-  auto codep = (uint8_t *)code.data();
-  for (auto p: patches) {
-    memcpy(codep + p.addr, &patchCode[p.off], p.size);
-  }
-}
+bool Translater::writeElfFile(const Translater::Result &res, const ElfFile &input, const std::string &output) {
+  auto totSize = input.buf.size();
+  auto newPhsStart = totSize;
+  unsigned align = 0x1000;
 
-void Translater::applyReloc(u8_view code, u8_view stubCode, const std::vector<Reloc> &relocs, void **funcs) {
-  for (auto r: relocs) {
+  auto oldPhs = (Elf64_Phdr *)(input.buf.data() + input.eh()->e_phoff);
+  auto phs = std::vector<Elf64_Phdr>(oldPhs, oldPhs + input.eh()->e_phnum);
+  for (auto i = phs.begin(); i < phs.end(); i++) {
+    if (i->p_type == PT_PHDR) {
+      phs.erase(i);
+    }
+  }
+  auto newPhsSize = (phs.size()+2)*sizeof(phs[0]);
+  totSize += newPhsSize;
+
+  totSize = (totSize + align-1) & ~(align-1);
+  auto stubCodeStart = totSize;
+  totSize += res.stubCode.size();
+
+  int fd = open(output.c_str(), O_RDWR|O_CREAT|O_TRUNC, 0744);
+  ftruncate(fd, totSize);
+  auto fileAddr = (uint8_t *)mmap(NULL, totSize, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+  if (fileAddr == MAP_FAILED) {
+    fprintf(stderr, "mmap %s failed\n", output.c_str());
+    return false;
+  }
+
+  auto codeStart = input.phX->p_offset;
+  auto code = fileAddr + codeStart;
+  auto stubCode = fileAddr + stubCodeStart;
+
+  memcpy(fileAddr, input.buf.data(), input.buf.size());
+  memcpy(fileAddr + stubCodeStart, res.stubCode.data(), res.stubCode.size());
+
+  for (auto p: res.patches) {
+    memcpy(code + p.addr, &res.patchCode[p.off], p.size);
+  }
+
+  for (auto r: res.relocs) {
     uint8_t *base = nullptr;
     switch ((SlotType)r.slot) {
-    case SlotType::Patch: base = (uint8_t *)code.data(); break;
-    case SlotType::Stub: base = (uint8_t *)stubCode.data(); break;
+    case SlotType::Patch: base = code; break;
+    case SlotType::Stub: base = stubCode; break;
     }
 
     auto p = base + r.addr;
-    auto diff = int32_t(stubCode.data() - code.data());
+    auto diff = int32_t(stubCodeStart - codeStart);
     switch ((RelType)r.rel) {
     case RelType::Add: *(int32_t *)p += diff; break;
     case RelType::Sub: *(int32_t *)p -= diff; break;
-    case RelType::Func: *(uint64_t *)p = (uint64_t)funcs[*(uint64_t *)p]; break;
     }
   }
+
+  phs.push_back({
+    .p_type = PT_LOAD, .p_flags = PF_R,
+    .p_offset = newPhsStart, .p_vaddr = newPhsStart, .p_paddr = newPhsStart,
+    .p_filesz = newPhsSize, .p_memsz = newPhsSize,
+    .p_align = 0x1,
+  });
+  phs.push_back({
+    .p_type = PT_LOAD, .p_flags = PF_R|PF_W|PF_X,
+    .p_offset = stubCodeStart, .p_vaddr = stubCodeStart, .p_paddr = stubCodeStart,
+    .p_filesz = res.stubCode.size(), .p_memsz = res.stubCode.size(),
+    .p_align = align,
+  });
+  memcpy(fileAddr + newPhsStart, phs.data(), newPhsSize);
+
+  auto newEh = (Elf64_Ehdr *)fileAddr;
+  newEh->e_phoff = newPhsStart;
+  newEh->e_phnum = phs.size();
+
+  if (msync(fileAddr, totSize, MS_SYNC) == -1) {
+    return false;
+  }
+  if (close(fd) == -1) {
+    return false;
+  }
+
+  return true;
 }
+
 
 bool Translater::verbose;
 bool Translater::summary;
@@ -1490,7 +1558,11 @@ int Translater::cmdMain(const std::vector<std::string> &args0) {
   }
 
   auto input = args[0];
-  // auto output = args[1];
+
+  std::string output = "a.out";
+  if (args.size() > 1) {
+    auto output = args[1];
+  }
 
   ElfFile file;
   int fd;
@@ -1501,10 +1573,9 @@ int Translater::cmdMain(const std::vector<std::string> &args0) {
   Translater::Result res;
   translate(file, res);
 
-  // int fd = open(output.c_str(), O_RDWR|O_CREAT|O_TRUNC, 0744);
-
-  // ftruncate(fd, file.buf.size());
-  // void *newFile = mmap(fd);
+  if (!writeElfFile(res, file, output)) {
+    return -1;
+  }
 
   return 0;
 }

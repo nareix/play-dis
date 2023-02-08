@@ -17,13 +17,11 @@ public:
   enum class RelType: int {
     Add,
     Sub,
-    Func,
   };
 
   enum class FuncType: int {
     GetTls,
     Syscall,
-    Nr,
   };
 
   struct Reloc {
@@ -37,6 +35,9 @@ public:
     uint32_t off;
     uint16_t size;
   };
+
+  // static bool isStub(u8_view code);
+  // static void relocStubFunc(u8_view code, int i, void *p);
 
   struct Result {
     std::vector<Reloc> relocs;
@@ -53,7 +54,6 @@ public:
   static int forSingleInstr;
 
   static void translate(const ElfFile &file, Result &res);
-  static void applyPatch(u8_view code, const std::vector<Patch> &patches, const std::vector<uint8_t> &patchCode);
-  static void applyReloc(u8_view code, u8_view stubCode, const std::vector<Reloc> &relocs, void **funcs);
+  static bool writeElfFile(const Result &res, const ElfFile &input, const std::string &output);
   static int cmdMain(const std::vector<std::string> &args);
 };
