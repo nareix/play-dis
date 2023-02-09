@@ -796,6 +796,8 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
 
   StubCE E(CE2, STI);
 
+  bool directSyscall = false;
+
   // text jmp to stub (Add)
   // v = v + stub - text
   // v = v + (stubStart+stubAddr) - (loadStart+addr)
@@ -908,7 +910,12 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     if (op.type == kTlsOp) {
       emitOldTlsInst(i);
     } else if (op.type == kSyscall) {
-      emitCallFn(FuncType::Syscall);
+      E.emit(MCInstBuilder(X86::SYSCALL));
+      // if (directSyscall) {
+      //   E.emit(MCInstBuilder(X86::SYSCALL));
+      // } else {
+      //   emitCallFn(FuncType::Syscall);
+      // }
     } else {
       auto r = mcDecode2(i);
       emitAndFix(r.inst, i.addr+r.size);
@@ -1170,7 +1177,11 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     return res;
   };
 
+  int syscallIdx = 0;
+
   auto doReplace = [&](AddrAndIdx i) -> JmpRes {
+    directSyscall = false;
+
     auto op = allOpcode[i.idx];
 
     if (op.type == kNormalOp) {
@@ -1194,15 +1205,27 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
 
     JmpRes res;
 
-    res = checkPushJmp(i, 3, kPushJmp);
-    if (res.type != kJmpFail) {
-      return res;
+    if (op.type == kSyscall) {
+      directSyscall = true;
+      syscallIdx++;
+      // if (syscallIdx == 26 || syscallIdx == 31) {
+      //   if (debug) {
+      //     outsfmt("failsyscall %d\n", syscallIdx-1);
+      //   }
+      //   // return {.type = kJmpFail};
+      //   directSyscall = true;
+      // }
     }
 
-    res = checkPushJmp(i, 2, kPushJmp2);
-    if (res.type != kJmpFail) {
-      return res;
-    }
+    // res = checkPushJmp(i, 3, kPushJmp);
+    // if (res.type != kJmpFail) {
+    //   return res;
+    // }
+
+    // res = checkPushJmp(i, 2, kPushJmp2);
+    // if (res.type != kJmpFail) {
+    //   return res;
+    // }
 
     res = checkCombineJmp(i);
     if (res.type != kJmpFail) {
@@ -1438,39 +1461,40 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
 }
 
 bool Translater::writeElfFile(const Translater::Result &res, const ElfFile &input, const std::string &output) {
-  auto totSize = input.buf.size();
-  auto newPhsStart = totSize;
   unsigned align = 0x1000;
+
+  auto totSize = (input.buf.size() + align-1) & ~(align-1);
+  auto l = input.loads[input.loads.size()-1];
+  auto lend = (l->p_vaddr + l->p_memsz + align-1) & ~(align-1);
+  if (lend > totSize) {
+    totSize = lend;
+  }
+
+  auto codeVaddr = input.phX->p_vaddr;
+  auto newPhsVaddr = totSize;
+  auto stubCodeVaddr = newPhsVaddr + align;
+  totSize = stubCodeVaddr + res.stubCode.size();
+  auto newPhsOff = newPhsVaddr;
+  auto stubCodeOff = stubCodeVaddr;
 
   auto oldPhs = (Elf64_Phdr *)(input.buf.data() + input.eh()->e_phoff);
   auto phs = std::vector<Elf64_Phdr>(oldPhs, oldPhs + input.eh()->e_phnum);
-  for (auto i = phs.begin(); i < phs.end(); i++) {
-    if (i->p_type == PT_PHDR) {
-      phs.erase(i);
-    }
-  }
   auto newPhsSize = (phs.size()+2)*sizeof(phs[0]);
-  totSize += newPhsSize;
-
-  totSize = (totSize + align-1) & ~(align-1);
-  auto stubCodeStart = totSize;
-  totSize += res.stubCode.size();
 
   int fd = open(output.c_str(), O_RDWR|O_CREAT|O_TRUNC, 0744);
   ftruncate(fd, totSize);
-  auto fileAddr = (uint8_t *)mmap(NULL, totSize, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-  if (fileAddr == MAP_FAILED) {
+  auto filem = (uint8_t *)mmap(NULL, totSize, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+  if (filem == MAP_FAILED) {
     fprintf(stderr, "mmap %s failed\n", output.c_str());
     return false;
   }
 
-  auto codeStart = input.phX->p_offset;
-  auto code = fileAddr + codeStart;
-  auto stubCode = fileAddr + stubCodeStart;
-  auto stubCodeVAddr = stubCodeStart + input.phX->p_vaddr - input.phX->p_offset;
+  auto codeOff = input.phX->p_offset;
+  auto code = filem + codeOff;
+  auto stubCode = filem + stubCodeOff;
 
-  memcpy(fileAddr, input.buf.data(), input.buf.size());
-  memcpy(fileAddr + stubCodeStart, res.stubCode.data(), res.stubCode.size());
+  memcpy(filem, input.buf.data(), input.buf.size());
+  memcpy(filem + stubCodeOff, res.stubCode.data(), res.stubCode.size());
 
   for (auto p: res.patches) {
     auto c = code + p.addr;
@@ -1486,11 +1510,21 @@ bool Translater::writeElfFile(const Translater::Result &res, const ElfFile &inpu
     }
 
     auto p = base + r.addr;
-    auto diff = int32_t(stubCodeStart - codeStart);
+    auto diff = int32_t(stubCodeVaddr - codeVaddr);
 
     switch ((RelType)r.rel) {
     case RelType::Add: *(int32_t *)p += diff; break;
     case RelType::Sub: *(int32_t *)p -= diff; break;
+    }
+  }
+
+  for (auto &ph: phs) {
+    if (ph.p_type == PT_PHDR) {
+      ph.p_offset = newPhsOff;
+      ph.p_vaddr = newPhsVaddr;
+      ph.p_paddr = newPhsVaddr;
+      ph.p_filesz = newPhsSize;
+      ph.p_memsz = newPhsSize;
     }
   }
 
@@ -1501,24 +1535,24 @@ bool Translater::writeElfFile(const Translater::Result &res, const ElfFile &inpu
     }
   }
 
-  phs.insert(phs.begin() + loadEnd+1, {{
+  phs.insert(phs.begin()+loadEnd+1, {{
     .p_type = PT_LOAD, .p_flags = PF_R,
-    .p_offset = newPhsStart, .p_vaddr = newPhsStart, .p_paddr = newPhsStart,
+    .p_offset = newPhsOff, .p_vaddr = newPhsVaddr, .p_paddr = newPhsVaddr,
     .p_filesz = newPhsSize, .p_memsz = newPhsSize,
     .p_align = 0x1,
   }, {
-    .p_type = PT_LOAD, .p_flags = PF_R|PF_W|PF_X,
-    .p_offset = stubCodeStart, .p_vaddr = stubCodeVAddr, .p_paddr = stubCodeVAddr,
+    .p_type = PT_LOAD, .p_flags = PF_R|PF_X,
+    .p_offset = stubCodeOff, .p_vaddr = stubCodeVaddr, .p_paddr = stubCodeVaddr,
     .p_filesz = res.stubCode.size(), .p_memsz = res.stubCode.size(),
     .p_align = align,
   }});
-  memcpy(fileAddr + newPhsStart, phs.data(), newPhsSize);
+  memcpy(filem + newPhsOff, phs.data(), newPhsSize);
 
-  auto newEh = (Elf64_Ehdr *)fileAddr;
-  newEh->e_phoff = newPhsStart;
+  auto newEh = (Elf64_Ehdr *)filem;
+  newEh->e_phoff = newPhsOff;
   newEh->e_phnum = phs.size();
 
-  if (msync(fileAddr, totSize, MS_SYNC) == -1) {
+  if (msync(filem, totSize, MS_SYNC) == -1) {
     return false;
   }
   if (close(fd) == -1) {

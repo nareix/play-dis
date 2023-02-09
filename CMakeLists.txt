@@ -4,8 +4,8 @@ project(s2)
 
 set(CMAKE_CXX_STANDARD 20)
 add_compile_options("-fno-rtti")
-# add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
-# add_link_options(-fsanitize=address -fno-omit-frame-pointer)
+#add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
+#add_link_options(-fsanitize=address -fno-omit-frame-pointer)
 
 set(ZLIB_INCLUDE_DIR /usr/include)
 set(ZLIB_LIBRARY -lz)
