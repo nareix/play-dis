@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <functional>
 #include <string_view>
 
 template <typename... Types>
@@ -29,3 +30,12 @@ public:
     return {data() + start, size};
   }
 };
+
+class DeferF {
+  std::function<void()> f;
+public:
+  DeferF(std::function<void()> f): f(f) {}
+  ~DeferF() { f(); }
+};
+
+#define defer(f) DeferF __df##__COUNTER__(f)

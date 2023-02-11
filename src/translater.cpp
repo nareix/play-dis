@@ -796,8 +796,6 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
 
   StubCE E(CE2, STI);
 
-  bool directSyscall = false;
-
   // text jmp to stub (Add)
   // v = v + stub - text
   // v = v + (stubStart+stubAddr) - (loadStart+addr)
@@ -911,11 +909,7 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
       emitOldTlsInst(i);
     } else if (op.type == kSyscall) {
       E.emit(MCInstBuilder(X86::SYSCALL));
-      // if (directSyscall) {
-      //   E.emit(MCInstBuilder(X86::SYSCALL));
-      // } else {
-      //   emitCallFn(FuncType::Syscall);
-      // }
+      // emitCallFn(FuncType::Syscall);
     } else {
       auto r = mcDecode2(i);
       emitAndFix(r.inst, i.addr+r.size);
@@ -1180,8 +1174,6 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
   int syscallIdx = 0;
 
   auto doReplace = [&](AddrAndIdx i) -> JmpRes {
-    directSyscall = false;
-
     auto op = allOpcode[i.idx];
 
     if (op.type == kNormalOp) {
@@ -1205,29 +1197,17 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
 
     JmpRes res;
 
-    if (op.type == kSyscall) {
-      directSyscall = true;
-      syscallIdx++;
-      // if (syscallIdx == 26 || syscallIdx == 31) {
-      //   if (debug) {
-      //     outsfmt("failsyscall %d\n", syscallIdx-1);
-      //   }
-      //   // return {.type = kJmpFail};
-      //   directSyscall = true;
-      // }
+    res = checkCombineJmp(i);
+    if (res.type != kJmpFail) {
+      return res;
     }
 
-    // res = checkPushJmp(i, 3, kPushJmp);
-    // if (res.type != kJmpFail) {
-    //   return res;
-    // }
+    res = checkPushJmp(i, 3, kPushJmp);
+    if (res.type != kJmpFail) {
+      return res;
+    }
 
-    // res = checkPushJmp(i, 2, kPushJmp2);
-    // if (res.type != kJmpFail) {
-    //   return res;
-    // }
-
-    res = checkCombineJmp(i);
+    res = checkPushJmp(i, 2, kPushJmp2);
     if (res.type != kJmpFail) {
       return res;
     }
@@ -1482,10 +1462,17 @@ bool Translater::writeElfFile(const Translater::Result &res, const ElfFile &inpu
   auto newPhsSize = (phs.size()+2)*sizeof(phs[0]);
 
   int fd = open(output.c_str(), O_RDWR|O_CREAT|O_TRUNC, 0744);
-  ftruncate(fd, totSize);
+  if (fd == -1) {
+    return false;
+  }
+  defer([&] { close(fd); });
+
+  if (ftruncate(fd, totSize) == -1) {
+    return false;
+  }
+
   auto filem = (uint8_t *)mmap(NULL, totSize, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
   if (filem == MAP_FAILED) {
-    fprintf(stderr, "mmap %s failed\n", output.c_str());
     return false;
   }
 
@@ -1555,13 +1542,9 @@ bool Translater::writeElfFile(const Translater::Result &res, const ElfFile &inpu
   if (msync(filem, totSize, MS_SYNC) == -1) {
     return false;
   }
-  if (close(fd) == -1) {
-    return false;
-  }
 
   return true;
 }
-
 
 bool Translater::verbose;
 bool Translater::summary;
@@ -1586,6 +1569,11 @@ int Translater::cmdMain(const std::vector<std::string> &args0) {
     }
     if (o == "-d") {
       debug = true;
+      continue;
+    }
+    if (o == "-vd") {
+      debug = true;
+      verbose = true;
       continue;
     }
     if (o == "-vad") {
