@@ -34,10 +34,10 @@ public:
 #define defer(f) DeferF __df##__COUNTER__(f)
 
 template <typename... Types>
-static inline std::string fmtSprintf(Types... args) {
-  ssize_t n = snprintf(NULL, 0, args...);
+static inline std::string fmtSprintf(const char *fmt, Types... args) {
+  ssize_t n = snprintf(NULL, 0, fmt, args...);
   char buf[n+1];
-  snprintf(buf, n+1, args...);
+  snprintf(buf, n+1, fmt, args...);
   return std::string(buf);
 }
 

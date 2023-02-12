@@ -31,6 +31,7 @@
 #include "llvm/Support/ConvertUTF.h"
 #include "X86BaseInfo.h"
 
+#include <cstddef>
 #include <iostream>
 #include <vector>
 #include <optional>
@@ -47,21 +48,24 @@
 
 #include "X86MCTargetDesc.h"
 #include "elf.h"
+#include "runtime.h"
 #include "translater.h"
 #include "utils.h"
 #include "elf_file.h"
 
 using namespace llvm;
 
+namespace translater {
+
 template <typename... Types>
 void outsfmt(const char *f, Types... args) {
   outs() << fmtSprintf(f, args...);
 }
 
-static std::string fmtReloc(Translater::Reloc r, int i, const ElfFile &file) {
+static std::string fmtReloc(Reloc r, int i, const ElfFile &file) {
   uint64_t vaddr;
   const char *vatype;
-  if (r.slot == (int)Translater::SlotType::Patch) {
+  if (r.slot == (int)SlotType::Patch) {
     vaddr = r.addr + file.phX->p_vaddr;
     vatype = "patch";
   } else {
@@ -83,11 +87,14 @@ public:
   }
 };
 
-static constexpr uint32_t kStubMagic = 0x42555453;
-static constexpr int kStubHeadSize = 16;
-static constexpr int kStubFuncSize = 32;
+static bool verbose;
+static bool summary;
+static bool debug;
+static bool debugOnlyBefore;
+static bool forAll;
+static int forSingleInstr = -1;
 
-void Translater::translate(const ElfFile &file, Translater::Result &res) {
+void translate(const ElfFile &file, Result &res) {
   Elf64_Ehdr *eh = file.eh();
 
   if (debug) {
@@ -840,14 +847,6 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     }
   };
 
-  auto emitCallFn = [&](FuncType fn) {
-    E.code.push_back(0xe8);
-    auto p = E.code.size();
-    E.code.resize(p+4);
-    auto addr = kStubHeadSize + (int)fn*kStubFuncSize;
-    *(int32_t *)&E.code[p] = (int)addr - (int)E.code.size();
-  };
-
   auto emitOldTlsInst = [&](AddrAndIdx i) {
     auto r = mcDecode2(i);
     auto inst1 = r.inst;
@@ -888,7 +887,8 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     rspFix -= 8;
     E.emit(MCInstBuilder(X86::PUSH64r).addReg(X86::RAX));
 
-    emitCallFn(FuncType::GetTls);
+    E.emit(MCInstBuilder(X86::CALL64m)
+      .addReg(0).addImm(1).addReg(0).addImm(8).addReg(X86::GS)); // tcb.gettls
 
     E.emit(MCInstBuilder(X86::LEA64r)
       .addReg(tmpReg).addReg(X86::RAX).addImm(1).addReg(tmpReg).addImm(0).addReg(0));
@@ -910,8 +910,8 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     if (op.type == kTlsOp) {
       emitOldTlsInst(i);
     } else if (op.type == kSyscall) {
-      E.emit(MCInstBuilder(X86::SYSCALL));
-      // emitCallFn(FuncType::Syscall);
+      E.emit(MCInstBuilder(X86::CALL64m)
+        .addReg(0).addImm(1).addReg(0).addImm(0).addReg(X86::GS)); // tcb.syscall
     } else {
       auto r = mcDecode2(i);
       emitAndFix(r.inst, i.addr+r.size);
@@ -1217,48 +1217,6 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     return {.type = kJmpFail};
   };
 
-  auto emitFnGetTls = [&]() {
-    E.emit(MCInstBuilder(X86::ENDBR64));
-    E.emit(MCInstBuilder(X86::RDFSBASE64).addReg(X86::RAX));
-    E.emit(MCInstBuilder(X86::RET64));
-  };
-
-  auto emitFnSyscall = [&]() {
-    E.emit(MCInstBuilder(X86::ENDBR64));
-    E.emit(MCInstBuilder(X86::SYSCALL));
-    E.emit(MCInstBuilder(X86::RET64));
-  };
-
-  auto emitWithPad = [&](std::function<void()> fn, size_t size) {
-    auto start = E.code.size();
-    fn();
-    auto p = E.code.size();
-    auto left = size - (p - start);
-    assert(left >= 0);
-    E.code.resize(p + left);
-    memset(&E.code[p], 0x90, left); // nop
-  };
-
-  auto emitStubHead = [&]() {
-    auto p = E.code.size();
-    E.code.resize(p + kStubHeadSize);
-    *(uint32_t *)&E.code[p] = kStubMagic;
-  };
-
-  emitStubHead();
-
-  emitWithPad(emitFnGetTls, kStubFuncSize);
-  if (debug) {
-    auto p = E.code.size()-kStubFuncSize;
-    dismInstBuf("fn_get_tls", E.codeSlice(p), p);
-  }
-
-  emitWithPad(emitFnSyscall, kStubFuncSize);
-  if (debug) {
-    auto p = E.code.size()-kStubFuncSize;
-    dismInstBuf("fn_syscall", E.codeSlice(p), p);
-  }
-
   auto handleInst = [&](AddrAndIdx i) {
     auto op = allOpcode[i.idx];
 
@@ -1442,7 +1400,7 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
   res.patchCode = std::move(E.patchCode);
 }
 
-bool Translater::writeElfFile(const Translater::Result &res, const ElfFile &input, const std::string &output) {
+bool writeElfFile(const Result &res, const ElfFile &input, const std::string &output) {
   unsigned align = 0x1000;
 
   auto totSize = (input.buf.size() + align-1) & ~(align-1);
@@ -1548,14 +1506,7 @@ bool Translater::writeElfFile(const Translater::Result &res, const ElfFile &inpu
   return true;
 }
 
-bool Translater::verbose;
-bool Translater::summary;
-bool Translater::debug;
-bool Translater::debugOnlyBefore;
-bool Translater::forAll;
-int Translater::forSingleInstr = -1;
-
-int Translater::cmdMain(const std::vector<std::string> &args0) {
+int cmdMain(const std::vector<std::string> &args0) {
   std::vector<std::string> args;
 
   for (int i = 0; i < args0.size(); i++) {
@@ -1621,7 +1572,7 @@ int Translater::cmdMain(const std::vector<std::string> &args0) {
     return -1;
   }
 
-  Translater::Result res;
+  Result res;
   translate(file, res);
 
   if (!writeElfFile(res, file, output)) {
@@ -1631,4 +1582,6 @@ int Translater::cmdMain(const std::vector<std::string> &args0) {
   auto err = fmtErrorf("hii");
 
   return 0;
+}
+
 }

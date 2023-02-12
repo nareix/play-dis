@@ -169,7 +169,7 @@ int main(int argc, char **argv) {
   args = {args.begin()+1, args.end()};
 
   if (action == "trans") {
-    return Translater::cmdMain(args);
+    return translater::cmdMain(args);
   // } else if (action == "load") {
   //   return doLoad(args);
   } else {

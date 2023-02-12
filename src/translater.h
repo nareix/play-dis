@@ -7,8 +7,7 @@
 #include "utils.h"
 #include "elf_file.h"
 
-class Translater {
-public:
+namespace translater {
   enum class SlotType: int {
     Patch,
     Stub,
@@ -17,11 +16,6 @@ public:
   enum class RelType: int {
     Add,
     Sub,
-  };
-
-  enum class FuncType: int {
-    GetTls,
-    Syscall,
   };
 
   struct Reloc {
@@ -46,14 +40,7 @@ public:
     std::vector<Patch> patches;
   };
 
-  static bool verbose;
-  static bool summary;
-  static bool debug;
-  static bool debugOnlyBefore;
-  static bool forAll;
-  static int forSingleInstr;
-
-  static void translate(const ElfFile &file, Result &res);
-  static bool writeElfFile(const Result &res, const ElfFile &input, const std::string &output);
-  static int cmdMain(const std::vector<std::string> &args);
-};
+  void translate(const ElfFile &file, Result &res);
+  bool writeElfFile(const Result &res, const ElfFile &input, const std::string &output);
+  int cmdMain(const std::vector<std::string> &args);
+}

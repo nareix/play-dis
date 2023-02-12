@@ -5,6 +5,7 @@ project(s2)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_compile_options("-fno-rtti")
+add_compile_options("-Wno-format-security")
 #add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
 #add_link_options(-fsanitize=address -fno-omit-frame-pointer)
 
@@ -33,9 +34,16 @@ add_executable(
   s2
   src/translater.cpp
   src/loader.cpp
+  src/runtime.cpp
   src/elf_file.cpp
   src/utils.cpp
   src/main.cpp
+)
+
+add_library(
+  s SHARED 
+  src/runtime_so.cpp
+  src/runtime.cpp
 )
 
 add_llvm_library(llvmdeps empty.cpp)
