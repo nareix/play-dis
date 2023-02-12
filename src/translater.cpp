@@ -53,7 +53,7 @@ using namespace llvm;
 
 template <typename... Types>
 void outsfmt(const char *f, Types... args) {
-  outs() << fmt(f, args...);
+  outs() << fmtSprintf(f, args...);
 }
 
 static std::string fmtReloc(Translater::Reloc r, int i, const ElfFile &file) {
@@ -66,7 +66,7 @@ static std::string fmtReloc(Translater::Reloc r, int i, const ElfFile &file) {
     vaddr = r.addr;
     vatype = "stub";
   }
-  return fmt("reloc_%d %s addr %lx rel %d", i, vatype, vaddr, r.rel);
+  return fmtSprintf("reloc_%d %s addr %lx rel %d", i, vatype, vaddr, r.rel);
 }
 
 class raw_u8_ostream : public raw_ostream {
@@ -214,7 +214,7 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
   auto instHexStr = [&](u8_view buf) -> std::string {
     std::string hex = "[";
     for (int i = 0; i < buf.size(); i++) {
-      hex += fmt("%.2X", buf[i]);
+      hex += fmtSprintf("%.2X", buf[i]);
       if (i < buf.size()-1) {
         hex += " ";
       }
@@ -238,13 +238,13 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
   auto instDumpStr = [&](const MCInst &inst) -> std::string {
     auto n = inst.getNumOperands();
     std::string s = std::string(IP->getOpcodeName(inst.getOpcode())) + 
-        fmt("(%d),n=%d[", inst.getOpcode(), n);
+        fmtSprintf("(%d),n=%d[", inst.getOpcode(), n);
     for (int i = 0; i < n; i++) {
       auto op = inst.getOperand(i);
       if (op.isReg()) {
-        s += fmt("r%d", op.getReg());
+        s += fmtSprintf("r%d", op.getReg());
       } else if (op.isImm()) {
-        s += fmt("i%d", op.getImm());
+        s += fmtSprintf("i%d", op.getImm());
       }
       if (i < n-1) {
         s += ",";
@@ -543,7 +543,7 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     for (int addr = 0; addr < buf.size(); ) {
       mcDecode(inst, size, buf.slice(addr));
     print:
-      outs() << prefix << " " << fmt("%lx", addr+va) << 
+      outs() << prefix << " " << fmtSprintf("%lx", addr+va) << 
         " " << instAllStr(inst, buf.slice(addr, size)) << 
         "\n";
       addr += size;
@@ -725,9 +725,9 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     std::string tag = kJmpTypeStrs[jmp.type];
 
     if (jmp.type == kPushJmp) {
-      tag += fmt(":%d", std::abs((int64_t)(jmp.r0.i.addr-ai.addr)));
+      tag += fmtSprintf(":%d", std::abs((int64_t)(jmp.r0.i.addr-ai.addr)));
     } else if (jmp.type == kCombineJmp) {
-      tag += fmt(":%d,%d", jmp.r0.size, jmp.r0.n);
+      tag += fmtSprintf(":%d,%d", jmp.r0.size, jmp.r0.n);
     }
 
     if (r.op.jmpto) {
@@ -735,7 +735,7 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     }
 
     std::string sep = " ";
-    outs() << fmt("%lx", vaddr(ai.addr)) <<
+    outs() << fmtSprintf("%lx", vaddr(ai.addr)) <<
       sep << instAllStr(r.inst, r.buf) <<
       sep << kOpTypeStrs[r.op.type] <<
       sep << tag << 
@@ -1322,7 +1322,7 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
         outsfmt("add %s\n", s.c_str());
       }
       auto D = [&](const std::string &s, u8_view buf, uint64_t va) {
-        dismInstBuf(fmt("%s_%s", stype, s.c_str()), buf, va);
+        dismInstBuf(fmtSprintf("%s_%s", stype, s.c_str()), buf, va);
       };
       auto before = [&](const std::string &s, AddrRange r) {
         D(s + "_before", instBuf.slice(r.i.addr,r.size), vaddr(r.i.addr));
@@ -1625,6 +1625,8 @@ int Translater::cmdMain(const std::vector<std::string> &args0) {
   if (!writeElfFile(res, file, output)) {
     return -1;
   }
+
+  auto err = fmtErrorf("hii");
 
   return 0;
 }

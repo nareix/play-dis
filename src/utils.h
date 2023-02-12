@@ -3,14 +3,7 @@
 #include <string>
 #include <functional>
 #include <string_view>
-
-template <typename... Types>
-std::string fmt(const char *f, Types... args) {
-  ssize_t n = snprintf(NULL, 0, f, args...);
-  char buf[n+1];
-  snprintf(buf, n+1, f, args...);
-  return std::string(buf);
-}
+#include <system_error>
 
 class u8_view: public std::basic_string_view<uint8_t> {
 public:
@@ -39,3 +32,30 @@ public:
 };
 
 #define defer(f) DeferF __df##__COUNTER__(f)
+
+template <typename... Types>
+static inline std::string fmtSprintf(Types... args) {
+  ssize_t n = snprintf(NULL, 0, args...);
+  char buf[n+1];
+  snprintf(buf, n+1, args...);
+  return std::string(buf);
+}
+
+class error {
+public:
+  virtual std::string Error() { return ""; };
+  virtual explicit operator bool() const { return false; }
+};
+
+class FmtError: public error {
+  std::string s;
+public:
+  FmtError(const std::string& s): s(s) {}
+  std::string Error() override { return s; };
+  explicit operator bool() const override { return true; }
+};
+
+template <typename... Types>
+static inline error fmtErrorf(Types... args) {
+  return FmtError(fmtSprintf(args...));
+}
