@@ -45,6 +45,8 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
+#include "X86MCTargetDesc.h"
+#include "elf.h"
 #include "translater.h"
 #include "utils.h"
 #include "elf_file.h"
@@ -81,7 +83,7 @@ public:
   }
 };
 
-static constexpr uint32_t kStubMagic = 0x53545542;
+static constexpr uint32_t kStubMagic = 0x42555453;
 static constexpr int kStubHeadSize = 16;
 static constexpr int kStubFuncSize = 32;
 
@@ -138,8 +140,8 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
 
   std::string tripleName = sys::getDefaultTargetTriple();
   Triple TheTriple(Triple::normalize(tripleName));
-  std::string err;
-  const Target *T = TargetRegistry::lookupTarget(tripleName, err);
+  std::string Terr;
+  const Target *T = TargetRegistry::lookupTarget(tripleName, Terr);
 
   std::unique_ptr<MCSubtargetInfo> STI(T->createMCSubtargetInfo(tripleName, "", ""));
   std::unique_ptr<MCRegisterInfo> MRI(T->createMCRegInfo(tripleName));
@@ -153,12 +155,12 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
   std::unique_ptr<MCCodeEmitter> CE(T->createMCCodeEmitter(*MCII, Ctx));
   std::unique_ptr<MCAsmBackend> MAB(T->createMCAsmBackend(*STI, *MRI, MCOptions));
 
-  SmallString<128> ss;
-  raw_svector_ostream osv(ss);
-  auto FOut = std::make_unique<formatted_raw_ostream>(osv);
+  SmallString<128> STRSs;
+  raw_svector_ostream STROsv(STRSs);
+  auto STROut = std::make_unique<formatted_raw_ostream>(STROsv);
   auto IP = T->createMCInstPrinter(Triple(tripleName), 0, *MAI, *MCII, *MRI);
-  std::unique_ptr<MCStreamer> Str(
-      T->createAsmStreamer(Ctx, std::move(FOut), /*asmverbose*/false,
+  std::unique_ptr<MCStreamer> STR(
+      T->createAsmStreamer(Ctx, std::move(STROut), /*asmverbose*/false,
                            /*useDwarfDirectory*/false, IP,
                            std::move(CE), std::move(MAB), /*showinst*/true));
 
@@ -224,14 +226,14 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
   };
 
   auto instDisStr = [&](const MCInst &inst) -> std::string {
-    Str->emitInstruction(inst, *STI);
-    auto r = ss.slice(1, ss.size()-1).str();
+    STR->emitInstruction(inst, *STI);
+    auto r = STRSs.slice(1, STRSs.size()-1).str();
     for (int i = 0; i < r.size(); i++) {
       if (r[i] == '\t') {
         r[i] = ' ';
       }
     }
-    ss.clear();
+    STRSs.clear();
     return r;
   };
 
@@ -756,7 +758,7 @@ void Translater::translate(const ElfFile &file, Translater::Result &res) {
     std::vector<uint8_t> patchCode;
     std::vector<Patch> patches;
 
-    StubCE(typeof(CE2) &CE2, typeof(STI) &STI): 
+    StubCE(const std::unique_ptr<MCCodeEmitter> &CE2, const std::unique_ptr<MCSubtargetInfo> & STI): 
       CE2(CE2), STI(STI), vcode(code) {
     }
 
