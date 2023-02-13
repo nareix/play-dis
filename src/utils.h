@@ -3,23 +3,23 @@
 #include <string>
 #include <functional>
 #include <string_view>
-#include <system_error>
+#include <memory>
 
-class u8_view: public std::basic_string_view<uint8_t> {
+class Slice: public std::basic_string_view<uint8_t> {
 public:
   template<typename... Args>
-    u8_view( Args&&... args ) 
+    Slice( Args&&... args ) 
        : std::basic_string_view<uint8_t>(std::forward<Args>(args)...) {  }
 
-  u8_view() { 
-    u8_view(nullptr, 0); 
+  Slice() { 
+    Slice(nullptr, 0); 
   }
 
-  u8_view slice(size_t start) {
+  Slice slice(size_t start) {
     return {data() + start, size() - start};
   }
 
-  u8_view slice(size_t start, size_t size) {
+  Slice slice(size_t start, size_t size) {
     return {data() + start, size};
   }
 };
@@ -41,21 +41,42 @@ static inline std::string fmtSprintf(const char *fmt, Types... args) {
   return std::string(buf);
 }
 
-class error {
+class IError {
 public:
-  virtual std::string Error() { return ""; };
-  virtual explicit operator bool() const { return false; }
+  virtual std::string msg() = 0;
+  virtual bool ok() const = 0;
+  virtual ~IError() = default;
 };
 
-class FmtError: public error {
+class StrError: public IError {
   std::string s;
 public:
-  FmtError(const std::string& s): s(s) {}
-  std::string Error() override { return s; };
-  explicit operator bool() const override { return true; }
+  StrError(const std::string &s): s(s) {}
+  virtual std::string msg() override { return s; }
+  virtual bool ok() const override { return true; };
+};
+
+class error {
+  std::unique_ptr<IError> i;
+public:
+  error(IError *i): i(i) {}
+  error(const std::nullptr_t &) { }
+  std::string msg() { return i ? i->msg() : ""; };
+  operator bool() const { return i ? i->ok() : false; }
 };
 
 template <typename... Types>
 static inline error fmtErrorf(Types... args) {
-  return FmtError(fmtSprintf(args...));
+  return new StrError(fmtSprintf(args...));
 }
+
+class File {
+public:
+  int fd = -1;
+  ~File();
+  File & operator=(File &&rhs);
+  File() {}
+  error open(const std::string &file);
+  error create(const std::string &file);
+  error truncate(size_t size);
+};

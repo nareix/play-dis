@@ -1,9 +1,11 @@
+#include <cstddef>
 #include <vector>
 #include <string>
 
 #include "translater.h"
 #include "loader.h"
 #include "elf_file.h"
+#include "utils.h"
 
 #include <stdlib.h>
 #include <sys/mman.h>
@@ -153,7 +155,7 @@
 //   return 0;
 // }
 
-int main(int argc, char **argv) {
+static error runMain(int argc, char **argv) {
   std::vector<std::string> args;
 
   for (int i = 1; i < argc; i++) {
@@ -161,8 +163,7 @@ int main(int argc, char **argv) {
   }
 
   if (args.size() == 0) {
-    fprintf(stderr, "need action\n");
-    return -1;
+    return fmtErrorf("need action");
   }
 
   auto action = args[0];
@@ -173,9 +174,19 @@ int main(int argc, char **argv) {
   // } else if (action == "load") {
   //   return doLoad(args);
   } else {
-    fprintf(stderr, "invalid action\n");
-    return -1;
+    return fmtErrorf("invalid action");
   }
 
-  return -1;
+  return nullptr;
+}
+
+int main(int argc, char **argv) {
+  auto err = runMain(argc, argv);
+  if (err) {
+    auto s = err.msg();
+    fputs(s.c_str(), stderr);
+    fputs("\n", stderr);
+    return -1;
+  }
+  return 0;
 }

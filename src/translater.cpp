@@ -31,6 +31,7 @@
 #include "llvm/Support/ConvertUTF.h"
 #include "X86BaseInfo.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <iostream>
 #include <vector>
@@ -111,7 +112,7 @@ void translate(const ElfFile &file, Result &res) {
     outsfmt("load off %lx size %lx secs %d\n", phX->p_offset, phX->p_filesz, file.secs.size());
   }
 
-  u8_view instBuf((uint8_t *)eh + phX->p_offset, phX->p_filesz);
+  Slice instBuf((uint8_t *)eh + phX->p_offset, phX->p_filesz);
   auto vaddr = [&](auto a) { return a + phX->p_vaddr; };
 
   struct Section {
@@ -176,7 +177,7 @@ void translate(const ElfFile &file, Result &res) {
 
   auto constexpr X86_BAD = X86::INSTRUCTION_LIST_END+1;
 
-  auto mcDecode = [&](MCInst &inst, uint64_t &size, u8_view buf) {
+  auto mcDecode = [&](MCInst &inst, uint64_t &size, Slice buf) {
     auto r = DisAsm->getInstruction(inst, size, {buf.data(), buf.size()}, 0, nulls());
     if (r != MCDisassembler::DecodeStatus::Success) {
       inst.setOpcode(X86_BAD);
@@ -220,7 +221,7 @@ void translate(const ElfFile &file, Result &res) {
     return super;
   };
 
-  auto instHexStr = [&](u8_view buf) -> std::string {
+  auto instHexStr = [&](Slice buf) -> std::string {
     std::string hex = "[";
     for (int i = 0; i < buf.size(); i++) {
       hex += fmtSprintf("%.2X", buf[i]);
@@ -263,7 +264,7 @@ void translate(const ElfFile &file, Result &res) {
     return s;
   };
 
-  auto instAllStr = [&](const MCInst &inst, u8_view buf = {}) -> std::string {
+  auto instAllStr = [&](const MCInst &inst, Slice buf = {}) -> std::string {
     std::string s;
     if (inst.getOpcode() == X86_BAD) {
       s += "bad";
@@ -533,7 +534,7 @@ void translate(const ElfFile &file, Result &res) {
 
   struct McDecode2Res {
     MCInst inst;
-    u8_view buf;
+    Slice buf;
     OpcodeAndSize op;
     uint64_t size;
   };
@@ -546,7 +547,7 @@ void translate(const ElfFile &file, Result &res) {
     return r;
   };
 
-  auto dismInstBuf = [&](const std::string &prefix, u8_view buf, uint64_t va = 0) {
+  auto dismInstBuf = [&](const std::string &prefix, Slice buf, uint64_t va = 0) {
     MCInst inst;
     uint64_t size;
     for (int addr = 0; addr < buf.size(); ) {
@@ -798,7 +799,7 @@ void translate(const ElfFile &file, Result &res) {
       p->size = patchCode.size() - p->off;
     }
 
-    u8_view codeSlice(size_t start) {
+    Slice codeSlice(size_t start) {
       return {(uint8_t *)code.data()+start, code.size()-start};
     }
   };
@@ -857,7 +858,7 @@ void translate(const ElfFile &file, Result &res) {
       [optional] lea 8(%rsp), %rsp // save rsp
       lea inst1.mem, %tmp // get orig value
       [optional] lea -8(%rsp), %rsp // recovery rsp
-      push %rax; call get_fs; lea (%rax,%tmp), %tmp; pop %rax // add fs
+      push %rax; call gettls; lea (%rax,%tmp), %tmp; pop %rax // add fs
       inst1.op inst1.reg, (%tmp) // modified instr
       pop %tmp // recovery tmp
     */
@@ -1281,7 +1282,7 @@ void translate(const ElfFile &file, Result &res) {
         auto s = fmtReloc(r, i, file);
         outsfmt("add %s\n", s.c_str());
       }
-      auto D = [&](const std::string &s, u8_view buf, uint64_t va) {
+      auto D = [&](const std::string &s, Slice buf, uint64_t va) {
         dismInstBuf(fmtSprintf("%s_%s", stype, s.c_str()), buf, va);
       };
       auto before = [&](const std::string &s, AddrRange r) {
@@ -1400,7 +1401,7 @@ void translate(const ElfFile &file, Result &res) {
   res.patchCode = std::move(E.patchCode);
 }
 
-bool writeElfFile(const Result &res, const ElfFile &input, const std::string &output) {
+error writeElfFile(const Result &res, const ElfFile &input, const std::string &setInterp, const std::string &output) {
   unsigned align = 0x1000;
 
   auto totSize = (input.buf.size() + align-1) & ~(align-1);
@@ -1421,19 +1422,20 @@ bool writeElfFile(const Result &res, const ElfFile &input, const std::string &ou
   auto phs = std::vector<Elf64_Phdr>(oldPhs, oldPhs + input.eh()->e_phnum);
   auto newPhsSize = (phs.size()+2)*sizeof(phs[0]);
 
-  int fd = open(output.c_str(), O_RDWR|O_CREAT|O_TRUNC, 0744);
-  if (fd == -1) {
-    return false;
-  }
-  defer([&] { close(fd); });
+  File f;
 
-  if (ftruncate(fd, totSize) == -1) {
-    return false;
+  auto err = f.create(output);
+  if (err) {
+    return err;
   }
 
-  auto filem = (uint8_t *)mmap(NULL, totSize, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+  if (ftruncate(f.fd, totSize) == -1) {
+    return fmtErrorf("trunc failed");
+  }
+
+  auto filem = (uint8_t *)mmap(NULL, totSize, PROT_READ|PROT_WRITE, MAP_SHARED, f.fd, 0);
   if (filem == MAP_FAILED) {
-    return false;
+    return fmtErrorf("mmap failed");
   }
 
   auto codeOff = input.phX->p_offset;
@@ -1482,6 +1484,25 @@ bool writeElfFile(const Result &res, const ElfFile &input, const std::string &ou
     }
   }
 
+  // if (setInterp != "") {
+  //   auto p = std::find_if(phs.begin(), phs.end(), [](Elf64_Phdr &i) {
+  //     return i.p_type == PT_INTERP;
+  //   });
+  //   if (p == phs.end()) {
+  //     return fmtErrorf("interp not found");
+  //   }
+  //   auto off = newPhsOff + newPhsSize;
+  //   if (setInterp.size() > align-newPhsSize) {
+  //     return fmtErrorf("interp too big");
+  //   }
+  //   memcpy(filem + off, setInterp.data(), setInterp.size());
+  //   p->p_offset = off;
+  //   p->p_vaddr = off;
+  //   p->p_paddr = off;
+  //   p->p_filesz = setInterp.size();
+  //   p->p_memsz = setInterp.size();
+  // }
+
   phs.insert(phs.begin()+loadEnd+1, {{
     .p_type = PT_LOAD, .p_flags = PF_R,
     .p_offset = newPhsOff, .p_vaddr = newPhsVaddr, .p_paddr = newPhsVaddr,
@@ -1500,21 +1521,21 @@ bool writeElfFile(const Result &res, const ElfFile &input, const std::string &ou
   newEh->e_phnum = phs.size();
 
   if (msync(filem, totSize, MS_SYNC) == -1) {
-    return false;
+    return fmtErrorf("msync failed");
   }
 
-  return true;
+  return nullptr;
 }
 
-int cmdMain(const std::vector<std::string> &args0) {
+error cmdMain(const std::vector<std::string> &args0) {
   std::vector<std::string> args;
+  std::string setInterp;
 
   for (int i = 0; i < args0.size(); i++) {
     auto &o = args0[i];
     if (o == "-i") {
       if (i+1 >= args0.size()) {
-        fprintf(stderr, "need param\n");
-        return -1;
+        return fmtErrorf("missing param");
       }
       sscanf(args0[i+1].c_str(), "%x", &forSingleInstr);
       i++;
@@ -1551,37 +1572,43 @@ int cmdMain(const std::vector<std::string> &args0) {
       summary = true;
       continue;
     }
+    if (o == "-si") {
+      if (i+1 >= args0.size()) {
+        return fmtErrorf("missing param");
+      }
+      setInterp = args0[i+1];
+      i++;
+      continue;
+    }
     args.push_back(o);
   }
 
   if (args.size() < 1) {
-    errs() << "need filename\n";
-    return -1;
+    return fmtErrorf("missing filename");
   }
 
-  auto input = args[0];
+  auto input0 = args[0];
 
-  std::string output = "a.out";
+  std::string output0 = "a.out";
   if (args.size() > 1) {
-    output = args[1];
+    output0 = args[1];
   }
 
-  ElfFile file;
-  int fd;
-  if (!ElfFile::open(input, file, fd)) {
-    return -1;
+  ElfFile input;
+  auto err = ElfFile::open(input0, input);
+  if (err) {
+    return err;
   }
 
   Result res;
-  translate(file, res);
+  translate(input, res);
 
-  if (!writeElfFile(res, file, output)) {
-    return -1;
+  err = writeElfFile(res, input, setInterp, output0);
+  if (err) {
+    return err;
   }
 
-  auto err = fmtErrorf("hii");
-
-  return 0;
+  return nullptr;
 }
 
 }

@@ -30,9 +30,6 @@ namespace translater {
     uint16_t size;
   };
 
-  // static bool isStub(u8_view code);
-  // static void relocStubFunc(u8_view code, int i, void *p);
-
   struct Result {
     std::vector<Reloc> relocs;
     std::vector<uint8_t> stubCode;
@@ -41,6 +38,6 @@ namespace translater {
   };
 
   void translate(const ElfFile &file, Result &res);
-  bool writeElfFile(const Result &res, const ElfFile &input, const std::string &output);
-  int cmdMain(const std::vector<std::string> &args);
+  error writeElfFile(const Result &res, const ElfFile &input, const std::string &setInterp, const std::string &output);
+  error cmdMain(const std::vector<std::string> &args);
 }

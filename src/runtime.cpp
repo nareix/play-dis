@@ -21,6 +21,7 @@ constexpr int offRegs = offsetof(ThreadCB, regs);
 static thread_local ThreadCB tcb;
 
 static __attribute__((naked)) void gettls() {
+	asm("endbr64");
 	asm("rdfsbase %rax; ret");
 }
 

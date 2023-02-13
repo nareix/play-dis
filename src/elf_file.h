@@ -5,9 +5,11 @@
 #include "elf.h"
 #include "utils.h"
 
-struct ElfFile {
-  u8_view buf;
+class ElfFile {
+public:
+  Slice buf;
   Elf64_Phdr *phX;
+  File f;
 
   struct Section {
     Elf64_Shdr *sh;
@@ -22,6 +24,5 @@ struct ElfFile {
     return (Elf64_Ehdr *)buf.data();
   }
 
-  static bool open(const std::string &filename, ElfFile &file, int &fd);
-  static bool parse(u8_view buf, ElfFile &file);
+  static error open(const std::string &filename, ElfFile &file);
 };

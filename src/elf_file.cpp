@@ -1,4 +1,5 @@
 #include "elf_file.h"
+#include "utils.h"
 
 #include <unistd.h>
 #include <stdlib.h>
@@ -7,7 +8,7 @@
 #include <fcntl.h>
 #include <string.h>
 
-static bool dynFindTag(u8_view file, Elf64_Phdr *ph, Elf64_Sxword tag, Elf64_Xword &v) {
+static bool dynFindTag(Slice file, Elf64_Phdr *ph, Elf64_Sxword tag, Elf64_Xword &v) {
   auto dynStart = file.data() + ph->p_offset;
   for (auto e = (Elf64_Dyn *)dynStart; (uint8_t *)e < file.end(); e++) {
     if (e->d_tag == DT_NULL) {
@@ -21,10 +22,10 @@ static bool dynFindTag(u8_view file, Elf64_Phdr *ph, Elf64_Sxword tag, Elf64_Xwo
   return false;
 }
 
-bool ElfFile::parse(u8_view buf, ElfFile &file) {
+static error parse(Slice buf, ElfFile &file) {
   auto eh = (Elf64_Ehdr *)buf.data();
   if (buf.size() < sizeof(Elf64_Ehdr)) {
-    return false;
+    return fmtErrorf("size not match #1");
   }
 
   uint8_t osabi = eh->e_ident[EI_OSABI];
@@ -38,14 +39,14 @@ bool ElfFile::parse(u8_view buf, ElfFile &file) {
     (eh->e_type != ET_DYN && eh->e_type != ET_EXEC)
     )
   {
-    return false;
+    return fmtErrorf("invalid spec");
   }
 
   if (eh->e_phentsize != sizeof(Elf64_Phdr)) {
-    return false;
+    return fmtErrorf("invalid spec");
   }
   if (eh->e_shentsize != sizeof(Elf64_Shdr)) {
-    return false;
+    return fmtErrorf("invalid spec");
   }
 
   uint8_t *shStart = (uint8_t *)eh + eh->e_shoff;
@@ -56,7 +57,7 @@ bool ElfFile::parse(u8_view buf, ElfFile &file) {
     auto s = (const char *)strtab + sh->sh_name;
     int maxlen = (uint8_t *)buf.end() - (uint8_t *)s;
     if (maxlen < 0) {
-      return false;
+      return fmtErrorf("size not match #2");
     }
     std::string name = std::string(s, strnlen(s, maxlen));
     file.secs.push_back({sh, std::move(name)});
@@ -68,10 +69,10 @@ bool ElfFile::parse(u8_view buf, ElfFile &file) {
   for (int i = 0; i < eh->e_phnum; i++) {
     Elf64_Phdr *ph = (Elf64_Phdr *)(phStart + eh->e_phentsize*i);
     if ((uint8_t *)ph + sizeof(Elf64_Phdr) > buf.end()) {
-      return false;
+      return fmtErrorf("size not match #3");
     }
-    if (ph->p_offset + ph->p_filesz >= buf.size()) {
-      return false;
+    if (ph->p_offset + ph->p_filesz > buf.size()) {
+      return fmtErrorf("size not match #4: %d", i);
     }
     phs.push_back(ph);
   }
@@ -82,7 +83,7 @@ bool ElfFile::parse(u8_view buf, ElfFile &file) {
     }
   }
   if (loads.size() == 0) {
-    return false;
+    return fmtErrorf("no load sec");
   }
 
   Elf64_Phdr *phX = nullptr;
@@ -90,7 +91,7 @@ bool ElfFile::parse(u8_view buf, ElfFile &file) {
     return ph->p_flags & PF_X;
   });
   if (iphX == phs.end()) {
-    return false;
+    return fmtErrorf("no load x sec");
   }
   phX = *iphX;
 
@@ -110,35 +111,37 @@ bool ElfFile::parse(u8_view buf, ElfFile &file) {
   file.phX = phX;
   file.loads = std::move(loads);
   file.isPIE = isPIE;
-  return true;
+  return nullptr;
 }
 
-bool ElfFile::open(const std::string &filename, ElfFile &file, int &fd) {
-  fd = ::open(filename.c_str(), O_RDONLY);
-  if (fd == -1) {
-    fprintf(stderr, "open %s failed\n", filename.c_str());
-    return false;
+error ElfFile::open(const std::string &filename, ElfFile &file) {
+  File f;
+
+  auto err = f.open(filename.c_str());
+  if (err) {
+    return err;
   }
 
   struct stat sb;
-  if (fstat(fd, &sb) == -1) {
-    fprintf(stderr, "stat %s failed\n", filename.c_str());
-    return false;
+  if (fstat(f.fd, &sb) == -1) {
+    return fmtErrorf("stat %s failed", filename.c_str());
   }
   auto fileSize = sb.st_size;
 
-  auto fileAddr = (uint8_t *)mmap(NULL, fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
+  auto fileAddr = (uint8_t *)mmap(NULL, fileSize, PROT_READ, MAP_PRIVATE, f.fd, 0);
   if (fileAddr == MAP_FAILED) {
-    fprintf(stderr, "mmap %s failed\n", filename.c_str());
-    return false;
+    return fmtErrorf("mmap %s failed", filename.c_str());
   }
 
-  u8_view buf = {fileAddr, (size_t)fileSize};
-  if (!parse(buf, file)) {
-    fprintf(stderr, "elf not supported\n");
-    return false;
+  Slice buf = {fileAddr, (size_t)fileSize};
+  err = parse(buf, file);
+  if (err) {
+    return fmtErrorf("elf not supported: %s", err.msg().c_str());
   }
 
-  return true;
+  file.buf = buf;
+  file.f = std::move(f);
+
+  return nullptr;
 }
 
