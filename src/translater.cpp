@@ -1429,15 +1429,18 @@ error writeElfFile(const Result &res, const ElfFile &input, const std::string &s
     return err;
   }
 
-  if (ftruncate(f.fd, totSize) == -1) {
-    return fmtErrorf("trunc failed");
+  err = f.truncate(totSize);
+  if (err) {
+    return err;
   }
 
-  auto filem = (uint8_t *)mmap(NULL, totSize, PROT_READ|PROT_WRITE, MAP_SHARED, f.fd, 0);
-  if (filem == MAP_FAILED) {
-    return fmtErrorf("mmap failed");
+  Slice buf;
+  err = f.mmap(buf);
+  if (err) {
+    return err;
   }
 
+  auto filem = buf.p();
   auto codeOff = input.phX->p_offset;
   auto code = filem + codeOff;
   auto stubCode = filem + stubCodeOff;
@@ -1595,7 +1598,7 @@ error cmdMain(const std::vector<std::string> &args0) {
   }
 
   ElfFile input;
-  auto err = ElfFile::open(input0, input);
+  auto err = input.open(input0);
   if (err) {
     return err;
   }

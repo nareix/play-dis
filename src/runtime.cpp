@@ -51,10 +51,14 @@ static __attribute__((naked)) void syscall() {
 	asm("jmp *%%gs:%c0" :: "i"(offRegs+8*9));
 }
 
-void soInit() {
+static void initTcb() {
 	tcb.fn[0] = (void *)syscall;
 	tcb.fn[1] = (void *)gettls;
   asm("WRGSBASE %0" :: "r"(&tcb));
+}
+
+void soInit() {
+	initTcb();
 }
 
 }

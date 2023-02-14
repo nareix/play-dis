@@ -24,5 +24,5 @@ public:
     return (Elf64_Ehdr *)buf.data();
   }
 
-  static error open(const std::string &filename, ElfFile &file);
+  error open(const std::string &filename);
 };

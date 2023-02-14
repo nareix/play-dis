@@ -2,6 +2,7 @@
 #include <vector>
 #include <string>
 
+#include "elf.h"
 #include "translater.h"
 #include "loader.h"
 #include "elf_file.h"
@@ -171,8 +172,18 @@ static error runMain(int argc, char **argv) {
 
   if (action == "trans") {
     return translater::cmdMain(args);
-  // } else if (action == "load") {
-  //   return doLoad(args);
+  } else if (action == "elfaddr") {
+    ElfFile f;
+    uint64_t start;
+    sscanf(args[1].c_str(), "%lx", &start);
+    fmtPrintf("add-symbol-file %s ", args[0].c_str());
+    f.open(args[0]);
+    for (auto i: f.secs) {
+      if (i.sh->sh_addr) {
+        fmtPrintf("-s %s 0x%lx ", i.name.c_str(), i.sh->sh_addr + start);
+      }
+    }
+    fmtPrintf("\n");
   } else {
     return fmtErrorf("invalid action");
   }

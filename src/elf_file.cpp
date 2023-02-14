@@ -114,7 +114,7 @@ static error parse(Slice buf, ElfFile &file) {
   return nullptr;
 }
 
-error ElfFile::open(const std::string &filename, ElfFile &file) {
+error ElfFile::open(const std::string &filename) {
   File f;
 
   auto err = f.open(filename.c_str());
@@ -122,25 +122,19 @@ error ElfFile::open(const std::string &filename, ElfFile &file) {
     return err;
   }
 
-  struct stat sb;
-  if (fstat(f.fd, &sb) == -1) {
-    return fmtErrorf("stat %s failed", filename.c_str());
-  }
-  auto fileSize = sb.st_size;
-
-  auto fileAddr = (uint8_t *)mmap(NULL, fileSize, PROT_READ, MAP_PRIVATE, f.fd, 0);
-  if (fileAddr == MAP_FAILED) {
-    return fmtErrorf("mmap %s failed", filename.c_str());
+  Slice buf;
+  err = f.mmap(buf);
+  if (err) {
+    return err;
   }
 
-  Slice buf = {fileAddr, (size_t)fileSize};
-  err = parse(buf, file);
+  err = parse(buf, *this);
   if (err) {
     return fmtErrorf("elf not supported: %s", err.msg().c_str());
   }
 
-  file.buf = buf;
-  file.f = std::move(f);
+  this->buf = buf;
+  this->f = std::move(f);
 
   return nullptr;
 }

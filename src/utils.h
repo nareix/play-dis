@@ -1,9 +1,11 @@
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <functional>
 #include <string_view>
 #include <memory>
+#include <sys/types.h>
 
 class Slice: public std::basic_string_view<uint8_t> {
 public:
@@ -14,6 +16,8 @@ public:
   Slice() { 
     Slice(nullptr, 0); 
   }
+
+  uint8_t *p() { return (uint8_t*)data(); };
 
   Slice slice(size_t start) {
     return {data() + start, size() - start};
@@ -39,6 +43,12 @@ static inline std::string fmtSprintf(const char *fmt, Types... args) {
   char buf[n+1];
   snprintf(buf, n+1, fmt, args...);
   return std::string(buf);
+}
+
+template <typename... Types>
+static inline void fmtPrintf(const char *fmt, Types... args) {
+  auto s = fmtSprintf(fmt, args...);
+  fputs(s.c_str(), stdout);
 }
 
 class IError {
@@ -73,10 +83,13 @@ static inline error fmtErrorf(Types... args) {
 class File {
 public:
   int fd = -1;
+  void *mmapP = nullptr;
   ~File();
   File & operator=(File &&rhs);
   File() {}
   error open(const std::string &file);
+  size_t size();
+  error truncate(size_t n);
+  error mmap(Slice &buf);
   error create(const std::string &file);
-  error truncate(size_t size);
 };
