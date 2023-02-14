@@ -52,6 +52,17 @@ error File::truncate(size_t n) {
 
 error File::mmap(Slice &buf) {
   auto n = size();
+  auto p = (uint8_t *)::mmap(NULL, n, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (p == MAP_FAILED) {
+    return fmtErrorf("mmap failed");
+  }
+  buf = {p, n};
+  mmapP = p;
+  return nullptr;
+}
+
+error File::mmapWrite(Slice &buf) {
+  auto n = size();
   auto p = (uint8_t *)::mmap(NULL, n, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
   if (p == MAP_FAILED) {
     return fmtErrorf("mmap failed");

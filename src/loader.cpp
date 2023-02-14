@@ -20,23 +20,22 @@ error loadBin(const ElfFile &file, uint8_t *&loadP) {
 
   auto load0 = loads.begin();
   auto loadn = loads.end()-1;
-  auto loadSize = (*loadn)->p_vaddr + (*loadn)->p_memsz + (*load0)->p_vaddr;
-  auto fileSize = file.buf.size();
+  auto loadSize = (*loadn)->p_vaddr + (*loadn)->p_memsz - (*load0)->p_vaddr;
 
-  auto align = 1UL << (64 - __builtin_clzll(fileSize) + 8);
+  auto align = 1UL << (64 - __builtin_clzll(loadSize) + 8);
   if (debug) {
     fmtPrintf("loadbin: align %lx\n", loadSize);
   }
 
-  loadP = (uint8_t *)mmap(NULL, fileSize, PROT_READ, MAP_PRIVATE, file.f.fd, 0);
+  loadP = (uint8_t *)mmap(NULL, loadSize, PROT_READ, MAP_PRIVATE, file.f.fd, 0);
   if (loadP == MAP_FAILED) {
     return fmtErrorf("mmap failed #0");
   }
 
   if (doBigAlign) {
-    munmap(loadP, fileSize);
+    munmap(loadP, loadSize);
     loadP = (uint8_t *)((uint64_t)loadP & ~(align-1));
-    loadP = (uint8_t *)mmap(loadP, fileSize, PROT_READ, MAP_PRIVATE|MAP_FIXED, file.f.fd, 0);
+    loadP = (uint8_t *)mmap(loadP, loadSize, PROT_READ, MAP_PRIVATE|MAP_FIXED, file.f.fd, 0);
     if (loadP == MAP_FAILED) {
       return fmtErrorf("mmap failed #1");
     }

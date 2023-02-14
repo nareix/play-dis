@@ -91,5 +91,6 @@ public:
   size_t size();
   error truncate(size_t n);
   error mmap(Slice &buf);
+  error mmapWrite(Slice &buf);
   error create(const std::string &file);
 };

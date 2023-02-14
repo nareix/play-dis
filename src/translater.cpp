@@ -1433,7 +1433,7 @@ error writeElfFile(const Result &res, const ElfFile &input, const std::string &s
   }
 
   Slice buf;
-  err = f.mmap(buf);
+  err = f.mmapWrite(buf);
   if (err) {
     return err;
   }

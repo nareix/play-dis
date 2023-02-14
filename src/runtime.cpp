@@ -125,7 +125,7 @@ static error runBin(const std::string &filename) {
 	v.push_back(0);
 
 	auto eh = file.eh();
-	uint8_t *phStart = (uint8_t *)eh + eh->e_phoff;
+	uint8_t *phStart = loadP + eh->e_phoff;
 
 	// aux
 	v.push_back(AT_HWCAP);
