@@ -41,11 +41,11 @@ static constexpr int TCBStack = offsetof(ThreadCB, stack);
 static constexpr int TCBFs = offsetof(ThreadCB, fs);
 
 static ThreadCB __attribute__((naked)) *tcb() {
-  asm("endbr64; RDGSBASE %rax; ret");
+  asm("endbr64; rdgsbase %rax; ret");
 }
 
 static void __attribute__((naked)) settcb(ThreadCB *t) {
-  asm("endbr64; WRGSBASE %rdi; ret");
+  asm("endbr64; wrgsbase %rdi; ret");
 }
 
 static __attribute__((naked)) void getfs() {
@@ -106,7 +106,6 @@ public:
 	}
 
 	bool handle() {
-		auto regs = t->regs;
 		auto nr = regs[0];
 		bool r;
 
@@ -201,8 +200,8 @@ static error initTcb() {
 		return fmtErrorf("mmap syscall stack failed");
 	}
 
-	auto t = (ThreadCB *)malloc(sizeof(ThreadCB));
-	memset(t, 0, sizeof(ThreadCB));
+	static thread_local ThreadCB t0;
+	auto t = &t0;
 	t->fn[0] = (void *)syscall;
 	t->fn[1] = (void *)getfs;
 	t->stack = stack + size;
@@ -214,7 +213,7 @@ static error initTcb() {
 static std::unordered_map<std::string, uint64_t> fileAddrMap;
 
 static void enterBin(void *entry, void *stack) {
-  asm("cmp $0, %0; cmovne %0, %%rsp" :: "r"(stack));
+  asm("mov %0, %%rsp" :: "r"(stack));
   asm("jmpq *%0" :: "r"(entry));
 }
 
@@ -242,15 +241,6 @@ static error runBin(const std::vector<std::string> &args) {
 	}
 
   auto entryP = loadP + file.eh()->e_entry - (*file.loads.begin())->p_vaddr;
-  uint8_t *stackStart = nullptr;
-
-	int stackSize = 1024*128;
-	auto stackTop = (uint8_t *)mmap(NULL, stackSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-	if (stackTop == MAP_FAILED) {
-		return fmtErrorf("mmap stack failed");
-	}
-	auto stackEnd = stackTop + stackSize;
-	stackStart = stackEnd;
 
 	// << stackTop
 	// .. stack ..
@@ -280,35 +270,35 @@ static error runBin(const std::vector<std::string> &args) {
 	uint8_t *phStart = loadP + eh->e_phoff;
 
 	// aux
-	v.push_back(AT_HWCAP);
-	v.push_back(0x178bfbff);
-	v.push_back(AT_PAGESZ);
-	v.push_back(getpagesize());
-	v.push_back(AT_CLKTCK);
-	v.push_back(100);
-	v.push_back(AT_PHDR);
-	v.push_back((size_t)phStart);
-	v.push_back(AT_BASE);
-	v.push_back((size_t)loadP);
-	v.push_back(AT_PHENT);
-	v.push_back((size_t)eh->e_phentsize);
-	v.push_back(AT_PHNUM);
-	v.push_back((size_t)eh->e_phnum);
-	v.push_back(AT_ENTRY);
-	v.push_back((size_t)entryP);
-	v.push_back(AT_EXECFN);
-	v.push_back((size_t)filename.c_str());
-	v.push_back(AT_PLATFORM);
-	v.push_back((size_t)"x86_64");
-	v.push_back(0);
-	v.push_back(0);
+	auto aux = [&](size_t k, size_t val) {
+		v.push_back(k);
+		v.push_back(val);
+	};
+	aux(AT_HWCAP, 0x178bfbff);
+	aux(AT_PAGESZ, getpagesize());
+	aux(AT_CLKTCK, 100);
+	aux(AT_PHDR, (size_t)phStart);
+	aux(AT_BASE, (size_t)loadP);
+	aux(AT_PHENT, (size_t)eh->e_phentsize);
+	aux(AT_PHNUM, (size_t)eh->e_phnum);
+	aux(AT_ENTRY, (size_t)entryP);
+	aux(AT_EXECFN, (size_t)filename.c_str());
+	aux(AT_PLATFORM, (size_t)"x86_64");
+	aux(0, 0);
+
+	auto stackSize = 1024*128;
+	auto stackTop = (uint8_t *)mmap(NULL, stackSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+	if (stackTop == MAP_FAILED) {
+		return fmtErrorf("mmap stack failed");
+	}
+	auto stackEnd = stackTop + stackSize;
 
 	auto vsize = v.size()*sizeof(v[0]);
 	if (vsize > stackSize) {
 		return fmtErrorf("auxv too large");
 	}
 
-	stackStart -= vsize;
+	auto stackStart = stackEnd - vsize;
 	memcpy(stackStart, v.data(), vsize);
 
 	err = initTcb();
