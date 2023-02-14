@@ -11,10 +11,9 @@
 #include <unistd.h>
 
 static bool debug = true;
-static bool doBigAlign = true;
 static auto pageSize = getpagesize();
 
-error loadBin(const ElfFile &file, uint8_t *&loadP) {
+error loadBin(const ElfFile &file, uint8_t *&loadP, uint64_t loadAt) {
   auto eh = file.eh();
   auto &loads = file.loads;
 
@@ -22,23 +21,17 @@ error loadBin(const ElfFile &file, uint8_t *&loadP) {
   auto loadn = loads.end()-1;
   auto loadSize = (*loadn)->p_vaddr + (*loadn)->p_memsz - (*load0)->p_vaddr;
 
-  auto align = 1UL << (64 - __builtin_clzll(loadSize) + 8);
-  if (debug) {
-    fmtPrintf("loadbin: align %lx\n", loadSize);
+  int flags = MAP_PRIVATE;
+  if (loadAt) {
+    flags |= MAP_FIXED;
   }
 
-  loadP = (uint8_t *)mmap(NULL, loadSize, PROT_READ, MAP_PRIVATE, file.f.fd, 0);
+  loadP = (uint8_t *)mmap((void *)loadAt, loadSize, PROT_READ, flags, file.f.fd, 0);
   if (loadP == MAP_FAILED) {
     return fmtErrorf("mmap failed #0");
   }
-
-  if (doBigAlign) {
-    munmap(loadP, loadSize);
-    loadP = (uint8_t *)((uint64_t)loadP & ~(align-1));
-    loadP = (uint8_t *)mmap(loadP, loadSize, PROT_READ, MAP_PRIVATE|MAP_FIXED, file.f.fd, 0);
-    if (loadP == MAP_FAILED) {
-      return fmtErrorf("mmap failed #1");
-    }
+  if (loadAt && loadP != (void *)loadAt) {
+    return fmtErrorf("load at failed: %p %lx", loadP, loadAt);
   }
 
   if (debug) {

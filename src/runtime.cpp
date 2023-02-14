@@ -1,16 +1,24 @@
+#include "elf.h"
 #include "elf_file.h"
 #include "utils.h"
 #include "runtime.h"
 #include "loader.h"
 
+#include <cstdint>
+#include <filesystem>
 #include <cstddef>
+#include <functional>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <string>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <vector>
+#include <unordered_map>
+#include <fstream>
 
 namespace runtime {
 
@@ -59,23 +67,16 @@ static void initTcb() {
   asm("WRGSBASE %0" :: "r"(&tcb));
 }
 
-static void printElfAddr(const std::string &filename, const ElfFile &file, uint64_t start) {
-	fmtPrintf("add-symbol-file %s ", filename.c_str());
-	for (auto i: file.secs) {
-		if (i.sh->sh_addr) {
-			fmtPrintf("-s %s 0x%lx ", i.name.c_str(), i.sh->sh_addr + start);
-		}
-	}
-	fmtPrintf("\n");
-}
+static std::unordered_map<std::string, uint64_t> fileAddrMap;
 
 static void enterBin(void *entry, void *stack) {
-	fmtPrintf("start\n");
   asm("cmp $0, %0; cmovne %0, %%rsp" :: "r"(stack));
   asm("jmpq *%0" :: "r"(entry));
 }
 
-static error runBin(const std::string &filename) {
+static error runBin(const std::vector<std::string> &args) {
+	auto &filename = args[0];
+
 	ElfFile file;
 
 	auto err = file.open(filename);
@@ -83,13 +84,18 @@ static error runBin(const std::string &filename) {
 		return err;
 	}
 
+	uint64_t loadAt = 0;
+	auto basename = std::filesystem::path(filename).filename();
+	auto addri = fileAddrMap.find(basename);
+	if (addri != fileAddrMap.end()) {
+		loadAt = addri->second;
+	}
+
 	uint8_t *loadP;
-	err = loadBin(file, loadP);
+	err = loadBin(file, loadP, loadAt);
 	if (err) {
 		return err;
 	}
-
-	printElfAddr(filename, file, (uint64_t)loadP);
 
   auto entryP = loadP + file.eh()->e_entry - (*file.loads.begin())->p_vaddr;
   uint8_t *stackStart = nullptr;
@@ -117,8 +123,10 @@ static error runBin(const std::string &filename) {
 	std::vector<size_t> v;
 
 	// argc argv
-	v.push_back(1);
-	v.push_back((size_t)filename.c_str());
+	v.push_back(args.size());
+	for (auto &s: args) {
+		v.push_back((size_t)s.c_str());
+	}
 	v.push_back(0);
 
 	// env
@@ -131,11 +139,13 @@ static error runBin(const std::string &filename) {
 	v.push_back(AT_HWCAP);
 	v.push_back(0x178bfbff);
 	v.push_back(AT_PAGESZ);
-	v.push_back(4096);
+	v.push_back(getpagesize());
 	v.push_back(AT_CLKTCK);
 	v.push_back(100);
 	v.push_back(AT_PHDR);
 	v.push_back((size_t)phStart);
+	v.push_back(AT_BASE);
+	v.push_back((size_t)loadP);
 	v.push_back(AT_PHENT);
 	v.push_back((size_t)eh->e_phentsize);
 	v.push_back(AT_PHNUM);
@@ -157,36 +167,88 @@ static error runBin(const std::string &filename) {
 	stackStart -= vsize;
 	memcpy(stackStart, v.data(), vsize);
 
+	initTcb();
 	enterBin(entryP, stackStart);
 	__builtin_unreachable();
 }
 
-error cmdMain(std::vector<std::string> &args) {
+error cmdMain(std::vector<std::string> &args0) {
+	std::vector<std::string> args;
+	std::string addrFile;
+
+  for (int i = 0; i < args0.size(); i++) {
+    auto &o = args0[i];
+		if (o == "-a") {
+      if (i+1 >= args0.size()) {
+        return fmtErrorf("missing param");
+      }
+			addrFile = args0[i+1];
+			i++;
+			continue;
+		}
+    args.push_back(o);
+	}
+
 	if (args.size() < 1) {
 		return fmtErrorf("missing action");
 	}
 	auto action = args[0];
+	args.erase(args.begin());
 
-	if (action == "elfaddr") {
-		if (args.size() < 3) {
+	auto forElfFiles = [&](
+		std::function<void(const std::string&, const ElfFile &, uint64_t)> fn
+	) -> error {
+		if (args.size() == 0) {
 			return fmtErrorf("missing filename");
 		}
-		auto filename = args[1];
-		ElfFile file;
-		auto err = file.open(filename);
-		if (err) {
-			return err;
+		auto addrStart = 0x00007ff000000000UL;
+		auto addrInc   = 0x0000000100000000UL;
+		auto addr = addrStart;
+		for (auto filename: args) {
+			ElfFile file;
+			auto err = file.open(filename);
+			if (err) {
+				return err;
+			}
+			fn(filename, file, addr);
+			addr += addrInc;
 		}
-    uint64_t start;
-    sscanf(args[2].c_str(), "%lx", &start);
-		printElfAddr(filename, file, start);
 		return nullptr;
+	};
+
+	if (action == "gdbcmd") {
+		return forElfFiles([&](const std::string &filename, const ElfFile &file, uint64_t addr) {
+			fmtPrintf("add-symbol-file %s ", filename.c_str());
+			for (auto i: file.secs) {
+				if (i.sh->sh_addr) {
+					fmtPrintf("-s %s 0x%lx ", i.name.c_str(), i.sh->sh_addr + addr);
+				}
+			}
+			fmtPrintf("\n");
+		});
+
+	} else if (action == "addrs") {
+		return forElfFiles([&](const std::string &filename, const ElfFile &file, uint64_t addr) {
+			auto basename = std::filesystem::path(filename).filename();
+			fmtPrintf("%s 0x%lx\n", basename.c_str(), addr);
+		});
+
 	} else if (action == "run") {
-		if (args.size() < 2) {
+		if (addrFile != "") {
+			std::ifstream file(addrFile);
+			std::string line;
+			while (std::getline(file, line)) {
+				std::stringstream sline(line);
+				std::string basename;
+				uint64_t addr;
+				sline >> basename >> std::hex >> addr;
+				fileAddrMap.emplace(basename, addr);
+			}
+		}
+		if (args.size() == 0) {
 			return fmtErrorf("missing filename");
 		}
-		auto filename = args[1];
-		return runBin(filename);
+		return runBin(args);
 	}
 
 	return fmtErrorf("invalid action");
