@@ -38,6 +38,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <sstream>
 
 #include <stdlib.h>
 #include <stdint.h>
@@ -57,11 +58,6 @@
 using namespace llvm;
 
 namespace translater {
-
-template <typename... Types>
-void outsfmt(const char *f, Types... args) {
-  outs() << fmtSprintf(f, args...);
-}
 
 static std::string fmtReloc(Reloc r, int i, const ElfFile &file) {
   uint64_t vaddr;
@@ -99,7 +95,7 @@ void translate(const ElfFile &file, Result &res) {
   Elf64_Ehdr *eh = file.eh();
 
   if (debug) {
-    outsfmt("filesize %lx e_ehsize %d e_phoff %lx size %d e_shoff %lx size %d\n",
+    fmtPrintf("filesize %lx e_ehsize %d e_phoff %lx size %d e_shoff %lx size %d\n",
       file.buf.size(), eh->e_ehsize,
       eh->e_phoff, eh->e_phentsize*eh->e_phnum,
       eh->e_shoff, eh->e_shentsize*eh->e_shnum
@@ -109,7 +105,7 @@ void translate(const ElfFile &file, Result &res) {
   auto phX = file.phX;
 
   if (debug) {
-    outsfmt("load off %lx size %lx secs %d\n", phX->p_offset, phX->p_filesz, file.secs.size());
+    fmtPrintf("load off %lx size %lx secs %d\n", phX->p_offset, phX->p_filesz, file.secs.size());
   }
 
   Slice instBuf((uint8_t *)eh + phX->p_offset, phX->p_filesz);
@@ -134,7 +130,7 @@ void translate(const ElfFile &file, Result &res) {
     uint64_t start = addr;
     uint64_t end = addr + s.sh->sh_size;
     if (debug) {
-      outsfmt("section %s %lx %lx\n", s.name.c_str(), vaddr(start), vaddr(end));
+      fmtPrintf("section %s %lx %lx\n", s.name.c_str(), vaddr(start), vaddr(end));
     }
     allSecs.push_back({.start = addr, .end = end, .name = s.name});
   }
@@ -526,7 +522,7 @@ void translate(const ElfFile &file, Result &res) {
 
   auto logJmpFail = [&](uint64_t addr, const char *tag) {
     if (debug) {
-      outsfmt("jmpfailat addr %lx %s\n", vaddr(addr), tag);
+      fmtPrintf("jmpfailat addr %lx %s\n", vaddr(addr), tag);
     }
   };
 
@@ -552,10 +548,9 @@ void translate(const ElfFile &file, Result &res) {
     uint64_t size;
     for (int addr = 0; addr < buf.size(); ) {
       mcDecode(inst, size, buf.slice(addr));
-    print:
-      outs() << prefix << " " << fmtSprintf("%lx", addr+va) << 
-        " " << instAllStr(inst, buf.slice(addr, size)) << 
-        "\n";
+      auto s = fmtSprintf("%lx", addr+va);
+      auto s2 = instAllStr(inst, buf.slice(addr, size));
+      fmtPrintf("%s %s %s\n", prefix.c_str(), s.c_str(), s2.c_str());
       addr += size;
     }
   };
@@ -704,7 +699,7 @@ void translate(const ElfFile &file, Result &res) {
       auto p = instOccur[sortIdx[i]];
       auto r = mcDecode2(p.i);
       auto s = instAllStr(r.inst, r.buf);
-      outsfmt("instoccur %d %s %d\n", i, s.c_str(), p.n);
+      fmtPrintf("instoccur %d %s %d\n", i, s.c_str(), p.n);
     }
    }
 
@@ -725,7 +720,7 @@ void translate(const ElfFile &file, Result &res) {
     for (int i = 0; i < badRanges.size(); i += 2) {
       auto start = badRanges[i];
       auto end = badRanges[i+1];
-      outsfmt("bad range %d addr %lx %lx len %lu n %d\n", i/2, vaddr(start.addr), vaddr(end.addr),
+      fmtPrintf("bad range %d addr %lx %lx len %lu n %d\n", i/2, vaddr(start.addr), vaddr(end.addr),
         end.addr-start.addr, end.idx-start.idx);
     }
   }
@@ -744,12 +739,14 @@ void translate(const ElfFile &file, Result &res) {
       tag += ":jmpto";
     }
 
+    std::stringstream ss;
     std::string sep = " ";
-    outs() << fmtSprintf("%lx", vaddr(ai.addr)) <<
+    ss << fmtSprintf("%lx", vaddr(ai.addr)) <<
       sep << instAllStr(r.inst, r.buf) <<
       sep << kOpTypeStrs[r.op.type] <<
       sep << tag << 
       "\n";
+    fmtPrintf("%s", ss.str().c_str());
   };
 
   int totOpType[kOpTypeNr] = {};
@@ -1275,12 +1272,12 @@ void translate(const ElfFile &file, Result &res) {
     if (debug) {
       for (int i = patchIdx; i < E.patches.size(); i++) {
         auto p = E.patches[i];
-        outsfmt("add patch_%d addr %lx off %d size %d\n", i, vaddr(p.addr), p.off, p.size);
+        fmtPrintf("add patch_%d addr %lx off %d size %d\n", i, vaddr(p.addr), p.off, p.size);
       }
       for (int i = relocIdx; i < E.relocs.size(); i++) {
         auto r = E.relocs[i];
         auto s = fmtReloc(r, i, file);
-        outsfmt("add %s\n", s.c_str());
+        fmtPrintf("add %s\n", s.c_str());
       }
       auto D = [&](const std::string &s, Slice buf, uint64_t va) {
         dismInstBuf(fmtSprintf("%s_%s", stype, s.c_str()), buf, va);
@@ -1362,7 +1359,7 @@ void translate(const ElfFile &file, Result &res) {
       }
 
       if (debug) {
-        outsfmt("markjmp %d/%d\n", n, tos.size());
+        fmtPrintf("markjmp %d/%d\n", n, tos.size());
       }
     }
   };
@@ -1386,13 +1383,14 @@ void translate(const ElfFile &file, Result &res) {
   }
 
   if (summary) {
+    std::stringstream ss;
     for (int i = 0; i < kOpTypeNr; i++) {
-      outs() << kOpTypeStrs[i] << " " << totOpType[i] << " ";
+      ss << kOpTypeStrs[i] << " " << totOpType[i] << " ";
     }
     for (int i = 1; i < kJmpTypeNr; i++) {
-      outs() << kJmpTypeStrs[i] << " " << totJmpType[i] << " ";
+      ss << kJmpTypeStrs[i] << " " << totJmpType[i] << " ";
     }
-    outs() << "\n";
+    fmtPrintf("%s\n", ss.str().c_str());
   }
 
   res.relocs = std::move(E.relocs);
