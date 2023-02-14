@@ -67,10 +67,13 @@ public:
 };
 
 class error {
-  std::unique_ptr<IError> i;
+  IError *i;
 public:
   error(IError *i): i(i) {}
-  error(const std::nullptr_t &) { }
+  error(const std::nullptr_t &): i(nullptr) { }
+  error &operator=(error &&rhs) { i = rhs.i; rhs.i = nullptr; return *this; }
+  error(error &&rhs) { i = rhs.i; rhs.i = nullptr; }
+  ~error() { if (i) { delete i; i = nullptr; } }
   std::string msg() { return i ? i->msg() : ""; };
   operator bool() const { return i ? i->ok() : false; }
 };
