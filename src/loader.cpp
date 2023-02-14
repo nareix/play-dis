@@ -1,3 +1,4 @@
+#include "elf.h"
 #include "elf_file.h"
 #include "loader.h"
 #include "utils.h"
@@ -6,8 +7,12 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <string.h>
+#include <unistd.h>
 
 static bool debug = true;
+static bool doBigAlign = true;
+static auto pageSize = getpagesize();
 
 error loadBin(const ElfFile &file, uint8_t *&loadP) {
   auto eh = file.eh();
@@ -28,11 +33,13 @@ error loadBin(const ElfFile &file, uint8_t *&loadP) {
     return fmtErrorf("mmap failed #0");
   }
 
-  munmap(loadP, fileSize);
-  loadP = (uint8_t *)((uint64_t)loadP & ~(align-1));
-  loadP = (uint8_t *)mmap(loadP, fileSize, PROT_READ, MAP_PRIVATE|MAP_FIXED, file.f.fd, 0);
-  if (loadP == MAP_FAILED) {
-    return fmtErrorf("mmap failed #1");
+  if (doBigAlign) {
+    munmap(loadP, fileSize);
+    loadP = (uint8_t *)((uint64_t)loadP & ~(align-1));
+    loadP = (uint8_t *)mmap(loadP, fileSize, PROT_READ, MAP_PRIVATE|MAP_FIXED, file.f.fd, 0);
+    if (loadP == MAP_FAILED) {
+      return fmtErrorf("mmap failed #1");
+    }
   }
 
   if (debug) {
@@ -41,7 +48,7 @@ error loadBin(const ElfFile &file, uint8_t *&loadP) {
 
   for (int i = 0; i < loads.size(); i++) {
     auto ph = loads[i];
-    auto diff = ph->p_vaddr & (ph->p_align-1);
+    auto diff = ph->p_vaddr & (pageSize-1);
     auto vaddrStart = ph->p_vaddr - diff;
     auto fileOff = ph->p_offset - diff;
     auto vaddrEnd = ph->p_vaddr + ph->p_filesz;
@@ -54,7 +61,7 @@ error loadBin(const ElfFile &file, uint8_t *&loadP) {
     if (ph->p_flags & PF_R) {
       prot |= PROT_READ;
     }
-    if (ph->p_flags & (PF_W|PF_X)) {
+    if (ph->p_flags & PF_W) {
       prot |= PROT_WRITE;
     }
 
@@ -66,17 +73,21 @@ error loadBin(const ElfFile &file, uint8_t *&loadP) {
       return fmtErrorf("mmap failed #2.%d", i);
     }
 
-    auto vaddrEndAlign = (vaddrEnd + ph->p_align - 1) & ~(ph->p_align-1);
-    auto vaddrMemEnd = ph->p_vaddr + ph->p_memsz;
-    if (vaddrMemEnd > vaddrEndAlign) {
-      auto mapSize = vaddrMemEnd - vaddrEndAlign;
+    if (ph->p_memsz > ph->p_filesz && (ph->p_flags & PF_W)) {
+      memset(p + mapSize, 0, pageSize - (mapSize & (pageSize-1)));
 
-      void *p = mmap(loadP + vaddrEndAlign, mapSize, prot, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0);
-      if (debug) {
-        fmtPrintf("loadbin: ph[%d] zero %p size %lx\n", i, p, mapSize);
-      }
-      if (p == MAP_FAILED) {
-        return fmtErrorf("mmap failed #2.%d.1", i);
+      auto vaddrEndAlign = (vaddrEnd + pageSize-1) & ~(pageSize-1);
+      auto vaddrMemEnd = ph->p_vaddr + ph->p_memsz;
+      if (vaddrMemEnd > vaddrEndAlign) {
+        auto mapSize = vaddrMemEnd - vaddrEndAlign;
+
+        void *p = mmap(loadP + vaddrEndAlign, mapSize, prot, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0);
+        if (debug) {
+          fmtPrintf("loadbin: ph[%d] zero %p size %lx\n", i, p, mapSize);
+        }
+        if (p == MAP_FAILED) {
+          return fmtErrorf("mmap failed #2.%d.1", i);
+        }
       }
     }
   }

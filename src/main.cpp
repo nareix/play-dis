@@ -13,7 +13,7 @@ static error runMain(int argc, char **argv) {
   std::vector<std::string> args;
 
   for (int i = 1; i < argc; i++) {
-    args.push_back(std::string(argv[i]));
+    args.push_back(argv[i]);
   }
 
   if (args.size() == 0) {
@@ -23,7 +23,7 @@ static error runMain(int argc, char **argv) {
   auto action = args[0];
   args = {args.begin()+1, args.end()};
 
-  if (action == "trans" || action == "translate") {
+  if (action == "tr" || action == "trans" || action == "translate") {
     return translater::cmdMain(args);
   } else if (action == "rt" || action == "runtime") {
     return runtime::cmdMain(args);

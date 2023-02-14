@@ -69,6 +69,12 @@ static void printElfAddr(const std::string &filename, const ElfFile &file, uint6
 	fmtPrintf("\n");
 }
 
+static void enterBin(void *entry, void *stack) {
+	fmtPrintf("start\n");
+  asm("cmp $0, %0; cmovne %0, %%rsp" :: "r"(stack));
+  asm("jmpq *%0" :: "r"(entry));
+}
+
 static error runBin(const std::string &filename) {
 	ElfFile file;
 
@@ -151,11 +157,7 @@ static error runBin(const std::string &filename) {
 	stackStart -= vsize;
 	memcpy(stackStart, v.data(), vsize);
 
-	fmtPrintf("start\n");
-
-  asm("cmp $0, %0; cmovne %0, %%rsp" :: "r"(stackStart));
-  asm("jmpq *%0" :: "r"(entryP));
-
+	enterBin(entryP, stackStart);
 	__builtin_unreachable();
 }
 
