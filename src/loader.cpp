@@ -1,14 +1,15 @@
 #include "elf_file.h"
 #include "loader.h"
+#include "utils.h"
 
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 
-static const bool debug = true;
+static bool debug = true;
 
-bool loadBin(const ElfFile &file, int fd, uint8_t *&loadAddr, uint8_t *&loadAddrPhX) {
+error loadBin(const ElfFile &file, uint8_t *&loadP) {
   auto eh = file.eh();
   auto &loads = file.loads;
 
@@ -19,23 +20,23 @@ bool loadBin(const ElfFile &file, int fd, uint8_t *&loadAddr, uint8_t *&loadAddr
 
   auto align = 1UL << (64 - __builtin_clzll(fileSize) + 8);
   if (debug) {
-    fprintf(stderr, "loadbin: align %lx\n", loadSize);
+    fmtPrintf("loadbin: align %lx\n", loadSize);
   }
 
-  loadAddr = (uint8_t *)mmap(NULL, fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
-  if (loadAddr == MAP_FAILED) {
-    return false;
+  loadP = (uint8_t *)mmap(NULL, fileSize, PROT_READ, MAP_PRIVATE, file.f.fd, 0);
+  if (loadP == MAP_FAILED) {
+    return fmtErrorf("mmap failed #0");
   }
 
-  munmap(loadAddr, fileSize);
-  loadAddr = (uint8_t *)((uint64_t)loadAddr & ~(align-1));
-  loadAddr = (uint8_t *)mmap(loadAddr, fileSize, PROT_READ, MAP_PRIVATE|MAP_FIXED, fd, 0);
-  if (loadAddr == MAP_FAILED) {
-    return false;
+  munmap(loadP, fileSize);
+  loadP = (uint8_t *)((uint64_t)loadP & ~(align-1));
+  loadP = (uint8_t *)mmap(loadP, fileSize, PROT_READ, MAP_PRIVATE|MAP_FIXED, file.f.fd, 0);
+  if (loadP == MAP_FAILED) {
+    return fmtErrorf("mmap failed #1");
   }
 
   if (debug) {
-    fprintf(stderr, "loadbin: %p n %zu\n", loadAddr, loads.size());
+    fmtPrintf("loadbin: %p n %zu\n", loadP, loads.size());
   }
 
   for (int i = 0; i < loads.size(); i++) {
@@ -57,16 +58,12 @@ bool loadBin(const ElfFile &file, int fd, uint8_t *&loadAddr, uint8_t *&loadAddr
       prot |= PROT_WRITE;
     }
 
-    auto p = (uint8_t *)mmap(loadAddr + vaddrStart, mapSize, prot, MAP_PRIVATE|MAP_FIXED, fd, fileOff);
+    auto p = (uint8_t *)mmap(loadP + vaddrStart, mapSize, prot, MAP_PRIVATE|MAP_FIXED, file.f.fd, fileOff);
     if (debug) {
-      fprintf(stderr, "loadbin: ph[%d] %p size %lx off %lx\n", i, p, mapSize, fileOff);
+      fmtPrintf("loadbin: ph[%d] %p size %lx off %lx\n", i, p, mapSize, fileOff);
     }
     if (p == MAP_FAILED) {
-      return false;
-    }
-
-    if (ph == file.phX) {
-      loadAddrPhX = p + diff;
+      return fmtErrorf("mmap failed #2.%d", i);
     }
 
     auto vaddrEndAlign = (vaddrEnd + ph->p_align - 1) & ~(ph->p_align-1);
@@ -74,15 +71,15 @@ bool loadBin(const ElfFile &file, int fd, uint8_t *&loadAddr, uint8_t *&loadAddr
     if (vaddrMemEnd > vaddrEndAlign) {
       auto mapSize = vaddrMemEnd - vaddrEndAlign;
 
-      void *p = mmap(loadAddr + vaddrEndAlign, mapSize, prot, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0);
+      void *p = mmap(loadP + vaddrEndAlign, mapSize, prot, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0);
       if (debug) {
-        fprintf(stderr, "loadbin: ph[%d] zero %p size %lx\n", i, p, mapSize);
+        fmtPrintf("loadbin: ph[%d] zero %p size %lx\n", i, p, mapSize);
       }
       if (p == MAP_FAILED) {
-        return false;
+        return fmtErrorf("mmap failed #2.%d.1", i);
       }
     }
   }
 
-  return true;
+  return nullptr;
 }
