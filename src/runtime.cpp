@@ -56,37 +56,39 @@ static bool debug = true;
 
 struct SyscallHandler {
 public:
-	static thread_local std::vector<std::string> dps;
+	static thread_local std::vector<std::pair<std::string,std::string>> dps;
 	ThreadCB *t;
 	uint64_t *regs;
 	bool handled;
 
-	inline void arg(uint64_t x) {
-		if (debug) {
-			dps.push_back(fmtSprintf("0x%lx", x));
-		}
+	inline void arg(const char *k, uint64_t v) {
+		dps.push_back({k, fmtSprintf("0x%lx", v)});
 	}
 
-	inline void arg(const std::string &x) {
-		if (debug) {
-			dps.push_back(x);
-		}
+	inline void arg(const char *k, int v) {
+		dps.push_back({k, fmtSprintf("%d", v)});
 	}
 
+	inline void arg(const char *k, const std::string &v) {
+		dps.push_back({k, v});
+	}
 
-	inline void ret(uint64_t x) {
+	#define A(k) if (debug) { arg(#k, k); };
+	#define A0(k, v) if (debug) { arg(#k, v); };
+
+	inline void ret(uint64_t r) {
 		handled = true;
-		regs[0] = x;
-		arg(x);
+		regs[0] = r;
+		arg("", r);
 	}
 
 	void arch_prctl() {
 		auto code = regs[1];
 		auto addr = regs[2];
-		#define C(x) case x: arg(#x);
+		#define C(x) case x: A0(code, #x);
 		switch (code) {
 			C(ARCH_SET_FS) {
-				arg(addr);
+				A(addr);
 				t->fs = addr;
 				ret(0);
 				break;
@@ -96,7 +98,7 @@ public:
 				break;
 			}
 			C(ARCH_SET_GS) {
-				arg(addr);
+				A(addr);
 				t->gs = addr;
 				ret(0);
 				break;
@@ -106,21 +108,83 @@ public:
 				break;
 			}
 			default: {
-				arg(code);
+				A(code);
 				break;
 			}
 		}
 		#undef C
 	}
 
+	void brk() {
+		auto p = regs[1];
+		A(p);
+	}
+
+	void openat() {
+		auto fd = int(regs[1]);
+		auto filename = (const char *)regs[2];
+		auto flags = regs[3];
+		auto mode = regs[4];
+		A(fd);
+		A(filename);
+		A(flags);
+		A(mode);
+	}
+
+	void mmap() {
+		auto addr = regs[1];
+		auto len = int(regs[2]);
+		auto prot = regs[3];
+		auto flags = regs[4];
+		auto fd = int(regs[5]);
+		auto off = regs[6];
+		A(addr);
+		A(len);
+		A(prot);
+		A(flags);
+		A(fd);
+		A(off);
+	}
+
+	void close() {
+		auto fd = int(regs[1]);
+		A(fd);
+	}
+
+	void writev() {
+		auto fd = int(regs[1]);
+		auto vec = regs[2];
+		auto vlen = int(regs[3]);
+		A(fd);
+		A(vec);
+		A(vlen);
+	}
+
+	void newfstatat() {
+		auto fd = int(regs[1]);
+		auto filename = (const char *)regs[2];
+		auto sb = regs[3];
+		auto flag = regs[4];
+		A(fd);
+		A(filename);
+		A(sb);
+		A(flag);
+	}
+
 	bool handle() {
 		auto nr = regs[0];
 
-		#define C(x) case SYS_##x: arg(#x); x(); break;
+		#define C(x) case SYS_##x: arg("", #x); x(); break;
 		switch (nr) {
+			C(brk)
+			C(openat)
 			C(arch_prctl)
+			C(mmap)
+			C(close)
+			C(writev)
+			C(newfstatat)
 			default: {
-				arg(fmtSprintf("syscall_%d", nr));
+				arg("", fmtSprintf("syscall_%d", nr));
 				break;
 			}
 		}
@@ -132,19 +196,19 @@ public:
 
 		if (debug) {
 			if (!handled) {
-				arg(regs[0]);
+				arg("", regs[0]);
 			}
 			auto &fn = dps[0];
 			auto &ret = dps[dps.size()-1];
-			fmtPrintf("%s(", fn.c_str());
+			fmtPrintf("%s(", fn.second.c_str());
 			for (int i = 1; i < dps.size()-1; i++) {
 				auto &p = dps[i];
-				fmtPrintf("%s", p.c_str());
+				fmtPrintf("%s=%s", p.first.c_str(), p.second.c_str());
 				if (i < dps.size()-2) {
 					fmtPrintf(",");
 				}
 			}
-			fmtPrintf(") = %s", ret.c_str());
+			fmtPrintf(") = %s", ret.second.c_str());
 			if (!handled) {
 				fmtPrintf(" (bypass)");
 			}
