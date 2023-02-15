@@ -20,6 +20,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <unordered_set>
 #include <vector>
 #include <unordered_map>
 #include <fstream>
@@ -54,9 +55,18 @@ static __attribute__((naked)) void getfs() {
 
 static bool debug = true;
 
-struct SyscallHandler {
+struct FileAddr {
+	std::string trname;
+	uint64_t addr;
+};
+
+struct Syscall {
 public:
 	static thread_local std::vector<std::pair<std::string,std::string>> dps;
+	static thread_local std::unordered_map<int, int> hookedFdIdx;
+	static std::vector<FileAddr> fdHooks;
+	static std::unordered_map<std::string, int> fdHookIdx;
+
 	ThreadCB *t;
 	uint64_t *regs;
 	bool handled;
@@ -129,6 +139,8 @@ public:
 		A(filename);
 		A(flags);
 		A(mode);
+
+		hookOpen(filename, regs[2]);
 	}
 
 	void mprotect() {
@@ -141,7 +153,7 @@ public:
 	}
 
 	void mmap() {
-		auto addr = regs[1];
+		auto &addr = regs[1];
 		auto len = int(regs[2]);
 		auto prot = regs[3];
 		auto flags = regs[4];
@@ -153,11 +165,17 @@ public:
 		A(flags);
 		A(fd);
 		A(off);
+
+		if (fd != -1 && addr == 0 && off == 0) {
+			hookMmap(fd, addr);
+		}
 	}
 
 	void close() {
 		auto fd = int(regs[1]);
 		A(fd);
+
+		hookClose(fd);
 	}
 
 	void writev() {
@@ -224,6 +242,8 @@ public:
 		A(filename);
 		A(flags);
 		A(mode);
+
+		hookOpen(filename, regs[1]);
 	}
 
 	void pread64() {
@@ -289,6 +309,59 @@ public:
 		A(len);
 		A(flags);
 		A(sig);
+	}
+
+	static int checkHook(const std::string &filename) {
+		auto basename = std::filesystem::path(filename).filename();
+		auto i = fdHookIdx.find(basename);
+		if (i == fdHookIdx.end()) {
+			return -1;
+		}
+		return i->second;
+	}
+
+	void hookClose(int fd) {
+		auto i = hookedFdIdx.find(fd);
+		if (i == hookedFdIdx.end()) {
+			return;
+		}
+		hookedFdIdx.erase(i);
+
+		if (debug) {
+			fmtPrintf("fd %d hook closed\n", fd);
+		}
+	}
+
+	void hookOpen(const std::string &filename, uint64_t &newname) {
+		auto i = checkHook(filename);
+		if (i == -1) {
+			return;
+		}
+		auto &h = fdHooks[i];
+
+		newname = (uint64_t)h.trname.c_str();
+		syscall();
+		handled = true;
+
+		auto fd = int(regs[0]);
+		if (debug) {
+			fmtPrintf("fd %d hooked newname %s\n", fd, h.trname.c_str());
+		}
+		hookedFdIdx[fd] = i;
+	}
+
+	void hookMmap(int fd, uint64_t &addr) {
+		auto i = hookedFdIdx.find(fd);
+		if (i == hookedFdIdx.end()) {
+			return;
+		}
+
+		auto &h = fdHooks[i->second];
+		addr = h.addr;
+
+		if (debug) {
+			fmtPrintf("mmap fd %d hooked new addr %lx\n", fd, addr);
+		}
 	}
 
 	bool handle() {
@@ -358,7 +431,7 @@ public:
 	#undef A0
 
 	static bool handle0() {
-		SyscallHandler h;
+		Syscall h;
 		h.t = tcb();
 		h.regs = h.t->regs;
 		h.handled = false;
@@ -425,7 +498,10 @@ public:
 	}
 };
 
-thread_local decltype(SyscallHandler::dps) SyscallHandler::dps;
+thread_local decltype(Syscall::dps) Syscall::dps;
+thread_local decltype(Syscall::hookedFdIdx) Syscall::hookedFdIdx;
+decltype(Syscall::fdHookIdx) Syscall::fdHookIdx;
+decltype(Syscall::fdHooks) Syscall::fdHooks;
 
 static error initTcb() {
 	auto size = 1024*128;
@@ -436,7 +512,7 @@ static error initTcb() {
 
 	static thread_local ThreadCB t0;
 	auto t = &t0;
-	t->fn[0] = (void *)SyscallHandler::entry;
+	t->fn[0] = (void *)Syscall::entry;
 	t->fn[1] = (void *)getfs;
 	t->stack = stack + size;
 	settcb(t);
@@ -444,27 +520,25 @@ static error initTcb() {
 	return nullptr;
 }
 
-static std::unordered_map<std::string, uint64_t> fileAddrMap;
-
 static void enterBin(void *entry, void *stack) {
   asm("mov %0, %%rsp; mov $0, %%rbp; jmpq *%1" :: "r"(stack), "r"(entry));
 }
 
 static error runBin(const std::vector<std::string> &args) {
-	auto &filename = args[0];
+	auto filename = args[0];
+
+	uint64_t loadAt = 0;
+	auto i = Syscall::checkHook(filename);
+	if (i != -1) {
+		auto &h = Syscall::fdHooks[i];
+		loadAt = h.addr;
+		filename = h.trname;
+	}
 
 	ElfFile file;
-
 	auto err = file.open(filename);
 	if (err) {
 		return err;
-	}
-
-	uint64_t loadAt = 0;
-	auto basename = std::filesystem::path(filename).filename();
-	auto addri = fileAddrMap.find(basename);
-	if (addri != fileAddrMap.end()) {
-		loadAt = addri->second;
 	}
 
 	uint8_t *loadP;
@@ -553,86 +627,28 @@ static error runBin(const std::vector<std::string> &args) {
 	__builtin_unreachable();
 }
 
-error cmdMain(std::vector<std::string> &args0) {
-	std::vector<std::string> args;
-	std::string addrFile;
-
-  for (int i = 0; i < args0.size(); i++) {
-    auto &o = args0[i];
-		if (o == "-a") {
-      if (i+1 >= args0.size()) {
-        return fmtErrorf("missing param");
-      }
-			addrFile = args0[i+1];
-			i++;
-			continue;
-		}
-    args.push_back(o);
+error cmdMain(std::vector<std::string> &args) {
+	if (args.size() == 0) {
+		return fmtErrorf("missing filename");
 	}
 
-	if (args.size() < 1) {
-		return fmtErrorf("missing action");
-	}
-	auto action = args[0];
-	args.erase(args.begin());
-
-	auto forElfFiles = [&](
-		std::function<void(const std::string&, const ElfFile &, uint64_t)> fn
-	) -> error {
-		if (args.size() == 0) {
-			return fmtErrorf("missing filename");
+	auto addrFile = "addrs";
+	if (std::filesystem::exists(addrFile)) {
+		std::ifstream file(addrFile);
+		std::string line;
+		while (std::getline(file, line)) {
+			std::stringstream sline(line);
+			std::string basename;
+			std::string trname;
+			uint64_t addr;
+			sline >> basename >> trname >> std::hex >> addr;
+			auto i = Syscall::fdHooks.size();
+			Syscall::fdHooks.push_back({trname, addr});
+			Syscall::fdHookIdx.emplace(basename, i);
 		}
-		auto addrStart = 0x00007ff000000000UL;
-		auto addrInc   = 0x0000000100000000UL;
-		auto addr = addrStart;
-		for (auto filename: args) {
-			ElfFile file;
-			auto err = file.open(filename);
-			if (err) {
-				return err;
-			}
-			fn(filename, file, addr);
-			addr += addrInc;
-		}
-		return nullptr;
-	};
-
-	if (action == "gdbcmd") {
-		return forElfFiles([&](const std::string &filename, const ElfFile &file, uint64_t addr) {
-			fmtPrintf("add-symbol-file %s ", filename.c_str());
-			for (auto i: file.secs) {
-				if (i.sh->sh_addr) {
-					fmtPrintf("-s %s 0x%lx ", i.name.c_str(), i.sh->sh_addr + addr);
-				}
-			}
-			fmtPrintf("\n");
-		});
-
-	} else if (action == "addrs") {
-		return forElfFiles([&](const std::string &filename, const ElfFile &file, uint64_t addr) {
-			auto basename = std::filesystem::path(filename).filename();
-			fmtPrintf("%s 0x%lx\n", basename.c_str(), addr);
-		});
-
-	} else if (action == "run") {
-		if (addrFile != "") {
-			std::ifstream file(addrFile);
-			std::string line;
-			while (std::getline(file, line)) {
-				std::stringstream sline(line);
-				std::string basename;
-				uint64_t addr;
-				sline >> basename >> std::hex >> addr;
-				fileAddrMap.emplace(basename, addr);
-			}
-		}
-		if (args.size() == 0) {
-			return fmtErrorf("missing filename");
-		}
-		return runBin(args);
 	}
 
-	return fmtErrorf("invalid action");
+	return runBin(args);
 }
 
 void soInit() {
