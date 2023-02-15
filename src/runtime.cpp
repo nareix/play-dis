@@ -74,7 +74,7 @@ public:
 	}
 
 	#define A(k) if (debug) { arg(#k, k); }
-	#define A0(k, v) if (debug) arg(#k, v);
+	#define A0(k, v) if (debug) { arg(#k, v); }
 
 	inline void ret(uint64_t r) {
 		handled = true;
@@ -251,6 +251,44 @@ public:
 	void set_tid_address() {
 		auto tidptr = regs[1];
 		A(tidptr);
+		ret(getpid());
+	}
+
+	void uname() {
+		auto name = regs[1];
+		A(name);
+	}
+
+	void access() {
+		auto filename = (const char *)(regs[1]);
+		auto mode = regs[2];
+		A(filename);
+		A(mode);
+	}
+
+	void getcwd() {
+		auto buf = regs[1];
+		auto size = int(regs[2]);
+		A(buf);
+		A(size);
+	}
+
+	void set_robust_list() {
+		auto head = regs[1];
+		auto len = int(regs[2]);
+		A(head);
+		A(len);
+	}
+
+	void rseq() {
+		auto rseq = regs[1];
+		auto len = int(regs[2]);
+		auto flags = regs[3];
+		auto sig = regs[4];
+		A(rseq);
+		A(len);
+		A(flags);
+		A(sig);
 	}
 
 	bool handle() {
@@ -275,6 +313,11 @@ public:
 			C(dup2)
 			C(getuid)
 			C(set_tid_address)
+			C(uname)
+			C(access)
+			C(getcwd)
+			C(set_robust_list)
+			C(rseq)
 			default: {
 				arg("", fmtSprintf("syscall_%d", nr));
 				break;
@@ -459,21 +502,32 @@ static error runBin(const std::vector<std::string> &args) {
 	auto eh = file.eh();
 	uint8_t *phStart = loadP + eh->e_phoff;
 
+	static thread_local uint64_t random[2];
+	random[0] = std::rand();
+	random[1] = std::rand();
+
 	// aux
 	auto aux = [&](size_t k, size_t val) {
 		v.push_back(k);
 		v.push_back(val);
 	};
 	aux(AT_HWCAP, 0x178bfbff);
+	aux(AT_HWCAP2, 0x2);
 	aux(AT_PAGESZ, getpagesize());
 	aux(AT_CLKTCK, 100);
 	aux(AT_PHDR, (size_t)phStart);
 	aux(AT_BASE, (size_t)loadP);
+	aux(AT_UID, 0);
+	aux(AT_EUID, 0);
+	aux(AT_GID, 0);
+	aux(AT_EGID, 0);
+	aux(AT_SECURE, 0);
 	aux(AT_PHENT, (size_t)eh->e_phentsize);
 	aux(AT_PHNUM, (size_t)eh->e_phnum);
 	aux(AT_ENTRY, (size_t)entryP);
 	aux(AT_EXECFN, (size_t)filename.c_str());
 	aux(AT_PLATFORM, (size_t)"x86_64");
+	aux(AT_RANDOM, (size_t)random);
 	aux(0, 0);
 
 	auto stackSize = 1024*128;

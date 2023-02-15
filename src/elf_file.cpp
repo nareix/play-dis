@@ -138,4 +138,3 @@ error ElfFile::open(const std::string &filename) {
 
   return nullptr;
 }
-
