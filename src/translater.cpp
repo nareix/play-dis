@@ -754,8 +754,8 @@ void translate(const ElfFile &file, Result &res) {
 
   class StubCE {
   public:
-    const std::unique_ptr<MCCodeEmitter> &CE2;
-    const std::unique_ptr<MCSubtargetInfo> &STI;
+    const decltype(CE2) &CE2;
+    const decltype(STI) &STI;
     std::vector<uint8_t> code;
     raw_u8_ostream vcode;
     SmallVector<MCFixup, 4> fixups;
@@ -763,7 +763,7 @@ void translate(const ElfFile &file, Result &res) {
     std::vector<uint8_t> patchCode;
     std::vector<Patch> patches;
 
-    StubCE(const std::unique_ptr<MCCodeEmitter> &CE2, const std::unique_ptr<MCSubtargetInfo> & STI): 
+    StubCE(decltype(CE2) CE2, decltype(STI) STI): 
       CE2(CE2), STI(STI), vcode(code) {
     }
 
@@ -1171,8 +1171,6 @@ void translate(const ElfFile &file, Result &res) {
     return res;
   };
 
-  int syscallIdx = 0;
-
   auto doReplace = [&](AddrAndIdx i) -> JmpRes {
     auto op = allOpcode[i.idx];
 
@@ -1399,7 +1397,7 @@ void translate(const ElfFile &file, Result &res) {
   res.patchCode = std::move(E.patchCode);
 }
 
-error writeElfFile(const Result &res, const ElfFile &input, const std::string &setInterp, const std::string &output) {
+error writeElfFile(const Result &res, const ElfFile &input, const std::string &output) {
   unsigned align = 0x1000;
 
   auto totSize = (input.buf.size() + align-1) & ~(align-1);
@@ -1485,25 +1483,6 @@ error writeElfFile(const Result &res, const ElfFile &input, const std::string &s
     }
   }
 
-  // if (setInterp != "") {
-  //   auto p = std::find_if(phs.begin(), phs.end(), [](Elf64_Phdr &i) {
-  //     return i.p_type == PT_INTERP;
-  //   });
-  //   if (p == phs.end()) {
-  //     return fmtErrorf("interp not found");
-  //   }
-  //   auto off = newPhsOff + newPhsSize;
-  //   if (setInterp.size() > align-newPhsSize) {
-  //     return fmtErrorf("interp too big");
-  //   }
-  //   memcpy(filem + off, setInterp.data(), setInterp.size());
-  //   p->p_offset = off;
-  //   p->p_vaddr = off;
-  //   p->p_paddr = off;
-  //   p->p_filesz = setInterp.size();
-  //   p->p_memsz = setInterp.size();
-  // }
-
   phs.insert(phs.begin()+loadEnd+1, {{
     .p_type = PT_LOAD, .p_flags = PF_R,
     .p_offset = newPhsOff, .p_vaddr = newPhsVaddr, .p_paddr = newPhsVaddr,
@@ -1530,7 +1509,6 @@ error writeElfFile(const Result &res, const ElfFile &input, const std::string &s
 
 error cmdMain(const std::vector<std::string> &args0) {
   std::vector<std::string> args;
-  std::string setInterp;
 
   for (int i = 0; i < args0.size(); i++) {
     auto &o = args0[i];
@@ -1573,14 +1551,6 @@ error cmdMain(const std::vector<std::string> &args0) {
       summary = true;
       continue;
     }
-    if (o == "-si") {
-      if (i+1 >= args0.size()) {
-        return fmtErrorf("missing param");
-      }
-      setInterp = args0[i+1];
-      i++;
-      continue;
-    }
     args.push_back(o);
   }
 
@@ -1604,7 +1574,7 @@ error cmdMain(const std::vector<std::string> &args0) {
   Result res;
   translate(input, res);
 
-  err = writeElfFile(res, input, setInterp, output0);
+  err = writeElfFile(res, input, output0);
   if (err) {
     return err;
   }

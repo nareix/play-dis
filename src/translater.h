@@ -38,6 +38,6 @@ namespace translater {
   };
 
   void translate(const ElfFile &file, Result &res);
-  error writeElfFile(const Result &res, const ElfFile &input, const std::string &setInterp, const std::string &output);
+  error writeElfFile(const Result &res, const ElfFile &input, const std::string &output);
   error cmdMain(const std::vector<std::string> &args);
 }

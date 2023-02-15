@@ -28,7 +28,7 @@ namespace runtime {
 
 struct ThreadCB {
 	void *fn[2];
-	uint64_t regs[10];
+	uint64_t regs[11];
 	void *stack;
 	uint64_t fs;
 	uint64_t gs;
@@ -37,14 +37,14 @@ struct ThreadCB {
 static constexpr int TCBRegs(int i) {
 	return offsetof(ThreadCB, regs) + i*8;
 }
-static constexpr int TCBStack = offsetof(ThreadCB, stack);
-static constexpr int TCBFs = offsetof(ThreadCB, fs);
+static const int TCBStack = offsetof(ThreadCB, stack);
+static const int TCBFs = offsetof(ThreadCB, fs);
 
-static ThreadCB __attribute__((naked)) *tcb() {
+static __attribute__((naked)) ThreadCB *tcb() {
   asm("endbr64; rdgsbase %rax; ret");
 }
 
-static void __attribute__((naked)) settcb(ThreadCB *t) {
+static __attribute__((naked))  void settcb(ThreadCB *t) {
   asm("endbr64; wrgsbase %rdi; ret");
 }
 
@@ -59,7 +59,7 @@ public:
 	static thread_local std::vector<std::string> dps;
 	ThreadCB *t;
 	uint64_t *regs;
-	bool setRet;
+	bool handled;
 
 	inline void arg(uint64_t x) {
 		if (debug) {
@@ -67,39 +67,47 @@ public:
 		}
 	}
 
+	inline void arg(const std::string &x) {
+		if (debug) {
+			dps.push_back(x);
+		}
+	}
+
+
 	inline void ret(uint64_t x) {
-		setRet = true;
+		handled = true;
 		regs[0] = x;
 		arg(x);
 	}
 
-	bool arch_prctl() {
+	void arch_prctl() {
 		auto code = regs[1];
 		auto addr = regs[2];
-		#define C(x) case x: if (debug) { dps.push_back(#x); }
+		#define C(x) case x: arg(#x);
 		switch (code) {
 			C(ARCH_SET_FS) {
 				arg(addr);
 				t->fs = addr;
 				ret(0);
-				return true;
+				break;
 			}
 			C(ARCH_GET_FS) {
 				ret(t->fs);
-				return true;
+				break;
 			}
 			C(ARCH_SET_GS) {
 				arg(addr);
 				t->gs = addr;
 				ret(0);
-				return true;
+				break;
 			}
 			C(ARCH_GET_GS) {
 				ret(t->gs);
-				return true;
+				break;
 			}
 			default: {
-				return false;
+				arg(code);
+				break;
 			}
 		}
 		#undef C
@@ -107,28 +115,24 @@ public:
 
 	bool handle() {
 		auto nr = regs[0];
-		bool r;
 
-		#define C(x) case SYS_##x: if (debug) { dps.push_back(#x); } r = x(); break;
+		#define C(x) case SYS_##x: arg(#x); x(); break;
 		switch (nr) {
 			C(arch_prctl)
 			default: {
-				if (debug) {
-					dps.push_back(fmtSprintf("syscall_%d", nr));
-				}
-				r = false;
+				arg(fmtSprintf("syscall_%d", nr));
 				break;
 			}
 		}
 		#undef C
 
-		if (r) {
-			assert(setRet);
-		} 
+		if (!handled) {
+			syscall();
+		}
 
 		if (debug) {
-			if (!r && !setRet) {
-				dps.push_back("bypass");
+			if (!handled) {
+				arg(regs[0]);
 			}
 			auto &fn = dps[0];
 			auto &ret = dps[dps.size()-1];
@@ -140,58 +144,86 @@ public:
 					fmtPrintf(",");
 				}
 			}
-			fmtPrintf(") = %s\n", ret.c_str());
+			fmtPrintf(") = %s", ret.c_str());
+			if (!handled) {
+				fmtPrintf(" (bypass)");
+			}
+			fmtPrintf("\n");
 			dps.clear();
 		}
 
-		return r;
+		return handled;
 	}
-};
 
-thread_local std::vector<std::string> SyscallHandler::dps;
-
-static bool handleSyscall() {
-	SyscallHandler h;
-	h.t = tcb();
-	h.regs = h.t->regs;
-	h.setRet = false;
-	return h.handle();
-}
-
-static __attribute__((naked)) void syscall() {
-	asm("endbr64");
+	static bool handle0() {
+		SyscallHandler h;
+		h.t = tcb();
+		h.regs = h.t->regs;
+		h.handled = false;
+		return h.handle();
+	}
 
 	// syscall: rax(nr) rdi(1) rsi(2) rdx(3) r10(4) r8(5) r9(6) rax(ret) 
 	// caller:  rdi(1) rsi(2) rdx(3) rcx(4) r8(5) r9(6) rax(ret) r10 r11
-	asm("mov %%rax, %%gs:%c0" :: "i"(TCBRegs(0)));
-	asm("mov %%rdi, %%gs:%c0" :: "i"(TCBRegs(1)));
-	asm("mov %%rsi, %%gs:%c0" :: "i"(TCBRegs(2)));
-	asm("mov %%rdx, %%gs:%c0" :: "i"(TCBRegs(3)));
-	asm("mov %%r10, %%gs:%c0" :: "i"(TCBRegs(4)));
-	asm("mov %%r8, %%gs:%c0" :: "i"(TCBRegs(5)));
-	asm("mov %%r9, %%gs:%c0" :: "i"(TCBRegs(6)));
-	asm("mov %%r11, %%gs:%c0" :: "i"(TCBRegs(7)));
-	asm("pop %%r11; mov %%r11, %%gs:%c0" :: "i"(TCBRegs(9)));
-	asm("mov %%rsp, %%gs:%c0" :: "i"(TCBRegs(8)));
-	asm("mov %%gs:%c0, %%rsp" :: "i"(TCBStack));
 
-	asm("call %P0" :: "i"(handleSyscall));
+	static __attribute__((naked)) void entry() {
+		asm("endbr64");
+		// save caller regs
+		asm("mov %%rax, %%gs:%c0" :: "i"(TCBRegs(0)));
+		asm("mov %%rdi, %%gs:%c0" :: "i"(TCBRegs(1)));
+		asm("mov %%rsi, %%gs:%c0" :: "i"(TCBRegs(2)));
+		asm("mov %%rdx, %%gs:%c0" :: "i"(TCBRegs(3)));
+		asm("mov %%r10, %%gs:%c0" :: "i"(TCBRegs(4)));
+		asm("mov %%r8, %%gs:%c0" :: "i"(TCBRegs(5)));
+		asm("mov %%r9, %%gs:%c0" :: "i"(TCBRegs(6)));
+		asm("mov %%r11, %%gs:%c0" :: "i"(TCBRegs(7)));
+		// pop and save ret addr
+		asm("pop %%r11; mov %%r11, %%gs:%c0" :: "i"(TCBRegs(9)));
+		// swap to host stack
+		asm("mov %%rsp, %%gs:%c0" :: "i"(TCBRegs(8)));
+		asm("mov %%gs:%c0, %%rsp" :: "i"(TCBStack));
+		// call handler
+		asm("call %P0" :: "i"(handle0));
+		// restore call regs
+		asm("mov %%gs:%c0, %%rax" :: "i"(TCBRegs(0)));
+		asm("mov %%gs:%c0, %%rdi" :: "i"(TCBRegs(1)));
+		asm("mov %%gs:%c0, %%rsi" :: "i"(TCBRegs(2)));
+		asm("mov %%gs:%c0, %%rdx" :: "i"(TCBRegs(3)));
+		asm("mov %%gs:%c0, %%r10" :: "i"(TCBRegs(4)));
+		asm("mov %%gs:%c0, %%r8" :: "i"(TCBRegs(5)));
+		asm("mov %%gs:%c0, %%r9" :: "i"(TCBRegs(6)));
+		asm("mov %%gs:%c0, %%r11" :: "i"(TCBRegs(7)));
+		// switch to guest stack
+		asm("mov %%gs:%c0, %%rsp" :: "i"(TCBRegs(8)));
+		// jmp to ret addr
+		asm("jmp *%%gs:%c0" :: "i"(TCBRegs(9)));
+	}
 
-	asm("mov %%gs:%c0, %%rdi" :: "i"(TCBRegs(1)));
-	asm("mov %%gs:%c0, %%rsi" :: "i"(TCBRegs(2)));
-	asm("mov %%gs:%c0, %%rdx" :: "i"(TCBRegs(3)));
-	asm("mov %%gs:%c0, %%r10" :: "i"(TCBRegs(4)));
-	asm("mov %%gs:%c0, %%r8" :: "i"(TCBRegs(5)));
-	asm("mov %%gs:%c0, %%r9" :: "i"(TCBRegs(6)));
-	asm("mov %%gs:%c0, %%r11" :: "i"(TCBRegs(7)));
-	asm("mov %%gs:%c0, %%rsp" :: "i"(TCBRegs(8)));
+	static __attribute__((naked)) void syscall() {
+		// restore call regs
+		asm("mov %%gs:%c0, %%rax" :: "i"(TCBRegs(0)));
+		asm("mov %%gs:%c0, %%rdi" :: "i"(TCBRegs(1)));
+		asm("mov %%gs:%c0, %%rsi" :: "i"(TCBRegs(2)));
+		asm("mov %%gs:%c0, %%rdx" :: "i"(TCBRegs(3)));
+		asm("mov %%gs:%c0, %%r10" :: "i"(TCBRegs(4)));
+		asm("mov %%gs:%c0, %%r8" :: "i"(TCBRegs(5)));
+		asm("mov %%gs:%c0, %%r9" :: "i"(TCBRegs(6)));
+		asm("mov %%gs:%c0, %%r11" :: "i"(TCBRegs(7)));
+		// swap to guest stack
+		asm("mov %%rsp, %%gs:%c0" :: "i"(TCBRegs(10)));
+		asm("mov %%gs:%c0, %%rsp" :: "i"(TCBRegs(8)));
+		// syscall
+		asm("syscall");
+		// save results
+		asm("mov %%rax, %%gs:%c0" :: "i"(TCBRegs(0)));
+		asm("mov %%rsp, %%gs:%c0" :: "i"(TCBRegs(8)));
+		// swap to host stack
+		asm("mov %%gs:%c0, %%rsp" :: "i"(TCBRegs(10)));
+		asm("ret");
+	}
+};
 
-	asm("cmp $0, %rax; jne 1f");
-	asm("mov %%gs:%c0, %%rax" :: "i"(TCBRegs(0)));
-	asm("syscall; jmp 2f; 1:");
-	asm("mov %%gs:%c0, %%rax" :: "i"(TCBRegs(0)));
-	asm("2: jmp *%%gs:%c0" :: "i"(TCBRegs(9)));
-}
+thread_local decltype(SyscallHandler::dps) SyscallHandler::dps;
 
 static error initTcb() {
 	auto size = 1024*128;
@@ -202,7 +234,7 @@ static error initTcb() {
 
 	static thread_local ThreadCB t0;
 	auto t = &t0;
-	t->fn[0] = (void *)syscall;
+	t->fn[0] = (void *)SyscallHandler::entry;
 	t->fn[1] = (void *)getfs;
 	t->stack = stack + size;
 	settcb(t);
@@ -213,8 +245,7 @@ static error initTcb() {
 static std::unordered_map<std::string, uint64_t> fileAddrMap;
 
 static void enterBin(void *entry, void *stack) {
-  asm("mov %0, %%rsp" :: "r"(stack));
-  asm("jmpq *%0" :: "r"(entry));
+  asm("mov %0, %%rsp; mov $0, %%rbp; jmpq *%1" :: "r"(stack), "r"(entry));
 }
 
 static error runBin(const std::vector<std::string> &args) {
@@ -294,11 +325,10 @@ static error runBin(const std::vector<std::string> &args) {
 	auto stackEnd = stackTop + stackSize;
 
 	auto vsize = v.size()*sizeof(v[0]);
-	if (vsize > stackSize) {
+	auto stackStart = (void *)(uint64_t(stackEnd - vsize) & ~15);
+	if (stackStart < stackTop) {
 		return fmtErrorf("auxv too large");
 	}
-
-	auto stackStart = stackEnd - vsize;
 	memcpy(stackStart, v.data(), vsize);
 
 	err = initTcb();

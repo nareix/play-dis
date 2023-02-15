@@ -58,14 +58,6 @@ public:
   virtual ~IError() = default;
 };
 
-class StrError: public IError {
-  std::string s;
-public:
-  StrError(const std::string &s): s(s) {}
-  virtual std::string msg() override { return s; }
-  virtual bool ok() const override { return true; };
-};
-
 class error {
   IError *i;
 public:
@@ -78,6 +70,14 @@ public:
   operator bool() const { return i ? i->ok() : false; }
 };
 
+class StrError: public IError {
+  std::string s;
+public:
+  StrError(const std::string &s): s(s) {}
+  virtual std::string msg() override { return s; }
+  virtual bool ok() const override { return true; };
+};
+
 template <typename... Types>
 static inline error fmtErrorf(Types... args) {
   return new StrError(fmtSprintf(args...));
@@ -88,7 +88,7 @@ public:
   int fd = -1;
   void *mmapP = nullptr;
   ~File();
-  File & operator=(File &&rhs);
+  File &operator=(File &&rhs);
   File() {}
   error open(const std::string &file);
   size_t size();
