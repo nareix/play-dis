@@ -73,8 +73,8 @@ public:
 		dps.push_back({k, v});
 	}
 
-	#define A(k) if (debug) { arg(#k, k); };
-	#define A0(k, v) if (debug) { arg(#k, v); };
+	#define A(k) if (debug) { arg(#k, k); }
+	#define A0(k, v) if (debug) arg(#k, v);
 
 	inline void ret(uint64_t r) {
 		handled = true;
@@ -131,6 +131,15 @@ public:
 		A(mode);
 	}
 
+	void mprotect() {
+		auto start = regs[1];
+		auto len = int(regs[2]);
+		auto prot = regs[3];
+		A(start);
+		A(len);
+		A(prot);
+	}
+
 	void mmap() {
 		auto addr = regs[1];
 		auto len = int(regs[2]);
@@ -160,6 +169,24 @@ public:
 		A(vlen);
 	}
 
+	void write() {
+		auto fd = int(regs[1]);
+		auto buf = regs[2];
+		auto n = int(regs[3]);
+		A(fd);
+		A(buf);
+		A(n);
+	}
+
+	void read() {
+		auto fd = int(regs[1]);
+		auto buf = regs[2];
+		auto n = int(regs[3]);
+		A(fd);
+		A(buf);
+		A(n);
+	}
+
 	void newfstatat() {
 		auto fd = int(regs[1]);
 		auto filename = (const char *)regs[2];
@@ -171,6 +198,61 @@ public:
 		A(flag);
 	}
 
+	void getuid() {
+	}
+
+	void dup2() {
+		auto oldfd = int(regs[1]);
+		auto newfd = int(regs[2]);
+		A(oldfd);
+		A(newfd);
+	}
+
+	void ioctl() {
+		auto fd = int(regs[1]);
+		auto cmd = int(regs[2]);
+		auto args = regs[3];
+		A(fd);
+		A(cmd);
+		A(args);
+	}
+
+	void open() {
+		auto filename = (const char *)(regs[1]);
+		auto flags = regs[2];
+		auto mode = regs[3];
+		A(filename);
+		A(flags);
+		A(mode);
+	}
+
+	void pread64() {
+		auto fd = int(regs[1]);
+		auto buf = regs[2];
+		auto count = int(regs[3]);
+		auto off = regs[4];
+		A(fd);
+		A(buf);
+		A(count);
+		A(off);
+	}
+
+	void pwrite64() {
+		auto fd = int(regs[1]);
+		auto buf = regs[2];
+		auto count = int(regs[3]);
+		auto off = regs[4];
+		A(fd);
+		A(buf);
+		A(count);
+		A(off);
+	}
+
+	void set_tid_address() {
+		auto tidptr = regs[1];
+		A(tidptr);
+	}
+
 	bool handle() {
 		auto nr = regs[0];
 
@@ -178,11 +260,21 @@ public:
 		switch (nr) {
 			C(brk)
 			C(openat)
+			C(open)
 			C(arch_prctl)
 			C(mmap)
+			C(mprotect)
 			C(close)
+			C(write)
+			C(read)
+			C(pread64)
+			C(pwrite64)
 			C(writev)
 			C(newfstatat)
+			C(ioctl)
+			C(dup2)
+			C(getuid)
+			C(set_tid_address)
 			default: {
 				arg("", fmtSprintf("syscall_%d", nr));
 				break;
@@ -218,6 +310,9 @@ public:
 
 		return handled;
 	}
+
+	#undef A
+	#undef A0
 
 	static bool handle0() {
 		SyscallHandler h;
