@@ -71,7 +71,7 @@ public:
 	uint64_t *regs;
 	bool handled;
 
-	enum { D, X, } retfmt;
+	enum { D, X } retfmt;
 
 	void arg(const char *k, uint64_t v) {
 		dps.push_back({k, fmtSprintf("0x%lx", v)});
@@ -361,6 +361,7 @@ public:
 		if (i == hookedFdIdx.end()) {
 			return;
 		}
+
 		hookedFdIdx.erase(i);
 
 		if (debug) {
@@ -373,17 +374,17 @@ public:
 		if (i == -1) {
 			return;
 		}
-		auto &h = fdHooks[i];
 
+		auto &h = fdHooks[i];
 		newname = (uint64_t)h.trname.c_str();
 		syscall();
 		handled = true;
-
 		auto fd = int(regs[0]);
+		hookedFdIdx[fd] = i;
+
 		if (debug) {
 			fmtPrintf("fd %d hooked newname %s\n", fd, h.trname.c_str());
 		}
-		hookedFdIdx[fd] = i;
 	}
 
 	void hookMmap(int fd, uint64_t &addr) {
