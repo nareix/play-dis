@@ -71,16 +71,26 @@ public:
 	uint64_t *regs;
 	bool handled;
 
-	inline void arg(const char *k, uint64_t v) {
+	enum { D, X, } retfmt;
+
+	void arg(const char *k, uint64_t v) {
 		dps.push_back({k, fmtSprintf("0x%lx", v)});
 	}
 
-	inline void arg(const char *k, int v) {
+	void arg(const char *k, int v) {
 		dps.push_back({k, fmtSprintf("%d", v)});
 	}
 
-	inline void arg(const char *k, const std::string &v) {
+	void arg(const char *k, const std::string &v) {
 		dps.push_back({k, v});
+	}
+
+	void argret() {
+		if (retfmt == X) {
+			arg("", regs[0]);
+		} else {
+			arg("", int(regs[0]));
+		}
 	}
 
 	#define A(k) if (debug) { arg(#k, k); }
@@ -89,7 +99,9 @@ public:
 	inline void ret(uint64_t r) {
 		handled = true;
 		regs[0] = r;
-		arg("", r);
+		if (debug) {
+			argret();
+		}
 	}
 
 	void arch_prctl() {
@@ -128,6 +140,7 @@ public:
 	void brk() {
 		auto p = regs[1];
 		A(p);
+		retfmt = X;
 	}
 
 	void openat() {
@@ -165,10 +178,27 @@ public:
 		A(flags);
 		A(fd);
 		A(off);
+		retfmt = X;
 
 		if (fd != -1 && addr == 0 && off == 0) {
 			hookMmap(fd, addr);
 		}
+	}
+
+	void munmap() {
+		auto addr = regs[1];
+		auto len = int(regs[2]);
+		A(addr);
+		A(len);
+	}
+
+	void madvise() {
+		auto start = regs[1];
+		auto len = int(regs[2]);
+		auto behavior = regs[2];
+		A(start);
+		A(len);
+		A(behavior);
 	}
 
 	void close() {
@@ -311,6 +341,12 @@ public:
 		A(sig);
 	}
 
+	void exit_group() {
+		auto err = int(regs[1]);
+		A(err);
+		ret(0);
+	}
+
 	static int checkHook(const std::string &filename) {
 		auto basename = std::filesystem::path(filename).filename();
 		auto i = fdHookIdx.find(basename);
@@ -366,6 +402,7 @@ public:
 
 	bool handle() {
 		auto nr = regs[0];
+		retfmt = D;
 
 		#define C(x) case SYS_##x: arg("", #x); x(); break;
 		switch (nr) {
@@ -391,6 +428,9 @@ public:
 			C(getcwd)
 			C(set_robust_list)
 			C(rseq)
+			C(madvise)
+			C(munmap)
+			C(exit_group)
 			default: {
 				arg("", fmtSprintf("syscall_%d", nr));
 				break;
@@ -404,7 +444,7 @@ public:
 
 		if (debug) {
 			if (!handled) {
-				arg("", regs[0]);
+				argret();
 			}
 			auto &fn = dps[0];
 			auto &ret = dps[dps.size()-1];
@@ -649,10 +689,6 @@ error cmdMain(std::vector<std::string> &args) {
 	}
 
 	return runBin(args);
-}
-
-void soInit() {
-	initTcb();
 }
 
 }

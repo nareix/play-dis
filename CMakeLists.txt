@@ -40,11 +40,5 @@ add_executable(
   src/main.cpp
 )
 
-add_library(
-  s SHARED 
-  src/runtime_so.cpp
-  src/runtime.cpp
-)
-
 add_llvm_library(llvmdeps empty.cpp)
 target_link_libraries(s2 llvmdeps)
