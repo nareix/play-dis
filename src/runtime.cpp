@@ -3,7 +3,6 @@
 #include "elf_file.h"
 #include "utils.h"
 #include "runtime.h"
-#include "loader.h"
 
 #include <algorithm>
 #include <cassert>
