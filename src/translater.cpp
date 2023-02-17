@@ -1566,20 +1566,20 @@ error cmdMain(const std::vector<std::string> &args0) {
   }
 
   if (gen) {
-		auto addrStart = 0x00007ff000000000UL;
-		auto addrInc   = 0x0000000100000000UL;
-		auto addr = addrStart;
-		std::fstream faddr("addrs", std::fstream::out);
-		std::fstream faddrGdb("addrs.gdb", std::fstream::out);
+    auto addrStart = 0x00007ff000000000UL;
+    auto addrInc   = 0x0000000100000000UL;
+    auto addr = addrStart;
+    std::fstream faddr("addrs", std::fstream::out);
+    std::fstream faddrGdb("addrs.gdb", std::fstream::out);
 
-		for (auto &filename: args) {
-			ElfFile file;
-			auto err = file.open(filename);
-			if (err) {
-				return err;
-			}
+    for (auto &filename: args) {
+      ElfFile file;
+      auto err = file.open(filename);
+      if (err) {
+        return err;
+      }
 
-			auto basename = std::filesystem::path(filename).filename().string();
+      auto basename = std::filesystem::path(filename).filename().string();
       auto trname = "tr."+basename;
       fmtPrintf("translate %s %s\n", basename.c_str(), trname.c_str());
 
