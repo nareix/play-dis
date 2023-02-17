@@ -33,7 +33,6 @@ set(LLVM_LINK_COMPONENTS
 add_executable(
   s2
   src/translater.cpp
-  src/loader.cpp
   src/runtime.cpp
   src/elf_file.cpp
   src/utils.cpp
