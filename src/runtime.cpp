@@ -24,6 +24,7 @@
 #include <vector>
 #include <unordered_map>
 #include <fstream>
+#include <signal.h>
 
 namespace runtime {
 
@@ -62,15 +63,65 @@ struct FileAddr {
 
 struct Syscall {
 public:
-	static thread_local std::vector<std::pair<std::string,std::string>> dps;
 	static thread_local std::unordered_map<int, int> hookedFdIdx;
 	static std::vector<FileAddr> fdHooks;
 	static std::unordered_map<std::string, int> fdHookIdx;
 
-	ThreadCB *t;
-	uint64_t *regs;
-	bool handled;
+	void hookClose(int fd) {
+		auto i = hookedFdIdx.find(fd);
+		if (i == hookedFdIdx.end()) {
+			return;
+		}
 
+		hookedFdIdx.erase(i);
+
+		if (debug) {
+			fmtPrintf("fd %d hook closed\n", fd);
+		}
+	}
+
+	void hookOpen(const std::string &filename, uint64_t &newname) {
+		auto i = checkHook(filename);
+		if (i == -1) {
+			return;
+		}
+
+		auto &h = fdHooks[i];
+		newname = (uint64_t)h.trname.c_str();
+		syscall();
+		handled = true;
+		auto fd = int(regs[0]);
+		hookedFdIdx[fd] = i;
+
+		if (debug) {
+			fmtPrintf("fd %d hooked newname %s\n", fd, h.trname.c_str());
+		}
+	}
+
+	void hookMmap(int fd, uint64_t &addr) {
+		auto i = hookedFdIdx.find(fd);
+		if (i == hookedFdIdx.end()) {
+			return;
+		}
+
+		auto &h = fdHooks[i->second];
+		addr = h.addr;
+
+		if (debug) {
+			fmtPrintf("mmap fd %d hooked new addr %lx\n", fd, addr);
+		}
+	}
+
+	static int checkHook(const std::string &filename) {
+		auto basename = std::filesystem::path(filename).filename();
+		auto i = fdHookIdx.find(basename);
+		if (i == fdHookIdx.end()) {
+			return -1;
+		}
+		return i->second;
+	}
+
+	static thread_local std::vector<std::pair<std::string,std::string>> dps;
 	enum { D, X } retfmt;
 
 	void arg(const char *k, uint64_t v) {
@@ -103,6 +154,10 @@ public:
 			argret();
 		}
 	}
+
+	ThreadCB *t;
+	uint64_t *regs;
+	bool handled;
 
 	void arch_prctl() {
 		auto code = regs[1];
@@ -347,58 +402,26 @@ public:
 		ret(0);
 	}
 
-	static int checkHook(const std::string &filename) {
-		auto basename = std::filesystem::path(filename).filename();
-		auto i = fdHookIdx.find(basename);
-		if (i == fdHookIdx.end()) {
-			return -1;
-		}
-		return i->second;
+	void rt_sigaction() {
+		auto sig = int(regs[1]);
+		auto act = regs[2];
+		auto oldact = regs[3];
+		auto size = int(regs[4]);
+		A(sig);
+		A(act);
+		A(oldact);
+		A(size);
 	}
 
-	void hookClose(int fd) {
-		auto i = hookedFdIdx.find(fd);
-		if (i == hookedFdIdx.end()) {
-			return;
-		}
-
-		hookedFdIdx.erase(i);
-
-		if (debug) {
-			fmtPrintf("fd %d hook closed\n", fd);
-		}
-	}
-
-	void hookOpen(const std::string &filename, uint64_t &newname) {
-		auto i = checkHook(filename);
-		if (i == -1) {
-			return;
-		}
-
-		auto &h = fdHooks[i];
-		newname = (uint64_t)h.trname.c_str();
-		syscall();
-		handled = true;
-		auto fd = int(regs[0]);
-		hookedFdIdx[fd] = i;
-
-		if (debug) {
-			fmtPrintf("fd %d hooked newname %s\n", fd, h.trname.c_str());
-		}
-	}
-
-	void hookMmap(int fd, uint64_t &addr) {
-		auto i = hookedFdIdx.find(fd);
-		if (i == hookedFdIdx.end()) {
-			return;
-		}
-
-		auto &h = fdHooks[i->second];
-		addr = h.addr;
-
-		if (debug) {
-			fmtPrintf("mmap fd %d hooked new addr %lx\n", fd, addr);
-		}
+	void rt_sigprocmask() {
+		auto how = int(regs[1]);
+		auto set = regs[2];
+		auto oldset = regs[3];
+		auto size = int(regs[4]);
+		A(how);
+		A(set);
+		A(oldset);
+		A(size);
 	}
 
 	bool handle() {
@@ -432,6 +455,8 @@ public:
 			C(madvise)
 			C(munmap)
 			C(exit_group)
+			C(rt_sigaction)
+			C(rt_sigprocmask)
 			default: {
 				arg("", fmtSprintf("syscall_%d", nr));
 				break;

@@ -1590,16 +1590,16 @@ error cmdMain(const std::vector<std::string> &args0) {
         return err;
       }
 
-			faddr << basename <<  " " << trname << " 0x" << std::hex << addr << "\n";
-			faddrGdb << "add-symbol-file" << " " << trname;
-			for (auto i: file.secs) {
-				if (i.sh->sh_addr) {
-					faddrGdb << " -s " << i.name << " 0x" << std::hex << i.sh->sh_addr + addr;
-				}
-			}
-			faddrGdb << "\n";
-			addr += addrInc;
-		}
+      faddr << basename <<  " " << trname << " 0x" << std::hex << addr << "\n";
+        faddrGdb << "add-symbol-file" << " " << trname;
+        for (auto i: file.secs) {
+          if (i.sh->sh_addr) {
+            faddrGdb << " -s " << i.name << " 0x" << std::hex << i.sh->sh_addr + addr;
+          }
+        }
+        faddrGdb << "\n";
+        addr += addrInc;
+      }
 
     return nullptr;
   }
