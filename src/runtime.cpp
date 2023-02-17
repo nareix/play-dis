@@ -356,7 +356,7 @@ public:
   void set_tid_address() {
     auto tidptr = regs[1];
     A(tidptr);
-    ret(getpid());
+    ret(::getpid());
   }
 
   void uname() {
@@ -424,6 +424,81 @@ public:
     A(size);
   }
 
+  void stat() {
+    auto filename = (const char *)(regs[1]);
+    auto sb = regs[2];
+    A(filename);
+    A(sb);
+  }
+
+  void poll() {
+    auto fds = regs[1];
+    auto n = int(regs[2]);
+    auto timeout = int(regs[2]);
+    A(fds);
+    A(n);
+    A(timeout);
+  }
+
+  void fork() {
+  }
+
+  void getpid() {
+  }
+
+  void gettid() {
+  }
+
+  void getppid() {
+  }
+
+  void getpgid() {
+    auto pid = int(regs[1]);
+    A(pid);
+  }
+
+  void setpgid() {
+    auto pid = int(regs[1]);
+    auto pgid = int(regs[2]);
+    A(pid);
+    A(pgid);
+  }
+
+  void wait4() {
+    auto pid = int(regs[1]);
+    auto stat_addr = regs[2];
+    auto options = regs[2];
+    auto ru = regs[2];
+    A(pid);
+    A(stat_addr);
+    A(options);
+    A(ru);
+  }
+
+  void rt_sigreturn() {
+  }
+
+  void geteuid() {
+  }
+
+  void fcntl() {
+    auto fd = int(regs[1]);
+    auto cmd = regs[2];
+    auto args = regs[2];
+    A(fd);
+    A(cmd);
+    A(args);
+  }
+
+  void lseek() {
+    auto fd = int(regs[1]);
+    auto off = int(regs[2]);
+    auto whence = int(regs[2]);
+    A(fd);
+    A(off);
+    A(whence);
+  }
+
   bool handle() {
     auto nr = regs[0];
     retfmt = D;
@@ -457,6 +532,19 @@ public:
       C(exit_group)
       C(rt_sigaction)
       C(rt_sigprocmask)
+      C(stat)
+      C(poll)
+      C(fork)
+      C(getpid)
+      C(gettid)
+      C(setpgid)
+      C(wait4)
+      C(rt_sigreturn)
+      C(geteuid)
+      C(fcntl)
+      C(lseek)
+      C(getpgid)
+      C(getppid)
       default: {
         arg("", fmtSprintf("syscall_%d", nr));
         break;
