@@ -5,11 +5,14 @@
 #include "loader.h"
 
 #include <cassert>
+#include <list>
+#include <functional>
 #include <cstdint>
 #include <cstdint>
 #include <filesystem>
 #include <cstddef>
 #include <functional>
+#include <optional>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
@@ -28,12 +31,17 @@
 
 namespace runtime {
 
+struct Proc;
+
 struct ThreadCB {
   void *fn[2];
   uint64_t regs[11];
   void *stack;
   uint64_t fs;
   uint64_t gs;
+
+  std::vector<Proc> procs;
+  std::unordered_map<pid_t, int> pids;
 };
 
 static constexpr int TCBRegs(int i) {
@@ -61,65 +69,99 @@ struct FileAddr {
   uint64_t addr;
 };
 
-struct Syscall {
-public:
-  static thread_local std::unordered_map<int, int> hookedFdIdx;
-  static std::vector<FileAddr> fdHooks;
-  static std::unordered_map<std::string, int> fdHookIdx;
+struct FileHooks {
+  std::vector<FileAddr> e;
+  std::unordered_map<std::string, int> m;
 
-  void hookClose(int fd) {
-    auto i = hookedFdIdx.find(fd);
-    if (i == hookedFdIdx.end()) {
-      return;
-    }
-
-    hookedFdIdx.erase(i);
-
-    if (debug) {
-      fmtPrintf("fd %d hook closed\n", fd);
-    }
+  void add(const std::string &k, const FileAddr &v) {
+    auto n = e.size();
+    m.emplace(k, n);
+    e.push_back(v);
   }
 
-  void hookOpen(const std::string &filename, uint64_t &newname) {
-    auto i = checkHook(filename);
-    if (i == -1) {
-      return;
-    }
-
-    auto &h = fdHooks[i];
-    newname = (uint64_t)h.trname.c_str();
-    syscall();
-    handled = true;
-    auto fd = int(regs[0]);
-    hookedFdIdx[fd] = i;
-
-    if (debug) {
-      fmtPrintf("fd %d hooked newname %s\n", fd, h.trname.c_str());
-    }
-  }
-
-  void hookMmap(int fd, uint64_t &addr) {
-    auto i = hookedFdIdx.find(fd);
-    if (i == hookedFdIdx.end()) {
-      return;
-    }
-
-    auto &h = fdHooks[i->second];
-    addr = h.addr;
-
-    if (debug) {
-      fmtPrintf("mmap fd %d hooked new addr %lx\n", fd, addr);
-    }
-  }
-
-  static int checkHook(const std::string &filename) {
-    auto basename = std::filesystem::path(filename).filename();
-    auto i = fdHookIdx.find(basename);
-    if (i == fdHookIdx.end()) {
+  int find(const std::string &filename) {
+    auto i = m.find(std::filesystem::path(filename).filename());
+    if (i == m.end()) {
       return -1;
     }
     return i->second;
   }
+};
+
+static FileHooks fileHooks;
+
+struct ProcFile {
+  int hook;
+};
+
+struct VMArea {
+  uint64_t addr;
+  uint64_t size;
+  int fd;
+};
+
+struct Proc {
+  pid_t pid;
+  std::vector<ProcFile*> files;
+  std::vector<VMArea> vms;
+
+  using HookSyscall = std::function<uint64_t(std::optional<uint64_t>)>;
+
+  void closeFd(int fd) {
+    if (fd >= files.size()) {
+      return;
+    }
+
+    auto f = files[fd];
+    if (!f) {
+      return;
+    }
+
+    delete f;
+    files[fd] = nullptr;
+  }
+
+  void openFd(const std::string &filename, HookSyscall syscall) {
+    std::optional<uint64_t> newname;
+
+    auto hook = fileHooks.find(filename);
+    if (hook != -1) {
+      newname = (uint64_t)fileHooks.e[hook].trname.c_str();
+    }
+
+    int fd = syscall(newname);
+
+    files.resize(fd+1);
+    auto f = new ProcFile();
+    f->hook = hook;
+    files[fd] = f;
+
+    if (debug && newname) {
+      fmtPrintf("fd %d opened with hook %s\n", fd, (*newname));
+    }
+  }
+
+  void mmapFd(uint64_t addr, int len, int prot, int flags, int fd, uint64_t off, HookSyscall syscall) {
+    std::optional<uint64_t> newaddr;
+
+    if (fd != -1 && addr == 0 && off == 0) {
+      auto f = files[fd];
+      if (f->hook != -1) {
+        newaddr = fileHooks.e[f->hook].addr;
+      }
+    }
+
+    if (debug && newaddr) {
+      fmtPrintf("mmap fd %d hook addr %lx\n", fd, *newaddr);
+    }
+
+    syscall(newaddr);
+  }
+};
+
+struct Syscall {
+public:
+  Proc *p;
 
   static thread_local std::vector<std::pair<std::string,std::string>> dps;
   enum { D, X } retfmt;
@@ -155,9 +197,24 @@ public:
     }
   }
 
+  void syscall() {
+    syscall0();
+    ret(regs[0]);
+  }
+
   ThreadCB *t;
   uint64_t *regs;
   bool handled;
+
+  Proc::HookSyscall hookSyscall(uint64_t *p) {
+    return [&, p](auto v) {
+      if (v) {
+        *p = *v;
+      }
+      syscall();
+      return regs[0];
+    };
+  }
 
   void arch_prctl() {
     auto code = regs[1];
@@ -208,7 +265,7 @@ public:
     A(flags);
     A(mode);
 
-    hookOpen(filename, regs[2]);
+    p->openFd(filename, hookSyscall(&regs[2]));
   }
 
   void mprotect() {
@@ -221,7 +278,7 @@ public:
   }
 
   void mmap() {
-    auto &addr = regs[1];
+    auto addr = regs[1];
     auto len = int(regs[2]);
     auto prot = regs[3];
     auto flags = regs[4];
@@ -235,9 +292,7 @@ public:
     A(off);
     retfmt = X;
 
-    if (fd != -1 && addr == 0 && off == 0) {
-      hookMmap(fd, addr);
-    }
+    p->mmapFd(addr, len, prot, flags, fd, off, hookSyscall(&regs[1]));
   }
 
   void munmap() {
@@ -260,7 +315,7 @@ public:
     auto fd = int(regs[1]);
     A(fd);
 
-    hookClose(fd);
+    p->closeFd(fd);
   }
 
   void writev() {
@@ -328,7 +383,7 @@ public:
     A(flags);
     A(mode);
 
-    hookOpen(filename, regs[1]);
+    p->openFd(filename, hookSyscall(&regs[1]));
   }
 
   void pread64() {
@@ -441,6 +496,7 @@ public:
   }
 
   void fork() {
+    ::exit(1);
   }
 
   void getpid() {
@@ -493,7 +549,7 @@ public:
   void lseek() {
     auto fd = int(regs[1]);
     auto off = int(regs[2]);
-    auto whence = int(regs[2]);
+    auto whence = int(regs[3]);
     A(fd);
     A(off);
     A(whence);
@@ -552,14 +608,12 @@ public:
     }
     #undef C
 
-    if (!handled) {
+    auto bypass = !handled;
+    if (bypass) {
       syscall();
     }
 
     if (debug) {
-      if (!handled) {
-        argret();
-      }
       auto &fn = dps[0];
       auto &ret = dps[dps.size()-1];
       fmtPrintf("%s(", fn.second.c_str());
@@ -571,7 +625,7 @@ public:
         }
       }
       fmtPrintf(") = %s", ret.second.c_str());
-      if (!handled) {
+      if (bypass) {
         fmtPrintf(" (bypass)");
       }
       fmtPrintf("\n");
@@ -585,7 +639,9 @@ public:
   #undef A0
 
   static bool handle0() {
+    static Proc p0;
     Syscall h;
+    h.p = &p0;
     h.t = tcb();
     h.regs = h.t->regs;
     h.handled = false;
@@ -628,7 +684,7 @@ public:
     asm("jmp *%%gs:%c0" :: "i"(TCBRegs(9)));
   }
 
-  static __attribute__((naked)) void syscall() {
+  static __attribute__((naked)) void syscall0() {
     // restore call regs
     asm("mov %%gs:%c0, %%rax" :: "i"(TCBRegs(0)));
     asm("mov %%gs:%c0, %%rdi" :: "i"(TCBRegs(1)));
@@ -653,9 +709,6 @@ public:
 };
 
 thread_local decltype(Syscall::dps) Syscall::dps;
-thread_local decltype(Syscall::hookedFdIdx) Syscall::hookedFdIdx;
-decltype(Syscall::fdHookIdx) Syscall::fdHookIdx;
-decltype(Syscall::fdHooks) Syscall::fdHooks;
 
 static error initTcb() {
   auto size = 1024*128;
@@ -682,9 +735,9 @@ static error runBin(const std::vector<std::string> &args) {
   auto filename = args[0];
 
   uint64_t loadAt = 0;
-  auto i = Syscall::checkHook(filename);
-  if (i != -1) {
-    auto &h = Syscall::fdHooks[i];
+  auto hook = fileHooks.find(filename);
+  if (hook != -1) {
+    auto &h = fileHooks.e[hook];
     loadAt = h.addr;
     filename = h.trname;
   }
@@ -796,9 +849,7 @@ error cmdMain(std::vector<std::string> &args) {
       std::string trname;
       uint64_t addr;
       sline >> basename >> trname >> std::hex >> addr;
-      auto i = Syscall::fdHooks.size();
-      Syscall::fdHooks.push_back({trname, addr});
-      Syscall::fdHookIdx.emplace(basename, i);
+      fileHooks.add(basename, {trname, addr});
     }
   }
 
