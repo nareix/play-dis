@@ -5,7 +5,6 @@
 #include "elf.h"
 #include "runtime.h"
 #include "translater.h"
-#include "loader.h"
 #include "elf_file.h"
 #include "utils.h"
 
