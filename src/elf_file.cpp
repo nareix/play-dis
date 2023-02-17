@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <string.h>
+#include <vector>
 
 static bool dynFindTag(Slice file, Elf64_Phdr *ph, Elf64_Sxword tag, Elf64_Xword &v) {
   auto dynStart = file.data() + ph->p_offset;
@@ -112,6 +113,63 @@ static error parse(Slice buf, ElfFile &file) {
   file.loads = std::move(loads);
   file.isPIE = isPIE;
   return nullptr;
+}
+
+static auto pageSize = getpagesize();
+
+std::vector<ElfFile::MmapSeg> ElfFile::mmapSegs() const {
+  std::vector<ElfFile::MmapSeg> segs;
+
+  auto eh = this->eh();
+  auto load0 = loads.begin();
+  auto loadn = loads.end()-1;
+  auto loadSize = (*loadn)->p_vaddr + (*loadn)->p_memsz - (*load0)->p_vaddr;
+
+  for (int i = 0; i < loads.size(); i++) {
+    auto ph = loads[i];
+    auto diff = ph->p_vaddr & (pageSize-1);
+    auto vaddrStart = ph->p_vaddr - diff;
+    auto fileOff = ph->p_offset - diff;
+    auto vaddrEnd = ph->p_vaddr + ph->p_filesz;
+    auto mapSize = vaddrEnd - vaddrStart;
+    int prot = 0;
+
+    if (ph->p_flags & PF_X) {
+      prot |= PROT_EXEC;
+    }
+    if (ph->p_flags & PF_R) {
+      prot |= PROT_READ;
+    }
+    if (ph->p_flags & PF_W) {
+      prot |= PROT_WRITE;
+    }
+
+    segs.push_back(MmapSeg{
+      .start = vaddrStart,
+      .len = mapSize,
+      .off = fileOff,
+      .prot = prot,
+    });
+
+    if (ph->p_memsz > ph->p_filesz && (ph->p_flags & PF_W)) {
+      segs[segs.size()-1].fill0 = pageSize - (mapSize & (pageSize-1));
+
+      auto vaddrEndAlign = (vaddrEnd + pageSize-1) & ~(pageSize-1);
+      auto vaddrMemEnd = ph->p_vaddr + ph->p_memsz;
+      if (vaddrMemEnd > vaddrEndAlign) {
+        auto mapSize = vaddrMemEnd - vaddrEndAlign;
+
+        segs.push_back(MmapSeg{
+          .start = vaddrEndAlign,
+          .len = mapSize,
+          .prot = prot,
+          .anon = true,
+        });
+      }
+    }
+  }
+
+  return segs;
 }
 
 error ElfFile::open(const std::string &filename) {

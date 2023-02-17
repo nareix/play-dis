@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <string.h>
 #include <unistd.h>
+#include <vector>
 
 static bool debug = true;
 static auto pageSize = getpagesize();

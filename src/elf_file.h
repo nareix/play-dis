@@ -11,6 +11,16 @@ public:
   Elf64_Phdr *phX;
   File f;
 
+  struct MmapSeg {
+    uint64_t start;
+    uint64_t len;
+    uint64_t off;
+    int prot;
+    bool anon;
+    uint64_t fill0;
+  };
+  std::vector<MmapSeg> mmapSegs() const;
+
   struct Section {
     Elf64_Shdr *sh;
     std::string name;

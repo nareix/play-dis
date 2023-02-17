@@ -1,9 +1,11 @@
+#include "X86BaseInfo.h"
 #include "elf.h"
 #include "elf_file.h"
 #include "utils.h"
 #include "runtime.h"
 #include "loader.h"
 
+#include <algorithm>
 #include <cassert>
 #include <list>
 #include <functional>
@@ -19,6 +21,7 @@
 #include <string>
 #include <sys/syscall.h>
 #include <asm/prctl.h>
+#include <type_traits>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -94,20 +97,20 @@ struct ProcFile {
   int hook;
 };
 
-struct VMArea {
-  uint64_t addr;
-  uint64_t size;
+struct VMRegion {
+  uint64_t start;
+  uint64_t len;
+  int prot;
   int fd;
 };
 
 struct Proc {
-  pid_t pid;
   std::vector<ProcFile*> files;
-  std::vector<VMArea> vms;
+  std::vector<VMRegion> vms;
 
   using HookSyscall = std::function<uint64_t(std::optional<uint64_t>)>;
 
-  void closeFd(int fd) {
+  void close(int fd) {
     if (fd >= files.size()) {
       return;
     }
@@ -121,7 +124,7 @@ struct Proc {
     files[fd] = nullptr;
   }
 
-  void openFd(const std::string &filename, HookSyscall syscall) {
+  void open(const std::string &filename, HookSyscall syscall) {
     std::optional<uint64_t> newname;
 
     auto hook = fileHooks.find(filename);
@@ -141,7 +144,13 @@ struct Proc {
     }
   }
 
-  void mmapFd(uint64_t addr, int len, int prot, int flags, int fd, uint64_t off, HookSyscall syscall) {
+  void mergeVms() {
+    std::sort(vms.begin(), vms.end(), [&](auto &l, auto &r) {
+      return l.start < r.start;
+    });
+  }
+
+  void mmap(uint64_t addr, int len, int prot, int flags, int fd, uint64_t off, HookSyscall syscall) {
     std::optional<uint64_t> newaddr;
 
     if (fd != -1 && addr == 0 && off == 0) {
@@ -155,13 +164,46 @@ struct Proc {
       fmtPrintf("mmap fd %d hook addr %lx\n", fd, *newaddr);
     }
 
-    syscall(newaddr);
+    auto raddr = (void *)syscall(newaddr);
+
+    if (raddr == MAP_FAILED) {
+      return;
+    }
+
+    VMRegion vm;
+    vm.start = (uint64_t)raddr;
+    vm.len = len;
+    vm.fd = fd;
+    vm.prot = prot;
+    vms.push_back(vm);
+    mergeVms();
+
+    fmtPrintf("add vm %lx-%lx %d\n", vm.start, vm.start+vm.len, vm.fd);
+  }
+
+  void unmap(uint64_t addr, int len) {
+    for (auto m = vms.begin(); m < vms.end(); m++) {
+      if (m->start == addr) {
+        vms.erase(m);
+        auto vm = *m;
+        fmtPrintf("remove vm %lx-%lx %d\n", vm.start, vm.start+vm.len, vm.fd);
+        break;
+      }
+    }
+  }
+
+  void fork() {
+    for (auto &vm: vms) {
+      fmtPrintf("all vm %lx-%lx %d\n", vm.start, vm.start+vm.len, vm.fd);
+    }
+    asm("int3");
   }
 };
 
 struct Syscall {
 public:
   Proc *p;
+  static Proc p0;
 
   static thread_local std::vector<std::pair<std::string,std::string>> dps;
   enum { D, X } retfmt;
@@ -265,7 +307,7 @@ public:
     A(flags);
     A(mode);
 
-    p->openFd(filename, hookSyscall(&regs[2]));
+    p->open(filename, hookSyscall(&regs[2]));
   }
 
   void mprotect() {
@@ -292,7 +334,7 @@ public:
     A(off);
     retfmt = X;
 
-    p->mmapFd(addr, len, prot, flags, fd, off, hookSyscall(&regs[1]));
+    p->mmap(addr, len, prot, flags, fd, off, hookSyscall(&regs[1]));
   }
 
   void munmap() {
@@ -300,6 +342,8 @@ public:
     auto len = int(regs[2]);
     A(addr);
     A(len);
+
+    p->unmap(addr, len);
   }
 
   void madvise() {
@@ -315,7 +359,7 @@ public:
     auto fd = int(regs[1]);
     A(fd);
 
-    p->closeFd(fd);
+    p->close(fd);
   }
 
   void writev() {
@@ -383,7 +427,7 @@ public:
     A(flags);
     A(mode);
 
-    p->openFd(filename, hookSyscall(&regs[1]));
+    p->open(filename, hookSyscall(&regs[1]));
   }
 
   void pread64() {
@@ -496,7 +540,7 @@ public:
   }
 
   void fork() {
-    ::exit(1);
+    p->fork();
   }
 
   void getpid() {
@@ -639,7 +683,6 @@ public:
   #undef A0
 
   static bool handle0() {
-    static Proc p0;
     Syscall h;
     h.p = &p0;
     h.t = tcb();
@@ -709,6 +752,7 @@ public:
 };
 
 thread_local decltype(Syscall::dps) Syscall::dps;
+Proc Syscall::p0;
 
 static error initTcb() {
   auto size = 1024*128;
@@ -727,18 +771,18 @@ static error initTcb() {
   return nullptr;
 }
 
-static void enterBin(void *entry, void *stack) {
-  asm("mov %0, %%rsp; mov $0, %%rbp; jmpq *%1" :: "r"(stack), "r"(entry));
+static __attribute__((naked)) void enterBin(void *entry, void *stack) {
+  asm("mov %rsi, %rsp; jmpq *%rdi");
 }
 
 static error runBin(const std::vector<std::string> &args) {
   auto filename = args[0];
+  uint8_t *loadP = nullptr;
 
-  uint64_t loadAt = 0;
   auto hook = fileHooks.find(filename);
   if (hook != -1) {
     auto &h = fileHooks.e[hook];
-    loadAt = h.addr;
+    loadP = (uint8_t *)h.addr;
     filename = h.trname;
   }
 
@@ -748,10 +792,51 @@ static error runBin(const std::vector<std::string> &args) {
     return err;
   }
 
-  uint8_t *loadP;
-  err = loadBin(file, loadP, loadAt);
-  if (err) {
-    return err;
+  auto segs = file.mmapSegs();
+  auto segn = segs[segs.size()-1];
+  auto segsSize = segn.start + segn.len - segs[0].start;
+
+  {
+    auto p = (uint8_t *)mmap(loadP, segsSize, PROT_NONE, MAP_PRIVATE, file.f.fd, 0);
+    if (p == MAP_FAILED) {
+      return fmtErrorf("load failed");
+    }
+    if (loadP && p != loadP) {
+      return fmtErrorf("load failed");
+    }
+    loadP = p;
+  }
+
+  for (auto &seg: segs) {
+    int flags;
+    int fd;
+    if (seg.anon) {
+      flags = MAP_PRIVATE|MAP_ANONYMOUS;
+      fd = -1;
+    } else {
+      flags = MAP_PRIVATE;
+      fd = file.f.fd;
+    }
+    flags |= MAP_FIXED;
+
+    auto segP = loadP + seg.start;
+    auto p = (uint8_t *)mmap(segP, seg.len, seg.prot, flags, fd, seg.off);
+    if (p == MAP_FAILED) {
+      return fmtErrorf("load failed");
+    }
+    if (seg.fill0) {
+      memset(p + seg.len, 0, seg.fill0);
+    }
+    if (debug) {
+      fmtPrintf("load %lx len %lx off %lx anon %d\n", segP, seg.len, seg.off, seg.anon);
+    }
+
+    Syscall::p0.vms.push_back(VMRegion{
+      .start = (uint64_t)segP,
+      .len = seg.len,
+      .prot = seg.prot,
+      .fd = fd,
+    });
   }
 
   auto entryP = loadP + file.eh()->e_entry - (*file.loads.begin())->p_vaddr;
@@ -787,6 +872,8 @@ static error runBin(const std::vector<std::string> &args) {
   random[0] = std::rand();
   random[1] = std::rand();
 
+  auto pageSize = getpagesize();
+
   // aux
   auto aux = [&](size_t k, size_t val) {
     v.push_back(k);
@@ -794,7 +881,7 @@ static error runBin(const std::vector<std::string> &args) {
   };
   aux(AT_HWCAP, 0x178bfbff);
   aux(AT_HWCAP2, 0x2);
-  aux(AT_PAGESZ, getpagesize());
+  aux(AT_PAGESZ, pageSize);
   aux(AT_CLKTCK, 100);
   aux(AT_PHDR, (size_t)phStart);
   aux(AT_BASE, (size_t)loadP);
@@ -824,6 +911,12 @@ static error runBin(const std::vector<std::string> &args) {
     return fmtErrorf("auxv too large");
   }
   memcpy(stackStart, v.data(), vsize);
+
+  Syscall::p0.vms.push_back(VMRegion{
+    .start = (uint64_t)stackTop,
+    .len = (uint64_t)((stackSize + pageSize-1) & ~(pageSize-1)),
+    .prot = PROT_READ|PROT_WRITE, .fd = -1,
+  });
 
   err = initTcb();
   if (err) {
