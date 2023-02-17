@@ -80,3 +80,13 @@ error File::create(const std::string &filename) {
   this->fd = fd;
   return nullptr;
 }
+
+uint64_t sysPageSize = getpagesize();
+
+uint64_t sysPageFloor(uint64_t addr) {
+  return addr & ~(sysPageSize-1);
+}
+
+uint64_t sysPageCeil(uint64_t addr) {
+  return (addr + sysPageSize-1) & ~(sysPageSize-1);
+}

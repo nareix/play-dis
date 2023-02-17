@@ -60,8 +60,8 @@ static error parse(Slice buf, ElfFile &file) {
     if (maxlen < 0) {
       return fmtErrorf("size not match #2");
     }
-    std::string name = std::string(s, strnlen(s, maxlen));
-    file.secs.push_back({sh, std::move(name)});
+    auto name = std::string(s, strnlen(s, maxlen));
+    file.secs.push_back({sh, name});
   }
 
   std::vector<Elf64_Phdr*> phs, loads;
@@ -115,8 +115,6 @@ static error parse(Slice buf, ElfFile &file) {
   return nullptr;
 }
 
-static auto pageSize = getpagesize();
-
 std::vector<ElfFile::MmapSeg> ElfFile::mmapSegs() const {
   std::vector<ElfFile::MmapSeg> segs;
 
@@ -127,7 +125,7 @@ std::vector<ElfFile::MmapSeg> ElfFile::mmapSegs() const {
 
   for (int i = 0; i < loads.size(); i++) {
     auto ph = loads[i];
-    auto diff = ph->p_vaddr & (pageSize-1);
+    auto diff = ph->p_vaddr & (sysPageSize-1);
     auto vaddrStart = ph->p_vaddr - diff;
     auto fileOff = ph->p_offset - diff;
     auto vaddrEnd = ph->p_vaddr + ph->p_filesz;
@@ -152,9 +150,9 @@ std::vector<ElfFile::MmapSeg> ElfFile::mmapSegs() const {
     });
 
     if (ph->p_memsz > ph->p_filesz && (ph->p_flags & PF_W)) {
-      segs[segs.size()-1].fill0 = pageSize - (mapSize & (pageSize-1));
+      segs[segs.size()-1].fill0 = sysPageSize - (mapSize & (sysPageSize-1));
 
-      auto vaddrEndAlign = (vaddrEnd + pageSize-1) & ~(pageSize-1);
+      auto vaddrEndAlign = sysPageCeil(vaddrEnd);
       auto vaddrMemEnd = ph->p_vaddr + ph->p_memsz;
       if (vaddrMemEnd > vaddrEndAlign) {
         auto mapSize = vaddrMemEnd - vaddrEndAlign;

@@ -52,7 +52,7 @@ static constexpr int TCBRegs(int i) {
 static const int TCBStack = offsetof(ThreadCB, stack);
 static const int TCBFs = offsetof(ThreadCB, fs);
 
-static __attribute__((naked)) ThreadCB *tcb() {
+static __attribute__((naked)) ThreadCB *gettcb() {
   asm("endbr64; rdgsbase %rax; ret");
 }
 
@@ -66,16 +66,15 @@ static __attribute__((naked)) void getfs() {
 
 static bool debug = true;
 
-struct FileAddr {
-  std::string trname;
-  uint64_t addr;
-};
-
 struct FileHooks {
-  std::vector<FileAddr> e;
+  struct File {
+    std::string trname;
+    uint64_t addr;
+  };
+  std::vector<File> e;
   std::unordered_map<std::string, int> m;
 
-  void add(const std::string &k, const FileAddr &v) {
+  void add(const std::string &k, const File &v) {
     auto n = e.size();
     m.emplace(k, n);
     e.push_back(v);
@@ -107,7 +106,10 @@ struct Proc {
   std::vector<ProcFile*> files;
   std::vector<VMRegion> vms;
 
-  using HookSyscall = std::function<uint64_t(std::optional<uint64_t>)>;
+  struct Syscall {
+    uint64_t &r;
+    const std::function<uint64_t()> &call;
+  };
 
   void close(int fd) {
     if (fd >= files.size()) {
@@ -123,61 +125,83 @@ struct Proc {
     files[fd] = nullptr;
   }
 
-  void open(const std::string &filename, HookSyscall syscall) {
-    std::optional<uint64_t> newname;
-
+  void open(const std::string &filename, const Syscall &s) {
+    auto hooked = false;
     auto hook = fileHooks.find(filename);
     if (hook != -1) {
-      newname = (uint64_t)fileHooks.e[hook].trname.c_str();
+      hooked = true;
+      s.r = (uint64_t)fileHooks.e[hook].trname.c_str();
     }
 
-    int fd = syscall(newname);
+    int fd = s.call();
+    if (fd == -1) {
+      return;
+    }
 
     files.resize(fd+1);
     auto f = new ProcFile();
     f->hook = hook;
     files[fd] = f;
 
-    if (debug && newname) {
-      fmtPrintf("fd %d opened with hook %s\n", fd, (*newname));
+    if (debug && hooked) {
+      fmtPrintf("fd %d opened with hook %s\n", fd, (void *)s.r);
     }
   }
 
-  void mergeVms() {
+  void addVm(uint64_t addr, uint64_t len, int prot, int fd) {
+    removeVm(addr, len);
+
+    VMRegion vm;
+    vm.start = sysPageFloor(addr);
+    vm.len = sysPageCeil(len);
+    vm.prot = prot;
+    vm.fd = fd;
+    vms.push_back(vm);
+
     std::sort(vms.begin(), vms.end(), [&](auto &l, auto &r) {
       return l.start < r.start;
     });
+
+    if (debug) {
+      fmtPrintf("add vm %lx-%lx %d\n", vm.start, vm.start+vm.len, vm.fd);
+    }
   }
 
-  void mmap(uint64_t addr, int len, int prot, int flags, int fd, uint64_t off, HookSyscall syscall) {
-    std::optional<uint64_t> newaddr;
+  void removeVm(uint64_t addr, uint64_t len) {
+    addr = sysPageFloor(addr);
+    len = sysPageCeil(len);
 
+    auto find = [&](uint64_t addr) {
+      int i;
+      for (i = 0; i < vms.size(); i++) {
+        if (i >= vms[i].start) {
+          break;
+        }
+      }
+      return i;
+    };
+  }
+
+  void mmap(uint64_t addr, int len, int prot, int flags, int fd, uint64_t off, const Syscall &s) {
+    auto hooked = false;
     if (fd != -1 && addr == 0 && off == 0) {
       auto f = files[fd];
       if (f->hook != -1) {
-        newaddr = fileHooks.e[f->hook].addr;
+        hooked = true;
+        s.r = fileHooks.e[f->hook].addr;
       }
     }
 
-    if (debug && newaddr) {
-      fmtPrintf("mmap fd %d hook addr %lx\n", fd, *newaddr);
+    if (debug && hooked) {
+      fmtPrintf("mmap fd %d hook addr %lx\n", fd, s.r);
     }
 
-    auto raddr = (void *)syscall(newaddr);
-
+    auto raddr = (void *)s.call();
     if (raddr == MAP_FAILED) {
       return;
     }
 
-    VMRegion vm;
-    vm.start = (uint64_t)raddr;
-    vm.len = len;
-    vm.fd = fd;
-    vm.prot = prot;
-    vms.push_back(vm);
-    mergeVms();
-
-    fmtPrintf("add vm %lx-%lx %d\n", vm.start, vm.start+vm.len, vm.fd);
+    addVm((uint64_t)raddr, len, prot, fd);
   }
 
   void unmap(uint64_t addr, int len) {
@@ -200,23 +224,22 @@ struct Proc {
 };
 
 struct Syscall {
-public:
-  Proc *p;
+  Proc &p;
   static Proc p0;
 
-  static thread_local std::vector<std::pair<std::string,std::string>> dps;
+  static thread_local std::vector<std::pair<std::string,std::string>> dbgarg;
   enum { D, X } retfmt;
 
   void arg(const char *k, uint64_t v) {
-    dps.push_back({k, fmtSprintf("0x%lx", v)});
+    dbgarg.push_back({k, fmtSprintf("0x%lx", v)});
   }
 
   void arg(const char *k, int v) {
-    dps.push_back({k, fmtSprintf("%d", v)});
+    dbgarg.push_back({k, fmtSprintf("%d", v)});
   }
 
   void arg(const char *k, const std::string &v) {
-    dps.push_back({k, v});
+    dbgarg.push_back({k, v});
   }
 
   void argret() {
@@ -238,24 +261,16 @@ public:
     }
   }
 
-  void syscall() {
+  uint64_t syscall() {
     syscall0();
     ret(regs[0]);
+    return regs[0];
   }
+  std::function<uint64_t()> syscallb = std::bind(&Syscall::syscall, this);
 
-  ThreadCB *t;
-  uint64_t *regs;
+  ThreadCB &t;
+  uint64_t *regs = t.regs;
   bool handled;
-
-  Proc::HookSyscall hookSyscall(uint64_t *p) {
-    return [&, p](auto v) {
-      if (v) {
-        *p = *v;
-      }
-      syscall();
-      return regs[0];
-    };
-  }
 
   void arch_prctl() {
     auto code = regs[1];
@@ -264,22 +279,22 @@ public:
     switch (code) {
       C(ARCH_SET_FS) {
         A(addr);
-        t->fs = addr;
+        t.fs = addr;
         ret(0);
         break;
       }
       C(ARCH_GET_FS) {
-        ret(t->fs);
+        ret(t.fs);
         break;
       }
       C(ARCH_SET_GS) {
         A(addr);
-        t->gs = addr;
+        t.gs = addr;
         ret(0);
         break;
       }
       C(ARCH_GET_GS) {
-        ret(t->gs);
+        ret(t.gs);
         break;
       }
       default: {
@@ -306,7 +321,7 @@ public:
     A(flags);
     A(mode);
 
-    p->open(filename, hookSyscall(&regs[2]));
+     p.open(filename, {regs[2], syscallb});
   }
 
   void mprotect() {
@@ -333,7 +348,7 @@ public:
     A(off);
     retfmt = X;
 
-    p->mmap(addr, len, prot, flags, fd, off, hookSyscall(&regs[1]));
+    p.mmap(addr, len, prot, flags, fd, off, {regs[1], syscallb});
   }
 
   void munmap() {
@@ -342,7 +357,7 @@ public:
     A(addr);
     A(len);
 
-    p->unmap(addr, len);
+    p.unmap(addr, len);
   }
 
   void madvise() {
@@ -358,7 +373,7 @@ public:
     auto fd = int(regs[1]);
     A(fd);
 
-    p->close(fd);
+    p.close(fd);
   }
 
   void writev() {
@@ -426,7 +441,7 @@ public:
     A(flags);
     A(mode);
 
-    p->open(filename, hookSyscall(&regs[1]));
+    p.open(filename, {regs[1], syscallb});
   }
 
   void pread64() {
@@ -539,7 +554,7 @@ public:
   }
 
   void fork() {
-    p->fork();
+    p.fork();
   }
 
   void getpid() {
@@ -657,13 +672,13 @@ public:
     }
 
     if (debug) {
-      auto &fn = dps[0];
-      auto &ret = dps[dps.size()-1];
+      auto &fn = dbgarg[0];
+      auto &ret = dbgarg[dbgarg.size()-1];
       fmtPrintf("%s(", fn.second.c_str());
-      for (int i = 1; i < dps.size()-1; i++) {
-        auto &p = dps[i];
+      for (int i = 1; i < dbgarg.size()-1; i++) {
+        auto &p = dbgarg[i];
         fmtPrintf("%s=%s", p.first.c_str(), p.second.c_str());
-        if (i < dps.size()-2) {
+        if (i < dbgarg.size()-2) {
           fmtPrintf(",");
         }
       }
@@ -672,7 +687,7 @@ public:
         fmtPrintf(" (bypass)");
       }
       fmtPrintf("\n");
-      dps.clear();
+      dbgarg.clear();
     }
 
     return handled;
@@ -682,12 +697,7 @@ public:
   #undef A0
 
   static bool handle0() {
-    Syscall h;
-    h.p = &p0;
-    h.t = tcb();
-    h.regs = h.t->regs;
-    h.handled = false;
-    return h.handle();
+    return Syscall{.p = p0, .t = *gettcb()}.handle();
   }
 
   // syscall: rax(nr) rdi(1) rsi(2) rdx(3) r10(4) r8(5) r9(6) rax(ret) 
@@ -750,7 +760,7 @@ public:
   }
 };
 
-thread_local decltype(Syscall::dps) Syscall::dps;
+thread_local decltype(Syscall::dbgarg) Syscall::dbgarg;
 Proc Syscall::p0;
 
 static error initTcb() {
@@ -826,16 +836,12 @@ static error runBin(const std::vector<std::string> &args) {
     if (seg.fill0) {
       memset(p + seg.len, 0, seg.fill0);
     }
+
     if (debug) {
       fmtPrintf("load %lx len %lx off %lx anon %d\n", segP, seg.len, seg.off, seg.anon);
     }
 
-    Syscall::p0.vms.push_back(VMRegion{
-      .start = (uint64_t)segP,
-      .len = seg.len,
-      .prot = seg.prot,
-      .fd = fd,
-    });
+    Syscall::p0.addVm((uint64_t)segP, seg.len, seg.prot, fd);
   }
 
   auto entryP = loadP + file.eh()->e_entry - (*file.loads.begin())->p_vaddr;
@@ -871,8 +877,6 @@ static error runBin(const std::vector<std::string> &args) {
   random[0] = std::rand();
   random[1] = std::rand();
 
-  auto pageSize = getpagesize();
-
   // aux
   auto aux = [&](size_t k, size_t val) {
     v.push_back(k);
@@ -880,7 +884,7 @@ static error runBin(const std::vector<std::string> &args) {
   };
   aux(AT_HWCAP, 0x178bfbff);
   aux(AT_HWCAP2, 0x2);
-  aux(AT_PAGESZ, pageSize);
+  aux(AT_PAGESZ, sysPageSize);
   aux(AT_CLKTCK, 100);
   aux(AT_PHDR, (size_t)phStart);
   aux(AT_BASE, (size_t)loadP);
@@ -911,11 +915,7 @@ static error runBin(const std::vector<std::string> &args) {
   }
   memcpy(stackStart, v.data(), vsize);
 
-  Syscall::p0.vms.push_back(VMRegion{
-    .start = (uint64_t)stackTop,
-    .len = (uint64_t)((stackSize + pageSize-1) & ~(pageSize-1)),
-    .prot = PROT_READ|PROT_WRITE, .fd = -1,
-  });
+  Syscall::p0.addVm((uint64_t)stackTop, stackSize, PROT_READ|PROT_WRITE, -1);
 
   err = initTcb();
   if (err) {

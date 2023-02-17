@@ -97,3 +97,7 @@ public:
   error mmapWrite(Slice &buf);
   error create(const std::string &file);
 };
+
+uint64_t sysPageFloor(uint64_t addr);
+uint64_t sysPageCeil(uint64_t addr);
+extern uint64_t sysPageSize;
