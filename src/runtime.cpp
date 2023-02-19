@@ -21,6 +21,7 @@
 #include <string>
 #include <sys/syscall.h>
 #include <asm/prctl.h>
+#include <sys/types.h>
 #include <type_traits>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -111,7 +112,7 @@ struct VMAs {
       } else {
         p += "-";
       }
-      return fmtSprintf("%lx-%lx %s %d", start, end, p.c_str(), fd);
+      return fmtSprintf("%lx-%lx %sp %d", start, end, p.c_str(), fd);
     }
   };
 
@@ -238,11 +239,21 @@ struct Proc {
   uint64_t gs;
   std::vector<ProcFile*> files;
   VMAs vm;
+  uint64_t brkEnd;
 
   struct Syscall {
     uint64_t &arg;
     const std::function<uint64_t()> &call;
   };
+
+  uint64_t brk(uint64_t addr) {
+    if (addr == 0) {
+      return brkEnd;
+    } else {
+      brkEnd = addr;
+      return addr;
+    }
+  }
 
   void close(int fd) {
     if (fd >= files.size()) {
@@ -370,7 +381,11 @@ struct Syscall {
   #define F(x) {x, #x}
 
   std::string sprot(int v) {
-    return strflags(v, {F(PF_X), F(PF_R), F(PF_W)});
+    return strflags(v, {
+      F(PROT_READ),
+      F(PROT_WRITE),
+      F(PROT_EXEC),
+    });
   }
 
   std::string smmapflags(int v) {
@@ -447,9 +462,11 @@ struct Syscall {
   }
 
   void brk() {
-    auto p = regs[1];
-    A(p);
+    auto addr = regs[1];
+    A(addr);
     retfmt = X;
+
+    ret(p.brk(addr));
   }
 
   void openat() {
@@ -891,6 +908,7 @@ struct Syscall {
   }
 
   static __attribute__((naked)) void syscall0() {
+    asm("endbr64");
     // restore call regs
     asm("mov %%gs:%c0, %%rax" :: "i"(R(0)));
     asm("mov %%gs:%c0, %%rdi" :: "i"(R(1)));
@@ -945,7 +963,7 @@ static error runBin(const std::vector<std::string> &args) {
     return err;
   }
 
-  auto proc = H.r()->t->p;
+  auto &proc = H.r()->t->p;
 
   auto filename = args[0];
   uint8_t *loadP = nullptr;
@@ -965,10 +983,10 @@ static error runBin(const std::vector<std::string> &args) {
 
   auto segs = file.mmapSegs();
   auto segn = segs[segs.size()-1];
-  auto segsSize = segn.start + segn.len - segs[0].start;
+  auto loadSize = segn.start + segn.len - segs[0].start;
 
   {
-    auto p = (uint8_t *)mmap(loadP, segsSize, PROT_NONE, MAP_PRIVATE, file.f.fd, 0);
+    auto p = (uint8_t *)mmap(loadP, loadSize, PROT_NONE, MAP_PRIVATE, file.f.fd, 0);
     if (p == MAP_FAILED) {
       return fmtErrorf("load failed");
     }
@@ -1006,6 +1024,7 @@ static error runBin(const std::vector<std::string> &args) {
 
     proc.vm.add((uint64_t)segP, (uint64_t)segP+seg.len, {.prot = seg.prot, .fd = fd});
   }
+  proc.brkEnd = (uint64_t)(loadP + sysPageCeil(loadSize));
 
   auto entryP = loadP + file.eh()->e_entry - (*file.loads.begin())->p_vaddr;
 
