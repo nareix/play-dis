@@ -34,36 +34,27 @@
 
 namespace runtime {
 
-struct Proc;
+struct HostThread;
 
-struct ThreadCB {
+struct HostRegs {
   void *fn[2];
   uint64_t regs[11];
   void *stack;
+  HostThread *t;
   uint64_t fs;
-  uint64_t gs;
-
-  std::vector<Proc> procs;
-  std::unordered_map<pid_t, int> pids;
 };
 
-static constexpr int TCBRegs(int i) {
-  return offsetof(ThreadCB, regs) + i*8;
-}
-static const int TCBStack = offsetof(ThreadCB, stack);
-static const int TCBFs = offsetof(ThreadCB, fs);
+struct Host {
+  static __attribute__((naked)) void setr(HostRegs *t) {
+    asm("endbr64; wrgsbase %rdi; ret");
+  }
 
-static __attribute__((naked)) ThreadCB *gettcb() {
-  asm("endbr64; rdgsbase %rax; ret");
-}
+  static __attribute__((naked)) HostRegs *r() {
+    asm("endbr64; rdgsbase %rax; ret");
+  }
+};
 
-static __attribute__((naked))  void settcb(ThreadCB *t) {
-  asm("endbr64; wrgsbase %rdi; ret");
-}
-
-static __attribute__((naked)) void getfs() {
-  asm("endbr64; mov %%gs:%c0, %%rax; ret" :: "i"(TCBFs));
-}
+struct Host H;
 
 static bool debug = true;
 
@@ -216,6 +207,8 @@ struct VMAs {
 };
 
 struct Proc {
+  uint64_t fs;
+  uint64_t gs;
   std::vector<ProcFile*> files;
   VMAs vm;
 
@@ -297,10 +290,15 @@ struct Proc {
   }
 };
 
-struct Syscall {
+struct HostThread {
+  std::vector<Proc> ps = {{}};
   Proc &p;
-  static Proc p0;
 
+  HostThread(): p(ps[0]) {
+  }
+};
+
+struct Syscall {
   static thread_local std::vector<std::pair<std::string,std::string>> dbgarg;
   enum { D, X } retfmt;
 
@@ -342,8 +340,10 @@ struct Syscall {
   }
   std::function<uint64_t()> syscallb = std::bind(&Syscall::syscall, this);
 
-  ThreadCB &t;
-  uint64_t *regs = t.regs;
+  HostRegs *hr;
+  HostThread *t = hr->t;
+  Proc &p = t->p;
+  uint64_t *regs = hr->regs;
   bool handled;
 
   void arch_prctl() {
@@ -353,22 +353,23 @@ struct Syscall {
     switch (code) {
       C(ARCH_SET_FS) {
         A(addr);
-        t.fs = addr;
+        p.fs = addr;
+        hr->fs = p.fs;
         ret(0);
         break;
       }
       C(ARCH_GET_FS) {
-        ret(t.fs);
+        ret(p.fs);
         break;
       }
       C(ARCH_SET_GS) {
         A(addr);
-        t.gs = addr;
+        p.gs = addr;
         ret(0);
         break;
       }
       C(ARCH_GET_GS) {
-        ret(t.gs);
+        ret(p.gs);
         break;
       }
       default: {
@@ -771,85 +772,96 @@ struct Syscall {
   #undef A0
 
   static bool handle0() {
-    return Syscall{.p = p0, .t = *gettcb()}.handle();
+    return Syscall{.hr = H.r()}.handle();
   }
 
   // syscall: rax(nr) rdi(1) rsi(2) rdx(3) r10(4) r8(5) r9(6) rax(ret) 
   // caller:  rdi(1) rsi(2) rdx(3) rcx(4) r8(5) r9(6) rax(ret) r10 r11
 
+  static constexpr int R(int i) {
+    return offsetof(HostRegs, regs) + i*8;
+  }
+  static const int Stack = offsetof(HostRegs, stack);
+  static const int Fs = offsetof(HostRegs, fs);
+
+  static __attribute__((naked)) void getfs() {
+    asm("endbr64; mov %%gs:%c0, %%rax; ret" :: "i"(Fs));
+  }
+
   static __attribute__((naked)) void entry() {
     asm("endbr64");
     // save caller regs
-    asm("mov %%rax, %%gs:%c0" :: "i"(TCBRegs(0)));
-    asm("mov %%rdi, %%gs:%c0" :: "i"(TCBRegs(1)));
-    asm("mov %%rsi, %%gs:%c0" :: "i"(TCBRegs(2)));
-    asm("mov %%rdx, %%gs:%c0" :: "i"(TCBRegs(3)));
-    asm("mov %%r10, %%gs:%c0" :: "i"(TCBRegs(4)));
-    asm("mov %%r8, %%gs:%c0" :: "i"(TCBRegs(5)));
-    asm("mov %%r9, %%gs:%c0" :: "i"(TCBRegs(6)));
-    asm("mov %%r11, %%gs:%c0" :: "i"(TCBRegs(7)));
+    asm("mov %%rax, %%gs:%c0" :: "i"(R(0)));
+    asm("mov %%rdi, %%gs:%c0" :: "i"(R(1)));
+    asm("mov %%rsi, %%gs:%c0" :: "i"(R(2)));
+    asm("mov %%rdx, %%gs:%c0" :: "i"(R(3)));
+    asm("mov %%r10, %%gs:%c0" :: "i"(R(4)));
+    asm("mov %%r8, %%gs:%c0" :: "i"(R(5)));
+    asm("mov %%r9, %%gs:%c0" :: "i"(R(6)));
+    asm("mov %%r11, %%gs:%c0" :: "i"(R(7)));
     // pop and save ret addr
-    asm("pop %%r11; mov %%r11, %%gs:%c0" :: "i"(TCBRegs(9)));
+    asm("pop %%r11; mov %%r11, %%gs:%c0" :: "i"(R(9)));
     // swap to host stack
-    asm("mov %%rsp, %%gs:%c0" :: "i"(TCBRegs(8)));
-    asm("mov %%gs:%c0, %%rsp" :: "i"(TCBStack));
+    asm("mov %%rsp, %%gs:%c0" :: "i"(R(8)));
+    asm("mov %%gs:%c0, %%rsp" :: "i"(Stack));
     // call handler
     asm("call %P0" :: "i"(handle0));
     // restore call regs
-    asm("mov %%gs:%c0, %%rax" :: "i"(TCBRegs(0)));
-    asm("mov %%gs:%c0, %%rdi" :: "i"(TCBRegs(1)));
-    asm("mov %%gs:%c0, %%rsi" :: "i"(TCBRegs(2)));
-    asm("mov %%gs:%c0, %%rdx" :: "i"(TCBRegs(3)));
-    asm("mov %%gs:%c0, %%r10" :: "i"(TCBRegs(4)));
-    asm("mov %%gs:%c0, %%r8" :: "i"(TCBRegs(5)));
-    asm("mov %%gs:%c0, %%r9" :: "i"(TCBRegs(6)));
-    asm("mov %%gs:%c0, %%r11" :: "i"(TCBRegs(7)));
+    asm("mov %%gs:%c0, %%rax" :: "i"(R(0)));
+    asm("mov %%gs:%c0, %%rdi" :: "i"(R(1)));
+    asm("mov %%gs:%c0, %%rsi" :: "i"(R(2)));
+    asm("mov %%gs:%c0, %%rdx" :: "i"(R(3)));
+    asm("mov %%gs:%c0, %%r10" :: "i"(R(4)));
+    asm("mov %%gs:%c0, %%r8" :: "i"(R(5)));
+    asm("mov %%gs:%c0, %%r9" :: "i"(R(6)));
+    asm("mov %%gs:%c0, %%r11" :: "i"(R(7)));
     // switch to guest stack
-    asm("mov %%gs:%c0, %%rsp" :: "i"(TCBRegs(8)));
+    asm("mov %%gs:%c0, %%rsp" :: "i"(R(8)));
     // jmp to ret addr
-    asm("jmp *%%gs:%c0" :: "i"(TCBRegs(9)));
+    asm("jmp *%%gs:%c0" :: "i"(R(9)));
   }
 
   static __attribute__((naked)) void syscall0() {
     // restore call regs
-    asm("mov %%gs:%c0, %%rax" :: "i"(TCBRegs(0)));
-    asm("mov %%gs:%c0, %%rdi" :: "i"(TCBRegs(1)));
-    asm("mov %%gs:%c0, %%rsi" :: "i"(TCBRegs(2)));
-    asm("mov %%gs:%c0, %%rdx" :: "i"(TCBRegs(3)));
-    asm("mov %%gs:%c0, %%r10" :: "i"(TCBRegs(4)));
-    asm("mov %%gs:%c0, %%r8" :: "i"(TCBRegs(5)));
-    asm("mov %%gs:%c0, %%r9" :: "i"(TCBRegs(6)));
-    asm("mov %%gs:%c0, %%r11" :: "i"(TCBRegs(7)));
+    asm("mov %%gs:%c0, %%rax" :: "i"(R(0)));
+    asm("mov %%gs:%c0, %%rdi" :: "i"(R(1)));
+    asm("mov %%gs:%c0, %%rsi" :: "i"(R(2)));
+    asm("mov %%gs:%c0, %%rdx" :: "i"(R(3)));
+    asm("mov %%gs:%c0, %%r10" :: "i"(R(4)));
+    asm("mov %%gs:%c0, %%r8" :: "i"(R(5)));
+    asm("mov %%gs:%c0, %%r9" :: "i"(R(6)));
+    asm("mov %%gs:%c0, %%r11" :: "i"(R(7)));
     // swap to guest stack
-    asm("mov %%rsp, %%gs:%c0" :: "i"(TCBRegs(10)));
-    asm("mov %%gs:%c0, %%rsp" :: "i"(TCBRegs(8)));
+    asm("mov %%rsp, %%gs:%c0" :: "i"(R(10)));
+    asm("mov %%gs:%c0, %%rsp" :: "i"(R(8)));
     // syscall
     asm("syscall");
     // save results
-    asm("mov %%rax, %%gs:%c0" :: "i"(TCBRegs(0)));
-    asm("mov %%rsp, %%gs:%c0" :: "i"(TCBRegs(8)));
+    asm("mov %%rax, %%gs:%c0" :: "i"(R(0)));
+    asm("mov %%rsp, %%gs:%c0" :: "i"(R(8)));
     // swap to host stack
-    asm("mov %%gs:%c0, %%rsp" :: "i"(TCBRegs(10)));
+    asm("mov %%gs:%c0, %%rsp" :: "i"(R(10)));
     asm("ret");
   }
 };
 
 thread_local decltype(Syscall::dbgarg) Syscall::dbgarg;
-Proc Syscall::p0;
 
-static error initTcb() {
+static error initH() {
   auto size = 1024*128;
   auto stack = (uint8_t *)mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
   if (stack == MAP_FAILED) {
     return fmtErrorf("mmap syscall stack failed");
   }
 
-  static thread_local ThreadCB t0;
-  auto t = &t0;
-  t->fn[0] = (void *)Syscall::entry;
-  t->fn[1] = (void *)getfs;
-  t->stack = stack + size;
-  settcb(t);
+  auto t = new HostThread();
+  static thread_local HostRegs hr;
+
+  H.setr(&hr);
+  hr.fn[0] = (void *)Syscall::entry;
+  hr.fn[1] = (void *)Syscall::getfs;
+  hr.stack = stack + size;
+  hr.t = t;
 
   return nullptr;
 }
@@ -859,6 +871,13 @@ static __attribute__((naked)) void enterBin(void *entry, void *stack) {
 }
 
 static error runBin(const std::vector<std::string> &args) {
+  auto err = initH();
+  if (err) {
+    return err;
+  }
+
+  auto &proc = H.r()->t->p;
+
   auto filename = args[0];
   uint8_t *loadP = nullptr;
 
@@ -870,7 +889,7 @@ static error runBin(const std::vector<std::string> &args) {
   }
 
   ElfFile file;
-  auto err = file.open(filename);
+  err = file.open(filename);
   if (err) {
     return err;
   }
@@ -916,7 +935,7 @@ static error runBin(const std::vector<std::string> &args) {
         segP, seg.len, seg.off, seg.anon, seg.fill0);
     }
 
-    Syscall::p0.vm.add((uint64_t)segP, (uint64_t)segP+seg.len, {.prot = seg.prot, .fd = fd});
+    proc.vm.add((uint64_t)segP, (uint64_t)segP+seg.len, {.prot = seg.prot, .fd = fd});
   }
 
   auto entryP = loadP + file.eh()->e_entry - (*file.loads.begin())->p_vaddr;
@@ -990,12 +1009,7 @@ static error runBin(const std::vector<std::string> &args) {
   }
   memcpy(stackStart, v.data(), vsize);
 
-  Syscall::p0.vm.add((uint64_t)stackTop, (uint64_t)stackTop+stackSize, {.prot = PROT_READ|PROT_WRITE, .fd = -1});
-
-  err = initTcb();
-  if (err) {
-    return err;
-  }
+  proc.vm.add((uint64_t)stackTop, (uint64_t)stackTop+stackSize, {.prot = PROT_READ|PROT_WRITE, .fd = -1});
 
   enterBin(entryP, stackStart);
   __builtin_unreachable();
