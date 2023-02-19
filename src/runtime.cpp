@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cstdio>
 #include <map>
 #include <functional>
@@ -117,31 +118,56 @@ struct VMAs {
   };
 
   std::map<int, VMA> m;
-  using MIter = decltype(m.end());
 
-  std::vector<VMA> all() {
-    std::vector<VMA> a;
-    for (auto i = m.begin(); i != m.end(); i++) {
-      a.push_back(i->second);
+  using Node = decltype(m.end());
+  using Nodes = std::vector<Node>;
+
+  void dump(const Nodes &rs) {
+    for (auto r: rs) {
+      auto &a = r->second;
+      fmtPrintf("vma %s\n", a.str().c_str());
+    }
+  }
+
+  Nodes all() {
+    Nodes a;
+    for (auto r = m.begin(); r != m.end(); r++) {
+      a.push_back(r);
     }
     return a;
   }
 
-  std::vector<MIter> getrs(MIter si, MIter ei) {
-    std::vector<MIter> rs;
+  Nodes nodes(uint64_t &start, uint64_t &end) {
+    assert(start <= end);
+    start = sysPageFloor(start);
+    end = sysPageCeil(end);
+
+    auto si = m.lower_bound(start);
+    auto ei = m.lower_bound(end);
+
+    if (si != m.begin()) {
+      si--;
+    }
+    if (ei != m.end()) {
+      ei++;
+    }
+
+    Nodes rs;
     for (auto i = si; i != m.end(); i++) {
       rs.push_back(i);
       if (i == ei) {
         break;
       }
     }
+
+    split(rs, start);
+    split(rs, end);
+
     return rs;
   }
 
-  void remove0(MIter si, MIter ei, uint64_t start, uint64_t end) {
-    auto rs = getrs(si, ei);
-
-    auto split = [&](decltype(rs.begin()) ri, uint64_t p) {
+  void split(Nodes &rs, uint64_t p) {
+    for (auto ri = rs.begin(); ri < rs.end(); ri++) {
       auto &old = (*ri)->second;
       if (old.start < p && p < old.end) {
         auto newr = old;
@@ -149,22 +175,12 @@ struct VMAs {
         newr.end = p;
         rs.insert(ri, m.emplace(p, newr).first);
         old.start = p;
-      }
-    };
-
-    if (rs.size() > 0) {
-      split(rs.begin(), start);
-      split(rs.end()-1, end);
-    }
-
-    for (auto r: rs) {
-      if (start <= r->second.start && r->second.end <= end) {
-        m.erase(r);
+        return;
       }
     }
   }
 
-  void merge0(const std::vector<MIter> &rs) {
+  void merge0(const Nodes &rs) {
     auto p = rs[rs.size()-1];
     for (int i = rs.size()-2; i >= 0; i--) {
       auto li = rs[i];
@@ -179,58 +195,44 @@ struct VMAs {
     }
   }
 
-  void align(uint64_t &start, uint64_t &end) {
-    assert(start <= end);
-    start = sysPageFloor(start);
-    end = sysPageCeil(end);
+  void remove0(Nodes &rs, uint64_t start, uint64_t end) {
+    auto ri = rs.begin();
+    while (ri != rs.end()) {
+      auto r = *ri;
+      if (start <= r->second.start && r->second.end <= end) {
+        m.erase(r);
+        rs.erase(ri);
+      } else {
+        ri++;
+      }
+    }
   }
 
   void remove(uint64_t start, uint64_t end) {
-    align(start, end);
-    auto si = m.lower_bound(start);
-    auto ei = m.lower_bound(end);
-    remove0(si, ei, start, end);
+    auto rs = nodes(start, end);
+    remove0(rs, start, end);
   }
 
   void updateProt(uint64_t start, uint64_t end, int prot) {
-    align(start, end);
-    auto si = m.lower_bound(start);
-    auto ei = m.lower_bound(end);
-
-    if (si != m.begin()) {
-      si--;
-    }
-    if (ei != m.end()) {
-      ei++;
-    }
-
-    auto rs = getrs(si, ei);
-    for (auto r0: rs) {
-      auto &r = r0->second;
-      if (start <= r.start && r.end <= end) {
-        r.prot = prot;
+    auto rs = nodes(start, end);
+    for (auto r: rs) {
+      if (start <= r->second.start && r->second.end <= end) {
+        r->second.prot = prot;
       }
     }
     merge0(rs);
   }
 
   void add(uint64_t start, uint64_t end, VMA a) {
-    align(start, end);
-    auto si = m.lower_bound(start);
-    auto ei = m.lower_bound(end);
-    remove0(si, ei, start, end);
-
+    auto rs = nodes(start, end);
+    remove0(rs, start, end);
     a.start = start;
     a.end = end;
-    m.emplace(end, a);
-
-    if (si != m.begin()) {
-      si--;
-    }
-    if (ei != m.end()) {
-      ei++;
-    }
-    merge0(getrs(si, ei));
+    rs.push_back(m.emplace(end, a).first);
+    std::sort(rs.begin(), rs.end(), [](auto l, auto r) {
+      return l->second.end < r->second.end;
+    });
+    merge0(rs);
   }
 };
 
@@ -249,10 +251,18 @@ struct Proc {
   uint64_t brk(uint64_t addr) {
     if (addr == 0) {
       return brkEnd;
-    } else {
-      brkEnd = addr;
-      return addr;
     }
+
+    int len = addr - brkEnd;
+    int prot = PROT_READ|PROT_WRITE;
+    auto p = ::mmap((void *)brkEnd, len, prot, MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0);
+    if (p == MAP_FAILED) {
+      return -1;
+    }
+    vm.add(brkEnd, brkEnd+len, {.prot = prot, .fd = -1});
+
+    brkEnd = addr;
+    return addr;
   }
 
   void close(int fd) {
@@ -319,10 +329,8 @@ struct Proc {
   }
 
   void fork() {
-    for (auto &a: vm.all()) {
-      if (debug) {
-        fmtPrintf("vma %s\n", a.str().c_str());
-      }
+    if (debug) {
+      vm.dump(vm.all());
     }
     asm("int3");
   }
@@ -330,10 +338,7 @@ struct Proc {
 
 struct HostThread {
   std::vector<Proc> ps = {{}};
-  Proc &p;
-
-  HostThread(): p(ps[0]) {
-  }
+  Proc &p = ps[0];
 };
 
 struct Syscall {
@@ -1083,7 +1088,7 @@ static error runBin(const std::vector<std::string> &args) {
   aux(AT_RANDOM, (size_t)random);
   aux(0, 0);
 
-  auto stackSize = 1024*128;
+  auto stackSize = 1024*64;
   auto stackTop = (uint8_t *)mmap(NULL, stackSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
   if (stackTop == MAP_FAILED) {
     return fmtErrorf("mmap stack failed");
