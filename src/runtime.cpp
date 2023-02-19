@@ -6,7 +6,8 @@
 
 #include <algorithm>
 #include <cassert>
-#include <list>
+#include <cstdio>
+#include <map>
 #include <functional>
 #include <cstdint>
 #include <cstdint>
@@ -95,19 +96,131 @@ struct ProcFile {
   int hook;
 };
 
-struct VMRegion {
-  uint64_t start;
-  uint64_t len;
-  int prot;
-  int fd;
+struct VMAs {
+  struct VMA {
+    uint64_t start;
+    uint64_t end;
+    int prot;
+    int fd;
+
+    std::string str() {
+      std::string p = "";
+      if (prot & PROT_READ) {
+        p += "r";
+      } else {
+        p += "-";
+      }
+      if (prot & PROT_WRITE) {
+        p += "w";
+      } else {
+        p += "-";
+      }
+      if (prot & PROT_EXEC) {
+        p += "x";
+      } else {
+        p += "-";
+      }
+      return fmtSprintf("%lx-%lx %s %d", start, end, p.c_str(), fd);
+    }
+  };
+
+  std::map<int, VMA> m;
+  using MIter = decltype(m.end());
+
+  std::vector<VMA> all() {
+    std::vector<VMA> a;
+    for (auto i = m.begin(); i != m.end(); i++) {
+      a.push_back(i->second);
+    }
+    return a;
+  }
+
+  std::vector<MIter> getrs(MIter si, MIter ei) {
+    std::vector<MIter> rs;
+    for (auto i = si; i != m.end(); i++) {
+      rs.push_back(i);
+      if (i == ei) {
+        break;
+      }
+    }
+    return rs;
+  }
+
+  void remove0(MIter si, MIter ei, uint64_t start, uint64_t end) {
+    auto rs = getrs(si, ei);
+
+    auto split = [&](decltype(rs.begin()) ri, uint64_t p) {
+      auto &old = (*ri)->second;
+      if (old.start < p && p < old.end) {
+        auto newr = old;
+        newr.start = old.start;
+        newr.end = p;
+        rs.insert(ri, m.emplace(p, newr).first);
+        old.start = p;
+      }
+    };
+
+    if (rs.size() > 0) {
+      split(rs.begin(), start);
+      split(rs.end()-1, end);
+    }
+
+    for (auto r: rs) {
+      if (start <= r->second.start && r->second.end <= end) {
+        m.erase(r);
+      }
+    }
+  }
+
+  void align(uint64_t &start, uint64_t &end) {
+    assert(start <= end);
+    start = sysPageFloor(start);
+    end = sysPageCeil(end);
+  }
+
+  void remove(uint64_t start, uint64_t end) {
+    align(start, end);
+    auto si = m.lower_bound(start);
+    auto ei = m.lower_bound(end);
+    remove0(si, ei, start, end);
+  }
+
+  void add(uint64_t start, uint64_t end, VMA a) {
+    align(start, end);
+    auto si = m.lower_bound(start);
+    auto ei = m.lower_bound(end);
+    remove0(si, ei, start, end);
+
+    a.start = start;
+    a.end = end;
+    m.emplace(end, a);
+
+    if (si != m.begin()) {
+      si--;
+    }
+    if (ei != m.end()) {
+      ei++;
+    }
+    auto rs = getrs(si, ei);
+
+    auto p = rs[rs.size()-1];
+    for (int i = rs.size()-2; i >= 0; i--) {
+      if (rs[i]->second.end == p->second.start) {
+        p->second.start = rs[i]->second.start;
+        m.erase(rs[i]);
+      } else {
+        p = rs[i];
+      }
+    }
+  }
 };
 
 struct Proc {
   std::vector<ProcFile*> files;
-  std::vector<VMRegion> vms;
+  VMAs vm;
 
   struct Syscall {
-    uint64_t &r;
+    uint64_t &arg;
     const std::function<uint64_t()> &call;
   };
 
@@ -130,7 +243,7 @@ struct Proc {
     auto hook = fileHooks.find(filename);
     if (hook != -1) {
       hooked = true;
-      s.r = (uint64_t)fileHooks.e[hook].trname.c_str();
+      s.arg = (uint64_t)fileHooks.e[hook].trname.c_str();
     }
 
     int fd = s.call();
@@ -144,42 +257,8 @@ struct Proc {
     files[fd] = f;
 
     if (debug && hooked) {
-      fmtPrintf("fd %d opened with hook %s\n", fd, (void *)s.r);
+      fmtPrintf("fd %d opened with hook %s\n", fd, (void *)s.arg);
     }
-  }
-
-  void addVm(uint64_t addr, uint64_t len, int prot, int fd) {
-    removeVm(addr, len);
-
-    VMRegion vm;
-    vm.start = sysPageFloor(addr);
-    vm.len = sysPageCeil(len);
-    vm.prot = prot;
-    vm.fd = fd;
-    vms.push_back(vm);
-
-    std::sort(vms.begin(), vms.end(), [&](auto &l, auto &r) {
-      return l.start < r.start;
-    });
-
-    if (debug) {
-      fmtPrintf("add vm %lx-%lx %d\n", vm.start, vm.start+vm.len, vm.fd);
-    }
-  }
-
-  void removeVm(uint64_t addr, uint64_t len) {
-    addr = sysPageFloor(addr);
-    len = sysPageCeil(len);
-
-    auto find = [&](uint64_t addr) {
-      int i;
-      for (i = 0; i < vms.size(); i++) {
-        if (i >= vms[i].start) {
-          break;
-        }
-      }
-      return i;
-    };
   }
 
   void mmap(uint64_t addr, int len, int prot, int flags, int fd, uint64_t off, const Syscall &s) {
@@ -188,12 +267,12 @@ struct Proc {
       auto f = files[fd];
       if (f->hook != -1) {
         hooked = true;
-        s.r = fileHooks.e[f->hook].addr;
+        s.arg = fileHooks.e[f->hook].addr;
       }
     }
 
     if (debug && hooked) {
-      fmtPrintf("mmap fd %d hook addr %lx\n", fd, s.r);
+      fmtPrintf("mmap fd %d hook addr %lx\n", fd, s.arg);
     }
 
     auto raddr = (void *)s.call();
@@ -201,23 +280,18 @@ struct Proc {
       return;
     }
 
-    addVm((uint64_t)raddr, len, prot, fd);
+    vm.add((uint64_t)raddr, (uint64_t)raddr+len, {.prot = prot, .fd = fd});
   }
 
   void unmap(uint64_t addr, int len) {
-    for (auto m = vms.begin(); m < vms.end(); m++) {
-      if (m->start == addr) {
-        vms.erase(m);
-        auto vm = *m;
-        fmtPrintf("remove vm %lx-%lx %d\n", vm.start, vm.start+vm.len, vm.fd);
-        break;
-      }
-    }
+    vm.remove(addr, addr+len);
   }
 
   void fork() {
-    for (auto &vm: vms) {
-      fmtPrintf("all vm %lx-%lx %d\n", vm.start, vm.start+vm.len, vm.fd);
+    for (auto &a: vm.all()) {
+      if (debug) {
+        fmtPrintf("vma %s\n", a.str().c_str());
+      }
     }
     asm("int3");
   }
@@ -838,10 +912,11 @@ static error runBin(const std::vector<std::string> &args) {
     }
 
     if (debug) {
-      fmtPrintf("load %lx len %lx off %lx anon %d\n", segP, seg.len, seg.off, seg.anon);
+      fmtPrintf("load %lx len %lx off %lx anon %d fill0 %d\n", 
+        segP, seg.len, seg.off, seg.anon, seg.fill0);
     }
 
-    Syscall::p0.addVm((uint64_t)segP, seg.len, seg.prot, fd);
+    Syscall::p0.vm.add((uint64_t)segP, (uint64_t)segP+seg.len, {.prot = seg.prot, .fd = fd});
   }
 
   auto entryP = loadP + file.eh()->e_entry - (*file.loads.begin())->p_vaddr;
@@ -915,7 +990,7 @@ static error runBin(const std::vector<std::string> &args) {
   }
   memcpy(stackStart, v.data(), vsize);
 
-  Syscall::p0.addVm((uint64_t)stackTop, stackSize, PROT_READ|PROT_WRITE, -1);
+  Syscall::p0.vm.add((uint64_t)stackTop, (uint64_t)stackTop+stackSize, {.prot = PROT_READ|PROT_WRITE, .fd = -1});
 
   err = initTcb();
   if (err) {

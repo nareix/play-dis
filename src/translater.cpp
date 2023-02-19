@@ -1400,18 +1400,16 @@ void translate(const ElfFile &file, Result &res) {
 }
 
 error writeElfFile(const Result &res, const ElfFile &input, const std::string &output) {
-  unsigned align = 0x1000;
-
-  auto totSize = (input.buf.size() + align-1) & ~(align-1);
+  auto totSize = sysPageCeil(input.buf.size());
   auto l = input.loads[input.loads.size()-1];
-  auto lend = (l->p_vaddr + l->p_memsz + align-1) & ~(align-1);
+  auto lend = sysPageCeil(l->p_vaddr + l->p_memsz);
   if (lend > totSize) {
     totSize = lend;
   }
 
   auto codeVaddr = input.phX->p_vaddr;
   auto newPhsVaddr = totSize;
-  auto stubCodeVaddr = newPhsVaddr + align;
+  auto stubCodeVaddr = newPhsVaddr + sysPageSize;
   totSize = stubCodeVaddr + res.stubCode.size();
   auto newPhsOff = newPhsVaddr;
   auto stubCodeOff = stubCodeVaddr;
@@ -1494,7 +1492,7 @@ error writeElfFile(const Result &res, const ElfFile &input, const std::string &o
     .p_type = PT_LOAD, .p_flags = PF_R|PF_X,
     .p_offset = stubCodeOff, .p_vaddr = stubCodeVaddr, .p_paddr = stubCodeVaddr,
     .p_filesz = res.stubCode.size(), .p_memsz = res.stubCode.size(),
-    .p_align = align,
+    .p_align = sysPageSize,
   }});
   memcpy(filem + newPhsOff, phs.data(), newPhsSize);
 

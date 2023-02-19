@@ -87,6 +87,10 @@ static error parse(Slice buf, ElfFile &file) {
     return fmtErrorf("no load sec");
   }
 
+  std::sort(loads.begin(), loads.end(), [&](auto &l, auto &r) {
+    return l->p_vaddr < r->p_vaddr;
+  });
+
   Elf64_Phdr *phX = nullptr;
   auto iphX = std::find_if(loads.begin(), loads.end(), [](auto ph) {
     return ph->p_flags & PF_X;
@@ -142,15 +146,17 @@ std::vector<ElfFile::MmapSeg> ElfFile::mmapSegs() const {
       prot |= PROT_WRITE;
     }
 
-    segs.push_back(MmapSeg{
+    auto seg0 = MmapSeg{
       .start = vaddrStart,
       .len = mapSize,
       .off = fileOff,
       .prot = prot,
-    });
+    };
+    segs.push_back(seg0);
+    auto &seg = *(segs.end()-1);
 
     if (ph->p_memsz > ph->p_filesz && (ph->p_flags & PF_W)) {
-      segs[segs.size()-1].fill0 = sysPageSize - (mapSize & (sysPageSize-1));
+      seg.fill0 = sysPageSize - (mapSize & (sysPageSize-1));
 
       auto vaddrEndAlign = sysPageCeil(vaddrEnd);
       auto vaddrMemEnd = ph->p_vaddr + ph->p_memsz;
@@ -172,7 +178,6 @@ std::vector<ElfFile::MmapSeg> ElfFile::mmapSegs() const {
 
 error ElfFile::open(const std::string &filename) {
   File f;
-
   auto err = f.open(filename.c_str());
   if (err) {
     return err;

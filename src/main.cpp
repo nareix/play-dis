@@ -1,4 +1,6 @@
 #include <cstddef>
+#include <map>
+#include <sstream>
 #include <vector>
 #include <string>
 
@@ -26,6 +28,8 @@ static error runMain(int argc, char **argv) {
     return translater::cmdMain(args);
   } else if (action == "rt" || action == "runtime") {
     return runtime::cmdMain(args);
+  } else if (action == "play") {
+    return nullptr;
   }
 
   return fmtErrorf("invalid action");
