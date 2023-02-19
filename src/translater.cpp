@@ -1476,14 +1476,11 @@ error writeElfFile(const Result &res, const ElfFile &input, const std::string &o
     }
   }
 
-  int loadEnd = 0;
-  for (int i = 0; i < phs.size(); i++) {
-    if (phs[i].p_type == PT_LOAD) {
-      loadEnd = i;
-    }
-  }
+  auto at = std::find_if(phs.begin(), phs.end(), [](auto ph) {
+    return ph.p_type == PT_LOAD && ph.p_flags & PF_W;
+  });
 
-  phs.insert(phs.begin()+loadEnd+1, {{
+  phs.insert(at, {{
     .p_type = PT_LOAD, .p_flags = PF_R,
     .p_offset = newPhsOff, .p_vaddr = newPhsVaddr, .p_paddr = newPhsVaddr,
     .p_filesz = newPhsSize, .p_memsz = newPhsSize,

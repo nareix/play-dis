@@ -163,6 +163,21 @@ struct VMAs {
     }
   }
 
+  void merge0(const std::vector<MIter> &rs) {
+    auto p = rs[rs.size()-1];
+    for (int i = rs.size()-2; i >= 0; i--) {
+      auto li = rs[i];
+      auto &l = li->second;
+      auto &r = p->second;
+      if (l.end == r.start && l.fd == r.fd && l.prot == r.prot) {
+        r.start = l.start;
+        m.erase(li);
+      } else {
+        p = li;
+      }
+    }
+  }
+
   void align(uint64_t &start, uint64_t &end) {
     assert(start <= end);
     start = sysPageFloor(start);
@@ -174,6 +189,28 @@ struct VMAs {
     auto si = m.lower_bound(start);
     auto ei = m.lower_bound(end);
     remove0(si, ei, start, end);
+  }
+
+  void updateProt(uint64_t start, uint64_t end, int prot) {
+    align(start, end);
+    auto si = m.lower_bound(start);
+    auto ei = m.lower_bound(end);
+
+    if (si != m.begin()) {
+      si--;
+    }
+    if (ei != m.end()) {
+      ei++;
+    }
+
+    auto rs = getrs(si, ei);
+    for (auto r0: rs) {
+      auto &r = r0->second;
+      if (start <= r.start && r.end <= end) {
+        r.prot = prot;
+      }
+    }
+    merge0(rs);
   }
 
   void add(uint64_t start, uint64_t end, VMA a) {
@@ -192,17 +229,7 @@ struct VMAs {
     if (ei != m.end()) {
       ei++;
     }
-    auto rs = getrs(si, ei);
-
-    auto p = rs[rs.size()-1];
-    for (int i = rs.size()-2; i >= 0; i--) {
-      if (rs[i]->second.end == p->second.start) {
-        p->second.start = rs[i]->second.start;
-        m.erase(rs[i]);
-      } else {
-        p = rs[i];
-      }
-    }
+    merge0(getrs(si, ei));
   }
 };
 
@@ -322,8 +349,47 @@ struct Syscall {
     }
   }
 
+  std::string strflags(uint64_t m, const std::vector<std::pair<uint64_t,std::string>> &v) {
+    std::vector<std::string> sv;
+    for (auto &p: v) {
+      if (m & p.first) {
+        sv.push_back(p.second);
+        m &= ~p.first;
+      }
+    }
+    if (m || sv.size() == 0) {
+      sv.push_back(fmtSprintf("0x%x", m));
+    }
+    std::ostringstream c;
+    std::copy(sv.begin(), sv.end(), std::ostream_iterator<std::string>(c, "|"));
+    auto r = c.str();
+    r.resize(r.size()-1);
+    return r;
+  }
+
+  #define F(x) {x, #x}
+
+  std::string sprot(int v) {
+    return strflags(v, {F(PF_X), F(PF_R), F(PF_W)});
+  }
+
+  std::string smmapflags(int v) {
+    return strflags(v, {
+      F(MAP_FIXED),
+      F(MAP_ANONYMOUS),
+      F(MAP_SHARED),
+      F(MAP_PRIVATE),
+      F(MAP_POPULATE),
+      F(MAP_GROWSDOWN),
+      F(MAP_STACK),
+    });
+  }
+
+  #undef F
+
   #define A(k) if (debug) { arg(#k, k); }
   #define A0(k, v) if (debug) { arg(#k, v); }
+  #define AF(k, f) if (debug) { arg(#k, f(k)); }
 
   inline void ret(uint64_t r) {
     handled = true;
@@ -338,7 +404,7 @@ struct Syscall {
     ret(regs[0]);
     return regs[0];
   }
-  std::function<uint64_t()> syscallb = std::bind(&Syscall::syscall, this);
+  std::function<uint64_t()> syscall1 = std::bind(&Syscall::syscall, this);
 
   HostRegs *hr;
   HostThread *t = hr->t;
@@ -396,7 +462,7 @@ struct Syscall {
     A(flags);
     A(mode);
 
-     p.open(filename, {regs[2], syscallb});
+    p.open(filename, {regs[2], syscall1});
   }
 
   void mprotect() {
@@ -405,7 +471,9 @@ struct Syscall {
     auto prot = regs[3];
     A(start);
     A(len);
-    A(prot);
+    AF(prot, sprot);
+
+    p.vm.updateProt(start, start+len, prot);
   }
 
   void mmap() {
@@ -417,13 +485,13 @@ struct Syscall {
     auto off = regs[6];
     A(addr);
     A(len);
-    A(prot);
-    A(flags);
+    AF(prot, sprot);
+    AF(flags, smmapflags);
     A(fd);
     A(off);
     retfmt = X;
 
-    p.mmap(addr, len, prot, flags, fd, off, {regs[1], syscallb});
+    p.mmap(addr, len, prot, flags, fd, off, {regs[1], syscall1});
   }
 
   void munmap() {
@@ -516,7 +584,7 @@ struct Syscall {
     A(flags);
     A(mode);
 
-    p.open(filename, {regs[1], syscallb});
+    p.open(filename, {regs[1], syscall1});
   }
 
   void pread64() {
@@ -770,6 +838,7 @@ struct Syscall {
 
   #undef A
   #undef A0
+  #undef AF
 
   static bool handle0() {
     return Syscall{.hr = H.r()}.handle();
@@ -854,14 +923,14 @@ static error initH() {
     return fmtErrorf("mmap syscall stack failed");
   }
 
-  auto t = new HostThread();
+  static thread_local HostThread t;
   static thread_local HostRegs hr;
 
   H.setr(&hr);
   hr.fn[0] = (void *)Syscall::entry;
   hr.fn[1] = (void *)Syscall::getfs;
   hr.stack = stack + size;
-  hr.t = t;
+  hr.t = &t;
 
   return nullptr;
 }
@@ -876,7 +945,7 @@ static error runBin(const std::vector<std::string> &args) {
     return err;
   }
 
-  auto &proc = H.r()->t->p;
+  auto proc = H.r()->t->p;
 
   auto filename = args[0];
   uint8_t *loadP = nullptr;

@@ -38,9 +38,7 @@ static error runMain(int argc, char **argv) {
 int main(int argc, char **argv) {
   auto err = runMain(argc, argv);
   if (err) {
-    auto s = err.msg();
-    fputs(s.c_str(), stderr);
-    fputs("\n", stderr);
+    fprintf(stderr, "%s\n", err.msg().c_str());
     return -1;
   }
   return 0;
