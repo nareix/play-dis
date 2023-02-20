@@ -297,7 +297,8 @@ struct Proc {
 
     int len = addr - brkEnd;
     int prot = PROT_READ|PROT_WRITE;
-    auto p = ::mmap((void *)brkEnd, len, prot, MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0);
+    auto p = ::mmap((void *)brkEnd, len, prot,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     if (p == MAP_FAILED) {
       return -1;
     }
@@ -387,7 +388,7 @@ struct HostThread {
 };
 
 struct Syscall {
-  static thread_local std::vector<std::pair<std::string,std::string>> dbgarg;
+  static thread_local std::vector<std::pair<std::string, std::string>> dbgarg;
   enum { D, X } retfmt;
 
   void arg(const char *k, uint64_t v) {
@@ -410,7 +411,7 @@ struct Syscall {
     }
   }
 
-  std::string strflags(uint64_t m, const std::vector<std::pair<uint64_t,std::string>> &v) {
+  std::string strflags(uint64_t m, const std::vector<std::pair<uint64_t, std::string>> &v) {
     std::vector<std::string> sv;
     for (auto &p: v) {
       if (m & p.first) {
@@ -428,7 +429,7 @@ struct Syscall {
     return r;
   }
 
-  #define F(x) {x, #x}
+#define F(x) {x, #x}
 
   std::string sprot(int v) {
     return strflags(v, {
@@ -987,7 +988,8 @@ thread_local decltype(Syscall::dbgarg) Syscall::dbgarg;
 
 static error initH() {
   auto size = 1024*128;
-  auto stack = (uint8_t *)mmap(nullptr, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+  auto stack = (uint8_t *)mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (stack == MAP_FAILED) {
     return fmtErrorf("mmap syscall stack failed");
   }
@@ -1112,8 +1114,8 @@ static error runBin(const std::vector<std::string> &args) {
   // << stackEnd
 
   auto stackSize = 1024*64;
-  auto stackTop = (uint8_t *)mmap((void *)0, stackSize, PROT_READ|PROT_WRITE, 
-      MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+  auto stackTop = (uint8_t *)mmap((void *)0, stackSize, PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (stackTop == MAP_FAILED) {
     return fmtErrorf("mmap stack failed");
   }

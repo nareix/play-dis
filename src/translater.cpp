@@ -457,7 +457,7 @@ public:
     OpTypeNr,
   };
 
-  const char *OpTypeStrs(int op) {
+  const char *OpTypeStr(int op) {
     static const char *a[] = {
       "normal_op",
       "tls_stack_canary",
@@ -478,7 +478,7 @@ public:
     JmpTypeNr,
   };
 
-  const char *JmpTypeStrs(int op) {
+  const char *JmpTypeStr(int op) {
     static const char *a[] = {
       "no_jmp",
       "ignore_jmp",
@@ -529,15 +529,15 @@ public:
     return a + phX->p_vaddr; 
   };
 
-  struct DecodeRes2 {
+  struct DecodeRes {
     MCInst inst;
     Slice buf;
     OpcodeAndSize op;
     uint64_t size;
   };
 
-  DecodeRes2 decode2(AddrAndIdx i) {
-    DecodeRes2 r;
+  DecodeRes decodeInst2(AddrAndIdx i) {
+    DecodeRes r;
     r.op = allOpcode[i.idx];
     r.buf = {instBuf.data() + i.addr, (size_t)r.op.size};
     ad.decode(r.inst, r.size, r.buf);
@@ -630,8 +630,8 @@ public:
   std::unordered_map<size_t, int> instOccurMap;
 
   void printInst(AddrAndIdx ai, JmpRes jmp) {
-    auto r = decode2(ai);
-    std::string tag = JmpTypeStrs(jmp.type);
+    auto r = decodeInst2(ai);
+    std::string tag = JmpTypeStr(jmp.type);
 
     if (jmp.type == PushJmp) {
       tag += fmtSprintf(":%d", std::abs((int64_t)(jmp.r0.i.addr-ai.addr)));
@@ -647,7 +647,7 @@ public:
     std::string sep = " ";
     ss << fmtSprintf("%lx", vaddr(ai.addr)) <<
       sep << ad.instAllStr(r.inst, r.buf) <<
-      sep << OpTypeStrs(r.op.type) <<
+      sep << OpTypeStr(r.op.type) <<
       sep << tag << 
       "\n";
     fmtPrintf("%s", ss.str().c_str());
@@ -664,7 +664,7 @@ public:
 
     for (int i = 0; i < sortIdx.size(); i++) {
       auto p = instOccur[sortIdx[i]];
-      auto r = decode2(p.i);
+      auto r = decodeInst2(p.i);
       auto s = ad.instAllStr(r.inst, r.buf);
       fmtPrintf("instoccur %d %s %d\n", i, s.c_str(), p.n);
     }
@@ -765,7 +765,7 @@ public:
   // v = v + addr-stubAddr - (stubStart-loadStart)
 
   void emitOldTlsInst(AddrAndIdx i) {
-    auto r = decode2(i);
+    auto r = decodeInst2(i);
     auto inst1 = r.inst;
     auto size1 = r.size;
 
@@ -830,7 +830,7 @@ public:
       E.emit(MCInstBuilder(X86::CALL64m)
         .addReg(0).addImm(1).addReg(0).addImm(0).addReg(X86::GS)); // tcb.syscall
     } else {
-      auto r = decode2(i);
+      auto r = decodeInst2(i);
       emitAndFix(r.inst, i.addr+r.size);
     }
   };
@@ -987,7 +987,7 @@ public:
   };
 
   bool canReplaceIdx(AddrAndIdx i) {
-    return canReplaceInst(decode2(i).inst);
+    return canReplaceInst(decodeInst2(i).inst);
   };
 
   void markInstRangeUsed(AddrRange r) {
@@ -1170,7 +1170,6 @@ public:
     auto stubAddr = E.code.size();
     auto relocIdx = E.relocs.size();
     auto patchIdx = E.patches.size();
-    auto stype = JmpTypeStrs(jmp.type);
 
     switch (jmp.type) {
       case PushJmp: {
@@ -1214,11 +1213,10 @@ public:
       }
       for (int i = relocIdx; i < E.relocs.size(); i++) {
         auto r = E.relocs[i];
-        auto s = fmtReloc(r, i);
-        fmtPrintf("add %s\n", s.c_str());
+        fmtPrintf("add %s\n", fmtReloc(r, i).c_str());
       }
       auto D = [&](const std::string &s, Slice buf, uint64_t va) {
-        ad.dumpInstBuf(fmtSprintf("%s_%s", stype, s.c_str()), buf, va);
+        ad.dumpInstBuf(fmtSprintf("%s_%s", JmpTypeStr(jmp.type), s.c_str()), buf, va);
       };
       auto before = [&](const std::string &s, AddrRange r) {
         D(s + "_before", instBuf.slice(r.i.addr,r.size), vaddr(r.i.addr));
@@ -1424,10 +1422,10 @@ public:
     if (summary) {
       std::stringstream ss;
       for (int i = 0; i < OpTypeNr; i++) {
-        ss << OpTypeStrs(i) << " " << totOpType[i] << " ";
+        ss << OpTypeStr(i) << " " << totOpType[i] << " ";
       }
       for (int i = 1; i < JmpTypeNr; i++) {
-        ss << JmpTypeStrs(i) << " " << totJmpType[i] << " ";
+        ss << JmpTypeStr(i) << " " << totJmpType[i] << " ";
       }
       fmtPrintf("%s\n", ss.str().c_str());
     }
@@ -1463,10 +1461,9 @@ error writeElfFile(const Result &res, const ElfFile &input, const std::string &o
 
   auto oldPhs = (Elf64_Phdr *)(input.buf.data() + input.eh()->e_phoff);
   auto phs = std::vector<Elf64_Phdr>(oldPhs, oldPhs + input.eh()->e_phnum);
-  auto newPhsSize = (phs.size()+2)*sizeof(phs[0]);
+  auto newPhsSize = (phs.size() + 2) * sizeof(phs[0]);
 
   File f;
-
   auto err = f.create(output);
   if (err) {
     return err;
