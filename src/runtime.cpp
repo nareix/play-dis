@@ -1111,8 +1111,6 @@ static error runBin(const std::vector<std::string> &args) {
   // ... str values ...
   // << stackEnd
 
-  std::vector<size_t> v;
-
   auto stackSize = 1024*64;
   auto stackTop = (uint8_t *)mmap((void *)0, stackSize, PROT_READ|PROT_WRITE, 
       MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
@@ -1120,10 +1118,12 @@ static error runBin(const std::vector<std::string> &args) {
     return fmtErrorf("mmap stack failed");
   }
   auto stackEnd = stackTop + stackSize;
-
-  proc.vm.add((uint64_t)stackTop, (uint64_t)stackEnd, {.prot = PROT_READ|PROT_WRITE, .fd = -1, .tag = "stack"});
   auto auxEnd = stackEnd;
 
+  proc.vm.add((uint64_t)stackTop, (uint64_t)stackEnd,
+              {.prot = PROT_READ | PROT_WRITE, .fd = -1, .tag = "stack"});
+
+  std::vector<size_t> v;
   auto auxb = [&](uint8_t *b, int n) {
     auxEnd -= n;
     if (auxEnd >= stackTop) {
@@ -1133,6 +1133,10 @@ static error runBin(const std::vector<std::string> &args) {
   };
   auto auxs = [&](const char *s) {
     return auxb((uint8_t *)s, strlen(s)+1);
+  };
+  auto aux = [&](size_t k, size_t val) {
+    v.push_back(k);
+    v.push_back(val);
   };
 
   // argc argv
@@ -1153,10 +1157,6 @@ static error runBin(const std::vector<std::string> &args) {
   random[1] = std::rand();
 
   // aux
-  auto aux = [&](size_t k, size_t val) {
-    v.push_back(k);
-    v.push_back(val);
-  };
   aux(AT_HWCAP, 0x178bfbff);
   aux(AT_HWCAP2, 0x2);
   aux(AT_PAGESZ, sysPageSize);
@@ -1176,12 +1176,12 @@ static error runBin(const std::vector<std::string> &args) {
   aux(AT_RANDOM, auxb((uint8_t *)random, sizeof(random)));
   aux(0, 0);
 
-  auto vsize = v.size()*sizeof(v[0]);
-  auto stackStart = (void *)(uint64_t(auxEnd - vsize) & ~15);
+  auto auxSize = v.size() * sizeof(v[0]);
+  auto stackStart = (void *)(uint64_t(auxEnd - auxSize) & ~15);
   if (stackStart < stackTop) {
     return fmtErrorf("auxv too large");
   }
-  memcpy(stackStart, v.data(), vsize);
+  memcpy(stackStart, v.data(), auxSize);
 
   if (debug) {
     fmtPrintf("stack %lx-%lx start %lx\n", stackTop, stackEnd, stackStart);

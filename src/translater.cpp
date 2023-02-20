@@ -82,52 +82,52 @@ static bool forAll;
 static int forSingleInstr = -1;
 
 struct AsmDism {
-  MCTargetOptions MCOptions;
+  MCTargetOptions MO;
   const Target *T;
   std::unique_ptr<MCSubtargetInfo> STI;
   std::unique_ptr<MCRegisterInfo> MRI;
   std::unique_ptr<MCAsmInfo> MAI;
   std::unique_ptr<MCInstrInfo> MII;
-  SourceMgr SrcMgr;
-  std::unique_ptr<MCContext> Ctx;
+  SourceMgr SM;
+  std::unique_ptr<MCContext> C;
   std::unique_ptr<MCInstrInfo> MCII;
-  SmallString<128> STRSs;
-  raw_svector_ostream STROsv;
+  SmallString<128> Sb;
+  raw_svector_ostream Ss;
   MCInstPrinter *IP;
 
-  std::unique_ptr<MCStreamer> STR;
-  std::unique_ptr<MCCodeEmitter> CE;
+  std::unique_ptr<MCStreamer> S;
+  std::unique_ptr<MCCodeEmitter> E;
   std::unique_ptr<MCDisassembler> D;
 
-  AsmDism(): STROsv(STRSs) {
+  AsmDism(): Ss(Sb) {
     LLVMInitializeX86TargetInfo();
     LLVMInitializeX86TargetMC();
     LLVMInitializeX86AsmParser();
     LLVMInitializeX86Disassembler();
 
-    std::string tripleName = sys::getDefaultTargetTriple();
-    Triple TheTriple(Triple::normalize(tripleName));
+    std::string tname = sys::getDefaultTargetTriple();
+    Triple triple(Triple::normalize(tname));
     std::string err;
-    T = TargetRegistry::lookupTarget(tripleName, err);
-    STI.reset(T->createMCSubtargetInfo(tripleName, "", ""));
-    MRI.reset(T->createMCRegInfo(tripleName));
-    MAI.reset(T->createMCAsmInfo(*MRI, tripleName, MCOptions));
+    T = TargetRegistry::lookupTarget(tname, err);
+    STI.reset(T->createMCSubtargetInfo(tname, "", ""));
+    MRI.reset(T->createMCRegInfo(tname));
+    MAI.reset(T->createMCAsmInfo(*MRI, tname, MO));
     MII.reset(T->createMCInstrInfo());
-    Ctx.reset(new MCContext(TheTriple, MAI.get(), MRI.get(), STI.get(), &SrcMgr, &MCOptions));
+    C.reset(new MCContext(triple, MAI.get(), MRI.get(), STI.get(), &SM, &MO));
     MCII.reset(T->createMCInstrInfo());
-    IP = T->createMCInstPrinter(Triple(tripleName), 0, *MAI, *MCII, *MRI);
+    IP = T->createMCInstPrinter(triple, 0, *MAI, *MCII, *MRI);
 
-    STR.reset(T->createAsmStreamer(
-        *Ctx, 
-        std::make_unique<formatted_raw_ostream>(STROsv),
+    S.reset(T->createAsmStreamer(
+        *C, 
+        std::make_unique<formatted_raw_ostream>(Ss),
         /*asmverbose*/false, /*useDwarfDirectory*/false, 
         IP, 
-        std::unique_ptr<MCCodeEmitter>(T->createMCCodeEmitter(*MCII, *Ctx)),
-        std::unique_ptr<MCAsmBackend>(T->createMCAsmBackend(*STI, *MRI, MCOptions)),
+        std::unique_ptr<MCCodeEmitter>(T->createMCCodeEmitter(*MCII, *C)),
+        std::unique_ptr<MCAsmBackend>(T->createMCAsmBackend(*STI, *MRI, MO)),
         /*showinst*/true
     ));
-    CE.reset(T->createMCCodeEmitter(*MCII, *Ctx));
-    D.reset(T->createMCDisassembler(*STI, *Ctx));
+    E.reset(T->createMCCodeEmitter(*MCII, *C));
+    D.reset(T->createMCDisassembler(*STI, *C));
   }
 
   static constexpr uint16_t X86_BAD = X86::INSTRUCTION_LIST_END+1;
@@ -139,6 +139,12 @@ struct AsmDism {
     X86::R8, X86::R9, X86::R10, X86::R11,
     X86::R12, X86::R13, X86::R14, X86::R15,
   };
+
+  SmallVector<MCFixup, 4> fixups;
+
+  void encode(const MCInst &inst, raw_u8_ostream &vcode) {
+    E->encodeInstruction(inst, vcode, fixups, *STI);
+  }
 
   void decode(MCInst &inst, uint64_t &size, Slice buf) {
     auto r = D->getInstruction(inst, size, {buf.data(), buf.size()}, 0, nulls());
@@ -201,14 +207,14 @@ struct AsmDism {
   };
 
   std::string instDisStr(const MCInst &inst) {
-    STR->emitInstruction(inst, *STI);
-    auto r = STRSs.slice(1, STRSs.size()-1).str();
+    S->emitInstruction(inst, *STI);
+    auto r = Sb.slice(1, Sb.size()-1).str();
     for (int i = 0; i < r.size(); i++) {
       if (r[i] == '\t') {
         r[i] = ' ';
       }
     }
-    STRSs.clear();
+    Sb.clear();
     return r;
   }
 
@@ -666,21 +672,18 @@ public:
 
   class StubCE {
   public:
-    const decltype(ad.CE) &CE2;
-    const decltype(ad.STI) &STI;
+    AsmDism &ad;
     std::vector<uint8_t> code;
     raw_u8_ostream vcode;
-    SmallVector<MCFixup, 4> fixups;
     std::vector<Reloc> relocs;
     std::vector<uint8_t> patchCode;
     std::vector<Patch> patches;
 
-    StubCE(decltype(CE2) CE2, decltype(STI) STI): 
-      CE2(CE2), STI(STI), vcode(code) {
+    StubCE(AsmDism &ad): ad(ad), vcode(code) {
     }
 
     void emit(const MCInst &inst) {
-      CE2->encodeInstruction(inst, vcode, fixups, *STI);
+      ad.encode(inst, vcode);
     }
 
     void patch8(uint8_t v) {
@@ -1306,7 +1309,7 @@ public:
     eh(file.eh()),
     phX(file.phX),
     instBuf((uint8_t *)eh + phX->p_offset, phX->p_filesz),
-    E(ad.CE, ad.STI)
+    E(ad)
   {
   }
 
