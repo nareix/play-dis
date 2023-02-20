@@ -41,7 +41,6 @@ struct HostThread;
 struct HostRegs {
   void *fn[2];
   uint64_t regs[11];
-  uint64_t regs2[24];
   void *stack;
   HostThread *t;
   uint64_t fs;
@@ -51,7 +50,6 @@ struct Host {
   static __attribute__((naked)) void setr(HostRegs *t) {
     asm("endbr64; wrgsbase %rdi; ret");
   }
-
   static __attribute__((naked)) HostRegs *r() {
     asm("endbr64; rdgsbase %rax; ret");
   }
@@ -283,7 +281,6 @@ struct VMAs {
 
 struct Proc {
   uint64_t fs;
-  uint64_t gs;
   std::vector<ProcFile*> files;
   VMAs vm;
   uint64_t brkEnd;
@@ -369,7 +366,11 @@ struct Proc {
     vm.add((uint64_t)raddr, (uint64_t)raddr+len, {.prot = prot, .fd = fd});
   }
 
-  void unmap(uint64_t addr, int len) {
+  void unmap(uint64_t addr, int len, const std::function<uint64_t()> &call) {
+    if (call() == -1) {
+      return;
+    }
+
     vm.remove(addr, addr+len);
   }
 
@@ -494,12 +495,11 @@ struct Syscall {
       }
       C(ARCH_SET_GS) {
         A(addr);
-        p.gs = addr;
-        ret(0);
+        ret(-1);
         break;
       }
       C(ARCH_GET_GS) {
-        ret(p.gs);
+        ret(-1);
         break;
       }
       default: {
@@ -566,7 +566,7 @@ struct Syscall {
     A(addr);
     A(len);
 
-    p.unmap(addr, len);
+    p.unmap(addr, len, syscall1);
   }
 
   void madvise() {
@@ -987,7 +987,7 @@ thread_local decltype(Syscall::dbgarg) Syscall::dbgarg;
 
 static error initH() {
   auto size = 1024*128;
-  auto stack = (uint8_t *)mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+  auto stack = (uint8_t *)mmap(nullptr, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
   if (stack == MAP_FAILED) {
     return fmtErrorf("mmap syscall stack failed");
   }
@@ -1009,7 +1009,7 @@ static error initH() {
 }
 
 static __attribute__((naked)) void enterBin(void *entry, void *stack) {
-  // reset caller:  rdi(1) rsi(2) rdx(3) rcx(4) r8(5) r9(6) rax(ret) r10 r11
+  // reset caller: rdi rsi rdx rcx r8 r9 rax r10 r11
   // reset callee: r12 r13 r14 r15 rbx rsp rbp
   asm("xor %rdx, %rdx");
   asm("xor %rcx, %rcx");
@@ -1024,7 +1024,8 @@ static __attribute__((naked)) void enterBin(void *entry, void *stack) {
   asm("xor %r15, %r15");
   asm("xor %rbx, %rbx");
   asm("xor %rbp, %rbp");
-  asm("mov %rsi, %rsp; jmpq *%rdi");
+  asm("mov %rsi, %rsp");
+  asm("jmpq *%rdi");
 }
 
 static error runBin(const std::vector<std::string> &args) {
@@ -1055,16 +1056,14 @@ static error runBin(const std::vector<std::string> &args) {
   auto segn = segs[segs.size()-1];
   auto loadSize = segn.start + segn.len - segs[0].start;
 
-  {
-    auto p = (uint8_t *)mmap(loadP, loadSize, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS, file.f.fd, 0);
-    if (p == MAP_FAILED) {
-      return fmtErrorf("load failed");
-    }
-    if (loadP && p != loadP) {
-      return fmtErrorf("load failed");
-    }
-    loadP = p;
+  auto loadP0 = (uint8_t *)mmap(loadP, loadSize, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS, file.f.fd, 0);
+  if (loadP0 == MAP_FAILED) {
+    return fmtErrorf("load failed");
   }
+  if (loadP && loadP0 != loadP) {
+    return fmtErrorf("load failed");
+  }
+  loadP = loadP0;
 
   for (auto &seg: segs) {
     int flags;
@@ -1115,7 +1114,7 @@ static error runBin(const std::vector<std::string> &args) {
   std::vector<size_t> v;
 
   auto stackSize = 1024*64;
-  auto stackTop = (uint8_t *)mmap((void *)0x7ffdddd00000, stackSize, PROT_READ|PROT_WRITE, 
+  auto stackTop = (uint8_t *)mmap((void *)0, stackSize, PROT_READ|PROT_WRITE, 
       MAP_FIXED|MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
   if (stackTop == MAP_FAILED) {
     return fmtErrorf("mmap stack failed");
