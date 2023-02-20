@@ -457,14 +457,14 @@ public:
   std::string plt = ".plt";
 
   enum {
-    kNormalOp,
-    kTlsStackCanary,
-    kTlsOp,
-    kSyscall,
-    kOpTypeNr,
+    NormalOp,
+    TlsStackCanary,
+    TlsOp,
+    Syscall,
+    OpTypeNr,
   };
 
-  const char *kOpTypeStrs(int op) {
+  const char *OpTypeStrs(int op) {
     static const char *a[] = {
       "normal_op",
       "tls_stack_canary",
@@ -475,17 +475,17 @@ public:
   }
 
   enum {
-    kNoJmp,
-    kIgnoreJmp,
-    kDirectCall,
-    kPushJmp,
-    kPushJmp2,
-    kCombineJmp,
-    kJmpFail,
-    kJmpTypeNr,
+    NoJmp,
+    IgnoreJmp,
+    DirectCall,
+    PushJmp,
+    PushJmp2,
+    CombineJmp,
+    JmpFail,
+    JmpTypeNr,
   };
 
-  const char *kJmpTypeStrs(int op) {
+  const char *JmpTypeStrs(int op) {
     static const char *a[] = {
       "no_jmp",
       "ignore_jmp",
@@ -536,15 +536,15 @@ public:
     return a + phX->p_vaddr; 
   };
 
-  struct McDecode2Res {
+  struct DecodeRes2 {
     MCInst inst;
     Slice buf;
     OpcodeAndSize op;
     uint64_t size;
   };
 
-  McDecode2Res mcDecode2(AddrAndIdx i) {
-    McDecode2Res r;
+  DecodeRes2 decode2(AddrAndIdx i) {
+    DecodeRes2 r;
     r.op = allOpcode[i.idx];
     r.buf = {instBuf.data() + i.addr, (size_t)r.op.size};
     ad.decode(r.inst, r.size, r.buf);
@@ -583,25 +583,25 @@ public:
     ad.decode(inst, size, instBuf.slice(addr));
 
     if (inst.getOpcode() == ad.X86_BAD) {
-      return {.op = ad.X86_BAD, .size = 1, .type = kNormalOp};
+      return {.op = ad.X86_BAD, .size = 1, .type = NormalOp};
     }
 
     auto &idesc = ad.MII->get(inst.getOpcode());
-    unsigned type = kNormalOp;
+    unsigned type = NormalOp;
 
     if (inst.getOpcode() == X86::SYSCALL) {
-      type = kSyscall;
+      type = Syscall;
     } else {
       for (int i = 0; i < idesc.NumOperands; i++) {
         auto od = inst.getOperand(i);
         auto opinfo = idesc.OpInfo[i];
         if (opinfo.RegClass == X86::SEGMENT_REGRegClassID) {
           if (od.getReg() == X86::FS) {
-            type = kTlsOp;
+            type = TlsOp;
             if (i > 0) {
               auto preOp = inst.getOperand(i-1);
               if (preOp.isImm() && preOp.getImm() == 40) {
-                type = kTlsStackCanary;
+                type = TlsStackCanary;
               }
             }
             break;
@@ -613,7 +613,7 @@ public:
     return {
       .op = (uint16_t)inst.getOpcode(),
       .size = (uint8_t)size,
-      .used = type != kNormalOp,
+      .used = type != NormalOp,
       .type = type,
     };
   };
@@ -637,12 +637,12 @@ public:
   std::unordered_map<size_t, int> instOccurMap;
 
   void printInst(AddrAndIdx ai, JmpRes jmp) {
-    auto r = mcDecode2(ai);
-    std::string tag = kJmpTypeStrs(jmp.type);
+    auto r = decode2(ai);
+    std::string tag = JmpTypeStrs(jmp.type);
 
-    if (jmp.type == kPushJmp) {
+    if (jmp.type == PushJmp) {
       tag += fmtSprintf(":%d", std::abs((int64_t)(jmp.r0.i.addr-ai.addr)));
-    } else if (jmp.type == kCombineJmp) {
+    } else if (jmp.type == CombineJmp) {
       tag += fmtSprintf(":%d,%d", jmp.r0.size, jmp.r0.n);
     }
 
@@ -654,7 +654,7 @@ public:
     std::string sep = " ";
     ss << fmtSprintf("%lx", vaddr(ai.addr)) <<
       sep << ad.instAllStr(r.inst, r.buf) <<
-      sep << kOpTypeStrs(r.op.type) <<
+      sep << OpTypeStrs(r.op.type) <<
       sep << tag << 
       "\n";
     fmtPrintf("%s", ss.str().c_str());
@@ -671,7 +671,7 @@ public:
 
     for (int i = 0; i < sortIdx.size(); i++) {
       auto p = instOccur[sortIdx[i]];
-      auto r = mcDecode2(p.i);
+      auto r = decode2(p.i);
       auto s = ad.instAllStr(r.inst, r.buf);
       fmtPrintf("instoccur %d %s %d\n", i, s.c_str(), p.n);
     }
@@ -729,8 +729,8 @@ public:
   StubCE E;
 
   int rspFix = 0;
-  int totOpType[kOpTypeNr] = {};
-  int totJmpType[kJmpTypeNr] = {};
+  int totOpType[OpTypeNr] = {};
+  int totJmpType[JmpTypeNr] = {};
 
   void adjustRIPImm4(const MCInst &inst, const AsmDism::InstInfo &info, uint64_t addr) {
     bool isJmp = inst.getOpcode() == X86::JCC_4 || inst.getOpcode() == X86::JMP_4;
@@ -775,7 +775,7 @@ public:
   // v = v + addr-stubAddr - (stubStart-loadStart)
 
   void emitOldTlsInst(AddrAndIdx i) {
-    auto r = mcDecode2(i);
+    auto r = decode2(i);
     auto inst1 = r.inst;
     auto size1 = r.size;
 
@@ -834,13 +834,13 @@ public:
 
   void emitOldInst(AddrAndIdx i) {
     auto op = allOpcode[i.idx];
-    if (op.type == kTlsOp) {
+    if (op.type == TlsOp) {
       emitOldTlsInst(i);
-    } else if (op.type == kSyscall) {
+    } else if (op.type == Syscall) {
       E.emit(MCInstBuilder(X86::CALL64m)
         .addReg(0).addImm(1).addReg(0).addImm(0).addReg(X86::GS)); // tcb.syscall
     } else {
-      auto r = mcDecode2(i);
+      auto r = decode2(i);
       emitAndFix(r.inst, i.addr+r.size);
     }
   };
@@ -997,7 +997,7 @@ public:
   };
 
   bool canReplaceIdx(AddrAndIdx i) {
-    return canReplaceInst(mcDecode2(i).inst);
+    return canReplaceInst(decode2(i).inst);
   };
 
   void markInstRangeUsed(AddrRange r) {
@@ -1016,7 +1016,7 @@ public:
     auto op = allOpcode[i.idx];
 
     if (op.size < minSize) {
-      return {.type = kJmpFail};
+      return {.type = JmpFail};
     }
 
     AddrAndIdx j;
@@ -1036,11 +1036,11 @@ public:
       };
     }
 
-    return {.type = kJmpFail};
+    return {.type = JmpFail};
   };
 
   JmpRes checkCombineJmp(AddrAndIdx i0) {
-    JmpRes res = {.type = kJmpFail};
+    JmpRes res = {.type = JmpFail};
 
     uint64_t size = 0;
     auto addr = i0.addr;
@@ -1057,7 +1057,7 @@ public:
       size += op.size;
       if (size >= 5) {
         return {
-          .type = kCombineJmp,
+          .type = CombineJmp,
           .r0 = {
             .i = {
               .addr = addr,
@@ -1095,7 +1095,7 @@ public:
       addr += op.size;
       if (size >= 5) {
         return {
-          .type = kCombineJmp,
+          .type = CombineJmp,
           .r0 = {
             .i = i0,
             .n = i - i0.idx + 1,
@@ -1111,21 +1111,21 @@ public:
   JmpRes doReplace(AddrAndIdx i) {
     auto op = allOpcode[i.idx];
 
-    if (op.type == kNormalOp) {
-      return {.type = kNoJmp};
+    if (op.type == NormalOp) {
+      return {.type = NoJmp};
     }
 
     if (op.bad) {
-      return {.type = kIgnoreJmp};
+      return {.type = IgnoreJmp};
     }
 
     if (!canReplaceIdx(i)) {
-      return {.type = kJmpFail};
+      return {.type = JmpFail};
     }
 
     if (op.size >= 5) {
       return {
-        .type = kDirectCall,
+        .type = DirectCall,
         .r0 = singleAddrRange(i),
       };
     }
@@ -1133,21 +1133,21 @@ public:
     JmpRes res;
 
     res = checkCombineJmp(i);
-    if (res.type != kJmpFail) {
+    if (res.type != JmpFail) {
       return res;
     }
 
-    res = checkPushJmp(i, 3, kPushJmp);
-    if (res.type != kJmpFail) {
+    res = checkPushJmp(i, 3, PushJmp);
+    if (res.type != JmpFail) {
       return res;
     }
 
-    res = checkPushJmp(i, 2, kPushJmp2);
-    if (res.type != kJmpFail) {
+    res = checkPushJmp(i, 2, PushJmp2);
+    if (res.type != JmpFail) {
       return res;
     }
 
-    return {.type = kJmpFail};
+    return {.type = JmpFail};
   };
 
   void handleInst(AddrAndIdx i) {
@@ -1167,24 +1167,24 @@ public:
     auto stubAddr = E.code.size();
     auto relocIdx = E.relocs.size();
     auto patchIdx = E.patches.size();
-    auto stype = kJmpTypeStrs(jmp.type);
+    auto stype = JmpTypeStrs(jmp.type);
 
     switch (jmp.type) {
-      case kPushJmp: {
+      case PushJmp: {
         patchPushRspJmp(jmp.r0, stubAddr);
         patchPushFJmp(jmp.r1, jmp.r0);
         emitPushJmpStub(jmp.r0, jmp.r1, true);
         break;
       }
 
-      case kPushJmp2: {
+      case PushJmp2: {
         patchPushRspJmp(jmp.r0, stubAddr);
         patchShortJmp(jmp.r1, jmp.r0, 1);
         emitPushJmpStub(jmp.r0, jmp.r1, false);
         break;
       }
 
-      case kDirectCall: {
+      case DirectCall: {
         auto i = instOccurMap.find(instHash(jmp.r0.i));
         assert(i != instOccurMap.end());
         int oi = i->second;
@@ -1197,7 +1197,7 @@ public:
         break;
       }
 
-      case kCombineJmp: {
+      case CombineJmp: {
         patchLongJmp(jmp.r0, stubAddr);
         emitDirectJmpStub(jmp.r0);
         break;
@@ -1349,11 +1349,11 @@ public:
         allOpcode.push_back(op);
         addr += op.size;
 
-        if (op.type >= kTlsStackCanary) {
+        if (op.type >= TlsStackCanary) {
           fsInsts.push_back(ai);
         }
 
-        if (op.type != kNormalOp) {
+        if (op.type != NormalOp) {
           if (op.size >= 5) {
             auto h = instHash(ai);
             auto mi = instOccurMap.emplace(h, (int)instOccur.size());
@@ -1394,8 +1394,9 @@ public:
       for (int i = 0; i < badRanges.size(); i += 2) {
         auto start = badRanges[i];
         auto end = badRanges[i+1];
-        fmtPrintf("bad range %d addr %lx %lx len %lu n %d\n", i/2, vaddr(start.addr), vaddr(end.addr),
-          end.addr-start.addr, end.idx-start.idx);
+        fmtPrintf("bad range %d addr %lx %lx len %lu n %d\n", i / 2,
+                  vaddr(start.addr), vaddr(end.addr), end.addr - start.addr,
+                  end.idx - start.idx);
       }
     }
 
@@ -1419,11 +1420,11 @@ public:
 
     if (summary) {
       std::stringstream ss;
-      for (int i = 0; i < kOpTypeNr; i++) {
-        ss << kOpTypeStrs(i) << " " << totOpType[i] << " ";
+      for (int i = 0; i < OpTypeNr; i++) {
+        ss << OpTypeStrs(i) << " " << totOpType[i] << " ";
       }
-      for (int i = 1; i < kJmpTypeNr; i++) {
-        ss << kJmpTypeStrs(i) << " " << totJmpType[i] << " ";
+      for (int i = 1; i < JmpTypeNr; i++) {
+        ss << JmpTypeStrs(i) << " " << totJmpType[i] << " ";
       }
       fmtPrintf("%s\n", ss.str().c_str());
     }
@@ -1605,7 +1606,7 @@ error cmdMain(const std::vector<std::string> &args0) {
 
   if (gen) {
     auto addrStart = 0x00007ff000000000UL;
-    auto addrInc   = 0x0000000010000000UL; //4G
+    auto addrInc   = 0x0000000010000000UL;
     auto addr = addrStart;
     std::fstream faddr("addrs", std::fstream::out);
     std::fstream faddrGdb("addrs.gdb", std::fstream::out);
