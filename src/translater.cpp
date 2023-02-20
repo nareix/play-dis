@@ -1562,7 +1562,7 @@ error cmdMain(const std::vector<std::string> &args0) {
 
   if (gen) {
     auto addrStart = 0x00007ff000000000UL;
-    auto addrInc   = 0x0000000100000000UL; //4G
+    auto addrInc   = 0x0000000010000000UL; //4G
     auto addr = addrStart;
     std::fstream faddr("addrs", std::fstream::out);
     std::fstream faddrGdb("addrs.gdb", std::fstream::out);

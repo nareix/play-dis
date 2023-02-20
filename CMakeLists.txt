@@ -6,8 +6,6 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_compile_options("-fno-rtti")
 add_compile_options("-Wno-format-security")
-add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
-add_link_options(-fsanitize=address -fno-omit-frame-pointer)
 
 set(ZLIB_INCLUDE_DIR /usr/include)
 set(ZLIB_LIBRARY -lz)
@@ -30,8 +28,7 @@ set(LLVM_LINK_COMPONENTS
   Support 
 )
 
-add_executable(
-  s2
+set(SRCS
   src/translater.cpp
   src/runtime.cpp
   src/elf_file.cpp
@@ -39,5 +36,12 @@ add_executable(
   src/main.cpp
 )
 
+add_executable(s2 ${SRCS})
+add_executable(s2a ${SRCS})
+
 add_llvm_library(llvmdeps empty.cpp)
 target_link_libraries(s2 llvmdeps)
+target_link_libraries(s2a llvmdeps)
+
+target_compile_options(s2a PUBLIC -fsanitize=address -fno-omit-frame-pointer)
+target_link_options(s2a PUBLIC -fsanitize=address -fno-omit-frame-pointer)

@@ -41,6 +41,7 @@ struct HostThread;
 struct HostRegs {
   void *fn[2];
   uint64_t regs[11];
+  uint64_t regs2[24];
   void *stack;
   HostThread *t;
   uint64_t fs;
@@ -95,6 +96,7 @@ struct VMAs {
     uint64_t end;
     int prot;
     int fd;
+    const char *tag;
 
     std::string str() {
       std::string p = "";
@@ -113,7 +115,11 @@ struct VMAs {
       } else {
         p += "-";
       }
-      return fmtSprintf("%lx-%lx %sp %d", start, end, p.c_str(), fd);
+      auto s = fmtSprintf("%lx-%lx %sp %d", start, end, p.c_str(), fd);
+      if (tag) {
+        s += fmtSprintf(" %s", tag);
+      }
+      return s;
     }
   };
 
@@ -127,6 +133,45 @@ struct VMAs {
       auto &a = r->second;
       fmtPrintf("vma %s\n", a.str().c_str());
     }
+  }
+
+  bool inRange(const Nodes &rs, uint64_t p) {
+    return std::find_if(rs.begin(), rs.end(), [&](auto i) {
+      auto &r = i->second;
+      return r.start <= p && p <= r.end;
+    }) != rs.end();
+  }
+
+  void ptrScan() {
+    auto alls = all();
+    decltype(alls) heaps;
+    std::copy_if(alls.begin(), alls.end(), std::back_inserter(heaps), 
+      [](auto r) { 
+        auto m = PROT_WRITE|PROT_READ;
+        return (r->second.prot & m) == m; 
+      }
+    );
+
+    auto mask =   0xfffffff000000000UL;
+    auto prefix = 0x00007ff000000000UL;
+    auto n = 0;
+    auto n1 = 0;
+    for (auto &ri: heaps) {
+      auto &r = ri->second;
+      for (auto i = r.start; i < r.end; i += 8) {
+        auto p = *(uint64_t *)i;
+        if ((p & mask) == prefix) {
+          n++;
+          if (inRange(alls, p)) {
+            n1++;
+          } else {
+            fmtPrintf("ptr val 0x%lx vm %s p 0x%lx\n", p, r.str().c_str(), i);
+          }
+        }
+      }
+    }
+
+    fmtPrintf("ptrs %d %d\n", n, n1);
   }
 
   Nodes all() {
@@ -329,9 +374,8 @@ struct Proc {
   }
 
   void fork() {
-    if (debug) {
-      vm.dump(vm.all());
-    }
+    vm.ptrScan();
+
     asm("int3");
   }
 };
@@ -854,6 +898,8 @@ struct Syscall {
       fmtPrintf("\n");
       dbgarg.clear();
     }
+    
+    p.vm.ptrScan();
 
     return handled;
   }
@@ -914,7 +960,7 @@ struct Syscall {
 
   static __attribute__((naked)) void syscall0() {
     asm("endbr64");
-    // restore call regs
+    // restore caller regs
     asm("mov %%gs:%c0, %%rax" :: "i"(R(0)));
     asm("mov %%gs:%c0, %%rdi" :: "i"(R(1)));
     asm("mov %%gs:%c0, %%rsi" :: "i"(R(2)));
@@ -946,6 +992,10 @@ static error initH() {
     return fmtErrorf("mmap syscall stack failed");
   }
 
+  if (debug) {
+    fmtPrintf("syscall stack %lx-%lx\n", stack, stack+size);
+  }
+
   static thread_local HostThread t;
   static thread_local HostRegs hr;
 
@@ -959,6 +1009,21 @@ static error initH() {
 }
 
 static __attribute__((naked)) void enterBin(void *entry, void *stack) {
+  // reset caller:  rdi(1) rsi(2) rdx(3) rcx(4) r8(5) r9(6) rax(ret) r10 r11
+  // reset callee: r12 r13 r14 r15 rbx rsp rbp
+  asm("xor %rdx, %rdx");
+  asm("xor %rcx, %rcx");
+  asm("xor %r8, %r8");
+  asm("xor %r9, %r9");
+  asm("xor %rax, %rax");
+  asm("xor %r10, %r10");
+  asm("xor %r11, %r11");
+  asm("xor %r12, %r12");
+  asm("xor %r13, %r13");
+  asm("xor %r14, %r14");
+  asm("xor %r15, %r15");
+  asm("xor %rbx, %rbx");
+  asm("xor %rbp, %rbp");
   asm("mov %rsi, %rsp; jmpq *%rdi");
 }
 
@@ -991,7 +1056,7 @@ static error runBin(const std::vector<std::string> &args) {
   auto loadSize = segn.start + segn.len - segs[0].start;
 
   {
-    auto p = (uint8_t *)mmap(loadP, loadSize, PROT_NONE, MAP_PRIVATE, file.f.fd, 0);
+    auto p = (uint8_t *)mmap(loadP, loadSize, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS, file.f.fd, 0);
     if (p == MAP_FAILED) {
       return fmtErrorf("load failed");
     }
@@ -1043,14 +1108,36 @@ static error runBin(const std::vector<std::string> &args) {
   // 0
   // .. aux ..
   // 0 0
+  // << auxEnd
+  // ... str values ...
   // << stackEnd
 
   std::vector<size_t> v;
 
+  auto stackSize = 1024*64;
+  auto stackTop = (uint8_t *)mmap((void *)0x7ffdddd00000, stackSize, PROT_READ|PROT_WRITE, 
+      MAP_FIXED|MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+  if (stackTop == MAP_FAILED) {
+    return fmtErrorf("mmap stack failed");
+  }
+  auto stackEnd = stackTop + stackSize;
+
+  proc.vm.add((uint64_t)stackTop, (uint64_t)stackEnd, {.prot = PROT_READ|PROT_WRITE, .fd = -1, .tag = "stack"});
+  auto auxEnd = stackEnd;
+
+  auto auxb = [&](uint8_t *b, int n) {
+    auxEnd -= n;
+    memcpy(auxEnd, b, n);
+    return (size_t)auxEnd;
+  };
+  auto auxs = [&](const char *s) {
+    return auxb((uint8_t *)s, strlen(s)+1);
+  };
+
   // argc argv
   v.push_back(args.size());
   for (auto &s: args) {
-    v.push_back((size_t)s.c_str());
+    v.push_back(auxs(s.c_str()));
   }
   v.push_back(0);
 
@@ -1060,7 +1147,7 @@ static error runBin(const std::vector<std::string> &args) {
   auto eh = file.eh();
   uint8_t *phStart = loadP + eh->e_phoff;
 
-  static thread_local uint64_t random[2];
+  uint64_t random[2];
   random[0] = std::rand();
   random[1] = std::rand();
 
@@ -1083,26 +1170,21 @@ static error runBin(const std::vector<std::string> &args) {
   aux(AT_PHENT, (size_t)eh->e_phentsize);
   aux(AT_PHNUM, (size_t)eh->e_phnum);
   aux(AT_ENTRY, (size_t)entryP);
-  aux(AT_EXECFN, (size_t)filename.c_str());
-  aux(AT_PLATFORM, (size_t)"x86_64");
-  aux(AT_RANDOM, (size_t)random);
+  aux(AT_EXECFN, auxs(filename.c_str()));
+  aux(AT_PLATFORM, auxs("x86_64"));
+  aux(AT_RANDOM, auxb((uint8_t *)random, sizeof(random)));
   aux(0, 0);
 
-  auto stackSize = 1024*64;
-  auto stackTop = (uint8_t *)mmap(NULL, stackSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-  if (stackTop == MAP_FAILED) {
-    return fmtErrorf("mmap stack failed");
-  }
-  auto stackEnd = stackTop + stackSize;
-
   auto vsize = v.size()*sizeof(v[0]);
-  auto stackStart = (void *)(uint64_t(stackEnd - vsize) & ~15);
+  auto stackStart = (void *)(uint64_t(auxEnd - vsize) & ~15);
   if (stackStart < stackTop) {
     return fmtErrorf("auxv too large");
   }
   memcpy(stackStart, v.data(), vsize);
 
-  proc.vm.add((uint64_t)stackTop, (uint64_t)stackTop+stackSize, {.prot = PROT_READ|PROT_WRITE, .fd = -1});
+  if (debug) {
+    fmtPrintf("stack %lx-%lx start %lx\n", stackTop, stackEnd, stackStart);
+  }
 
   enterBin(entryP, stackStart);
   __builtin_unreachable();
