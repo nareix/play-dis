@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <iostream>
+#include <memory>
 #include <vector>
 #include <fstream>
 #include <filesystem>
@@ -93,95 +94,56 @@ static bool debugOnlyBefore;
 static bool forAll;
 static int forSingleInstr = -1;
 
-void translate(const ElfFile &file, Result &res) {
-  Elf64_Ehdr *eh = file.eh();
-
-  if (debug) {
-    fmtPrintf("filesize %lx e_ehsize %d e_phoff %lx size %d e_shoff %lx size %d\n",
-      file.buf.size(), eh->e_ehsize,
-      eh->e_phoff, eh->e_phentsize*eh->e_phnum,
-      eh->e_shoff, eh->e_shentsize*eh->e_shnum
-    );
-  }
-
-  auto phX = file.phX;
-
-  if (debug) {
-    fmtPrintf("load off %lx size %lx secs %d\n", phX->p_offset, phX->p_filesz, file.secs.size());
-  }
-
-  Slice instBuf((uint8_t *)eh + phX->p_offset, phX->p_filesz);
-  auto vaddr = [&](auto a) { return a + phX->p_vaddr; };
-
-  struct Section {
-    uint64_t start, end;
-    const std::string &name;
-    int startIdx, endIdx;
-  };
-  std::vector<Section> allSecs;
-  std::string plt = ".plt";
-
-  for (auto &s: file.secs) {
-    if (!(s.sh->sh_flags & SHF_EXECINSTR)) {
-      continue;
-    }
-    if (s.name.substr(0, plt.size()) == plt) {
-      continue;
-    }
-    uint64_t addr = s.sh->sh_offset - phX->p_offset;
-    uint64_t start = addr;
-    uint64_t end = addr + s.sh->sh_size;
-    if (debug) {
-      fmtPrintf("section %s %lx %lx\n", s.name.c_str(), vaddr(start), vaddr(end));
-    }
-    allSecs.push_back({.start = addr, .end = end, .name = s.name});
-  }
-
-  LLVMInitializeX86TargetInfo();
-  LLVMInitializeX86TargetMC();
-  LLVMInitializeX86AsmParser();
-  LLVMInitializeX86Disassembler();
-
+struct AsmDism {
   MCTargetOptions MCOptions;
-
-  std::string tripleName = sys::getDefaultTargetTriple();
-  Triple TheTriple(Triple::normalize(tripleName));
-  std::string Terr;
-  const Target *T = TargetRegistry::lookupTarget(tripleName, Terr);
-
-  std::unique_ptr<MCSubtargetInfo> STI(T->createMCSubtargetInfo(tripleName, "", ""));
-  std::unique_ptr<MCRegisterInfo> MRI(T->createMCRegInfo(tripleName));
-  std::unique_ptr<MCAsmInfo> MAI(T->createMCAsmInfo(*MRI, tripleName, MCOptions));
-  std::unique_ptr<MCInstrInfo> MII(T->createMCInstrInfo());
-
+  const Target *T;
+  std::unique_ptr<MCSubtargetInfo> STI;
+  std::unique_ptr<MCRegisterInfo> MRI;
+  std::unique_ptr<MCAsmInfo> MAI;
+  std::unique_ptr<MCInstrInfo> MII;
   SourceMgr SrcMgr;
-  MCContext Ctx(TheTriple, MAI.get(), MRI.get(), STI.get(), &SrcMgr, &MCOptions);
-
-  std::unique_ptr<MCInstrInfo> MCII(T->createMCInstrInfo());
-  std::unique_ptr<MCCodeEmitter> CE(T->createMCCodeEmitter(*MCII, Ctx));
-  std::unique_ptr<MCAsmBackend> MAB(T->createMCAsmBackend(*STI, *MRI, MCOptions));
-
+  std::unique_ptr<MCContext> Ctx;
+  std::unique_ptr<MCInstrInfo> MCII;
   SmallString<128> STRSs;
-  raw_svector_ostream STROsv(STRSs);
-  auto STROut = std::make_unique<formatted_raw_ostream>(STROsv);
-  auto IP = T->createMCInstPrinter(Triple(tripleName), 0, *MAI, *MCII, *MRI);
-  std::unique_ptr<MCStreamer> STR(
-      T->createAsmStreamer(Ctx, std::move(STROut), /*asmverbose*/false,
-                           /*useDwarfDirectory*/false, IP,
-                           std::move(CE), std::move(MAB), /*showinst*/true));
+  raw_svector_ostream STROsv;
+  MCInstPrinter *IP;
 
-  std::unique_ptr<MCCodeEmitter> CE2(T->createMCCodeEmitter(*MCII, Ctx));
-  std::unique_ptr<MCDisassembler> DisAsm(T->createMCDisassembler(*STI, Ctx));
+  std::unique_ptr<MCStreamer> STR;
+  std::unique_ptr<MCCodeEmitter> CE;
+  std::unique_ptr<MCDisassembler> D;
 
-  auto constexpr X86_BAD = X86::INSTRUCTION_LIST_END+1;
+  AsmDism(): STROsv(STRSs) {
+    LLVMInitializeX86TargetInfo();
+    LLVMInitializeX86TargetMC();
+    LLVMInitializeX86AsmParser();
+    LLVMInitializeX86Disassembler();
 
-  auto mcDecode = [&](MCInst &inst, uint64_t &size, Slice buf) {
-    auto r = DisAsm->getInstruction(inst, size, {buf.data(), buf.size()}, 0, nulls());
-    if (r != MCDisassembler::DecodeStatus::Success) {
-      inst.setOpcode(X86_BAD);
-      size = 1;
-    }
-  };
+    std::string tripleName = sys::getDefaultTargetTriple();
+    Triple TheTriple(Triple::normalize(tripleName));
+    std::string err;
+    T = TargetRegistry::lookupTarget(tripleName, err);
+    STI.reset(T->createMCSubtargetInfo(tripleName, "", ""));
+    MRI.reset(T->createMCRegInfo(tripleName));
+    MAI.reset(T->createMCAsmInfo(*MRI, tripleName, MCOptions));
+    MII.reset(T->createMCInstrInfo());
+    Ctx.reset(new MCContext(TheTriple, MAI.get(), MRI.get(), STI.get(), &SrcMgr, &MCOptions));
+    MCII.reset(T->createMCInstrInfo());
+    IP = T->createMCInstPrinter(Triple(tripleName), 0, *MAI, *MCII, *MRI);
+
+    STR.reset(T->createAsmStreamer(
+        *Ctx, 
+        std::make_unique<formatted_raw_ostream>(STROsv),
+        /*asmverbose*/false, /*useDwarfDirectory*/false, 
+        IP, 
+        std::unique_ptr<MCCodeEmitter>(T->createMCCodeEmitter(*MCII, *Ctx)),
+        std::unique_ptr<MCAsmBackend>(T->createMCAsmBackend(*STI, *MRI, MCOptions)),
+        /*showinst*/true
+    ));
+    CE.reset(T->createMCCodeEmitter(*MCII, *Ctx));
+    D.reset(T->createMCDisassembler(*STI, *Ctx));
+  }
+
+  static constexpr uint16_t X86_BAD = X86::INSTRUCTION_LIST_END+1;
 
   std::vector<unsigned> gpRegs = {
     // keep order
@@ -191,35 +153,43 @@ void translate(const ElfFile &file, Result &res) {
     X86::R12, X86::R13, X86::R14, X86::R15,
   };
 
-  auto gpRegIdx = [&](unsigned reg) -> int {
+  void decode(MCInst &inst, uint64_t &size, Slice buf) {
+    auto r = D->getInstruction(inst, size, {buf.data(), buf.size()}, 0, nulls());
+    if (r != MCDisassembler::DecodeStatus::Success) {
+      inst.setOpcode(X86_BAD);
+      size = 1;
+    }
+  }
+
+  int gpFreeStart = gpRegIdx(X86::RCX);
+  int gpRspIdx = gpRegIdx(X86::RSP);
+
+  int gpRegIdx(unsigned reg) {
     auto first = std::find(gpRegs.begin(), gpRegs.end(), reg);
     if (first == gpRegs.end()) {
       return -1;
     }
     return first - gpRegs.begin();
-  };
+  }
 
-  auto gpFreeStart = gpRegIdx(X86::RCX);
-  auto gpRspIdx = gpRegIdx(X86::RSP);
-
-  auto gpFindFreeReg = [&](unsigned mask) -> int {
+  int gpFindFreeReg(unsigned mask) {
     for (int i = gpFreeStart; i < gpRegs.size(); i++) {
       if (!(mask & (1<<i))) {
         return i;
       }
     }
     return -1;
-  };
+  }
 
-  auto superReg = [&](unsigned reg) -> unsigned {
+  unsigned superReg(unsigned reg) {
     auto super = reg;
     for (MCSuperRegIterator i(reg, MRI.get()); i.isValid(); ++i) {
       super = *i;
     }
     return super;
-  };
+  }
 
-  auto instHexStr = [&](Slice buf) -> std::string {
+  std::string instHexStr(Slice buf) {
     std::string hex = "[";
     for (int i = 0; i < buf.size(); i++) {
       hex += fmtSprintf("%.2X", buf[i]);
@@ -229,9 +199,21 @@ void translate(const ElfFile &file, Result &res) {
     }
     hex += "]";
     return hex;
+  }
+
+  void dumpInstBuf(const std::string &prefix, Slice buf, uint64_t va = 0) {
+    MCInst inst;
+    uint64_t size;
+    for (int addr = 0; addr < buf.size(); ) {
+      decode(inst, size, buf.slice(addr));
+      auto s = fmtSprintf("%lx", addr+va);
+      auto s2 = instAllStr(inst, buf.slice(addr, size));
+      fmtPrintf("%s %s %s\n", prefix.c_str(), s.c_str(), s2.c_str());
+      addr += size;
+    }
   };
 
-  auto instDisStr = [&](const MCInst &inst) -> std::string {
+  std::string instDisStr(const MCInst &inst) {
     STR->emitInstruction(inst, *STI);
     auto r = STRSs.slice(1, STRSs.size()-1).str();
     for (int i = 0; i < r.size(); i++) {
@@ -241,9 +223,9 @@ void translate(const ElfFile &file, Result &res) {
     }
     STRSs.clear();
     return r;
-  };
+  }
 
-  auto instDumpStr = [&](const MCInst &inst) -> std::string {
+  std::string instDumpStr(const MCInst &inst) {
     auto n = inst.getNumOperands();
     std::string s = std::string(IP->getOpcodeName(inst.getOpcode())) + 
         fmtSprintf("(%d),n=%d[", inst.getOpcode(), n);
@@ -260,9 +242,9 @@ void translate(const ElfFile &file, Result &res) {
     }
     s += "]";
     return s;
-  };
+  }
 
-  auto instAllStr = [&](const MCInst &inst, Slice buf = {}) -> std::string {
+  std::string instAllStr(const MCInst &inst, Slice buf = {}) {
     std::string s;
     if (inst.getOpcode() == X86_BAD) {
       s += "bad";
@@ -273,7 +255,14 @@ void translate(const ElfFile &file, Result &res) {
       s += " " + instHexStr(buf);
     }
     return s;
-  };
+  }
+
+  #define panicUnsupportedInstr(inst) {\
+    auto s0 = instAllStr(inst); \
+    fprintf(stderr, "%s:%d: unsupported instr %s\n", __FILE__, __LINE__, s0.c_str()); \
+    exit(-1); \
+    __builtin_unreachable(); \
+  }
 
   struct InstInfo {
     bool ok;
@@ -286,14 +275,7 @@ void translate(const ElfFile &file, Result &res) {
     int useReg;
   };
 
-  #define panicUnsupportedInstr(inst) {\
-    auto s0 = instAllStr(inst); \
-    fprintf(stderr, "%s:%d: unsupported instr %s\n", __FILE__, __LINE__, s0.c_str()); \
-    exit(-1); \
-    __builtin_unreachable(); \
-  }
-
-  auto getInstInfo = [&](const MCInst &inst, bool panic = true) -> InstInfo {
+  InstInfo getInstInfo(const MCInst &inst, bool panic = true) {
     auto n = inst.getNumOperands();
     InstInfo r = {
       .mIdx = -1,
@@ -409,7 +391,7 @@ void translate(const ElfFile &file, Result &res) {
     #undef C
   };
 
-  auto instUsedRegMask = [&](const MCInst &inst) -> unsigned {
+  unsigned instUsedRegMask(const MCInst &inst) {
     unsigned mask = 0;
     auto info = getInstInfo(inst);
 
@@ -452,7 +434,27 @@ void translate(const ElfFile &file, Result &res) {
     }
 
     return mask;
+  }
+};
+
+class Translater {
+public:
+  AsmDism &ad;
+  const ElfFile &file;
+  Result &res;
+
+  Elf64_Ehdr *eh;
+  Elf64_Phdr *phX;
+  Slice instBuf;
+
+  struct Section {
+    uint64_t start, end;
+    const std::string &name;
+    int startIdx, endIdx;
   };
+
+  std::vector<Section> allSecs;
+  std::string plt = ".plt";
 
   enum {
     kNormalOp,
@@ -462,12 +464,15 @@ void translate(const ElfFile &file, Result &res) {
     kOpTypeNr,
   };
 
-  const char *kOpTypeStrs[] = {
-    "normal_op",
-    "tls_stack_canary",
-    "tls_op",
-    "syscall",
-  };
+  const char *kOpTypeStrs(int op) {
+    static const char *a[] = {
+      "normal_op",
+      "tls_stack_canary",
+      "tls_op",
+      "syscall",
+    };
+    return a[op];
+  }
 
   enum {
     kNoJmp,
@@ -480,14 +485,17 @@ void translate(const ElfFile &file, Result &res) {
     kJmpTypeNr,
   };
 
-  const char *kJmpTypeStrs[] = {
-    "no_jmp",
-    "ignore_jmp",
-    "direct_call",
-    "push_jmp",
-    "push_jmp2",
-    "combine_jmp",
-    "jmp_fail",
+  const char *kJmpTypeStrs(int op) {
+    static const char *a[] = {
+      "no_jmp",
+      "ignore_jmp",
+      "direct_call",
+      "push_jmp",
+      "push_jmp2",
+      "combine_jmp",
+      "jmp_fail",
+    };
+    return a[op];
   };
 
   struct OpcodeAndSize {
@@ -499,6 +507,8 @@ void translate(const ElfFile &file, Result &res) {
     unsigned bad:1;
   } __attribute__((packed, aligned(4)));
   static_assert(sizeof(OpcodeAndSize) == 4, "");
+
+  std::vector<OpcodeAndSize> allOpcode;
 
   struct AddrAndIdx {
     uint64_t addr;
@@ -522,13 +532,9 @@ void translate(const ElfFile &file, Result &res) {
     const char *tag;
   };
 
-  auto logJmpFail = [&](uint64_t addr, const char *tag) {
-    if (debug) {
-      fmtPrintf("jmpfailat addr %lx %s\n", vaddr(addr), tag);
-    }
+  uint64_t vaddr(uint64_t a) { 
+    return a + phX->p_vaddr; 
   };
-
-  std::vector<OpcodeAndSize> allOpcode;
 
   struct McDecode2Res {
     MCInst inst;
@@ -537,27 +543,15 @@ void translate(const ElfFile &file, Result &res) {
     uint64_t size;
   };
 
-  auto mcDecode2 = [&](AddrAndIdx i) -> McDecode2Res {
+  McDecode2Res mcDecode2(AddrAndIdx i) {
     McDecode2Res r;
     r.op = allOpcode[i.idx];
     r.buf = {instBuf.data() + i.addr, (size_t)r.op.size};
-    mcDecode(r.inst, r.size, r.buf);
+    ad.decode(r.inst, r.size, r.buf);
     return r;
-  };
+  }
 
-  auto dismInstBuf = [&](const std::string &prefix, Slice buf, uint64_t va = 0) {
-    MCInst inst;
-    uint64_t size;
-    for (int addr = 0; addr < buf.size(); ) {
-      mcDecode(inst, size, buf.slice(addr));
-      auto s = fmtSprintf("%lx", addr+va);
-      auto s2 = instAllStr(inst, buf.slice(addr, size));
-      fmtPrintf("%s %s %s\n", prefix.c_str(), s.c_str(), s2.c_str());
-      addr += size;
-    }
-  };
-
-  auto forInstAround = [&](AddrAndIdx ai, int maxDist, std::function<int(AddrAndIdx i)> fn) -> bool {
+  bool forInstAround(AddrAndIdx ai, int maxDist, std::function<int(AddrAndIdx i)> fn) {
     auto addr = ai.addr;
     for (int i = ai.idx; i > 0 && ai.addr-addr < maxDist; i--) {
       if (i != ai.idx) {
@@ -581,18 +575,18 @@ void translate(const ElfFile &file, Result &res) {
       addr += allOpcode[i].size;
     }
     return false;
-  };
+  }
 
-  auto decodeInst = [&](uint64_t addr) -> OpcodeAndSize {
+  OpcodeAndSize decodeInst(uint64_t addr) {
     MCInst inst;
     uint64_t size;
-    mcDecode(inst, size, instBuf.slice(addr));
+    ad.decode(inst, size, instBuf.slice(addr));
 
-    if (inst.getOpcode() == X86_BAD) {
-      return {.op = X86_BAD, .size = 1, .type = kNormalOp};
+    if (inst.getOpcode() == ad.X86_BAD) {
+      return {.op = ad.X86_BAD, .size = 1, .type = kNormalOp};
     }
 
-    auto &idesc = MII->get(inst.getOpcode());
+    auto &idesc = ad.MII->get(inst.getOpcode());
     unsigned type = kNormalOp;
 
     if (inst.getOpcode() == X86::SYSCALL) {
@@ -630,7 +624,7 @@ void translate(const ElfFile &file, Result &res) {
 
   std::hash<std::string_view> strHash;
 
-  auto instHash = [&](AddrAndIdx i) -> size_t {
+  size_t instHash(AddrAndIdx i) {
     return strHash({(char *)instBuf.data()+i.addr, allOpcode[i.idx].size});
   };
 
@@ -642,94 +636,9 @@ void translate(const ElfFile &file, Result &res) {
   std::vector<OccurPair> instOccur;
   std::unordered_map<size_t, int> instOccurMap;
 
-  for (auto &sec: allSecs) {
-    sec.startIdx = allOpcode.size();
-    for (uint64_t addr = sec.start; addr < sec.end; ) {
-      auto op = decodeInst(addr);
-
-      auto idx = (int)allOpcode.size();
-
-      if (op.op == X86_BAD) {
-        if (badRanges.size() == 0 ||
-            addr - badRanges[badRanges.size()-1].addr > BadMaxDiff)
-        {
-          badRanges.push_back({addr, idx});
-          badRanges.push_back({addr+op.size, idx+1});
-        } else {
-          badRanges[badRanges.size()-1] = {addr+op.size, idx+1};
-        }
-      }
-
-      AddrAndIdx ai = {addr, idx};
-      allOpcode.push_back(op);
-      addr += op.size;
-
-      if (op.type >= kTlsStackCanary) {
-        fsInsts.push_back(ai);
-      }
-
-      if (op.type != kNormalOp) {
-        if (op.size >= 5) {
-          auto h = instHash(ai);
-          auto mi = instOccurMap.emplace(h, (int)instOccur.size());
-          int oi;
-          if (mi.second) {
-            oi = instOccur.size();
-            instOccur.push_back({});
-          } else {
-            oi = mi.first->second;
-          }
-          auto &p = instOccur[oi];
-          p.i = ai;
-          p.n++;
-        }
-      }
-    }
-    sec.endIdx = allOpcode.size();
-  }
-
-  if (debug) {
-    std::vector<int> sortIdx;
-    for (int i = 0; i < instOccur.size(); i++) {
-      sortIdx.push_back(i);
-    }
-    std::sort(sortIdx.begin(), sortIdx.end(), [&](auto &l, auto &r) {
-      return instOccur[l].n > instOccur[r].n;
-    });
-
-    for (int i = 0; i < sortIdx.size(); i++) {
-      auto p = instOccur[sortIdx[i]];
-      auto r = mcDecode2(p.i);
-      auto s = instAllStr(r.inst, r.buf);
-      fmtPrintf("instoccur %d %s %d\n", i, s.c_str(), p.n);
-    }
-   }
-
-  for (auto bi: badRanges) {
-    for (int i = 0; i < badRanges.size(); i += 2) {
-      for (int j = badRanges[i].idx; j < badRanges[i+1].idx; j++) {
-        allOpcode[j].bad = 1;
-      }
-    }
-    forInstAround(bi, BadMaxDiff, [&](AddrAndIdx i) -> int {
-      allOpcode[i.idx].bad = 1;
-      allOpcode[i.idx].used = 1;
-      return -1;
-    });
-  }
-
-  if (debug) {
-    for (int i = 0; i < badRanges.size(); i += 2) {
-      auto start = badRanges[i];
-      auto end = badRanges[i+1];
-      fmtPrintf("bad range %d addr %lx %lx len %lu n %d\n", i/2, vaddr(start.addr), vaddr(end.addr),
-        end.addr-start.addr, end.idx-start.idx);
-    }
-  }
-
-  auto printInst = [&](AddrAndIdx ai, JmpRes jmp) {
+  void printInst(AddrAndIdx ai, JmpRes jmp) {
     auto r = mcDecode2(ai);
-    std::string tag = kJmpTypeStrs[jmp.type];
+    std::string tag = kJmpTypeStrs(jmp.type);
 
     if (jmp.type == kPushJmp) {
       tag += fmtSprintf(":%d", std::abs((int64_t)(jmp.r0.i.addr-ai.addr)));
@@ -744,20 +653,34 @@ void translate(const ElfFile &file, Result &res) {
     std::stringstream ss;
     std::string sep = " ";
     ss << fmtSprintf("%lx", vaddr(ai.addr)) <<
-      sep << instAllStr(r.inst, r.buf) <<
-      sep << kOpTypeStrs[r.op.type] <<
+      sep << ad.instAllStr(r.inst, r.buf) <<
+      sep << kOpTypeStrs(r.op.type) <<
       sep << tag << 
       "\n";
     fmtPrintf("%s", ss.str().c_str());
   };
 
-  int totOpType[kOpTypeNr] = {};
-  int totJmpType[kJmpTypeNr] = {};
+  void debugInstOccur() {
+    std::vector<int> sortIdx;
+    for (int i = 0; i < instOccur.size(); i++) {
+      sortIdx.push_back(i);
+    }
+    std::sort(sortIdx.begin(), sortIdx.end(), [&](auto &l, auto &r) {
+      return instOccur[l].n > instOccur[r].n;
+    });
+
+    for (int i = 0; i < sortIdx.size(); i++) {
+      auto p = instOccur[sortIdx[i]];
+      auto r = mcDecode2(p.i);
+      auto s = ad.instAllStr(r.inst, r.buf);
+      fmtPrintf("instoccur %d %s %d\n", i, s.c_str(), p.n);
+    }
+  }
 
   class StubCE {
   public:
-    const decltype(CE2) &CE2;
-    const decltype(STI) &STI;
+    const decltype(ad.CE) &CE2;
+    const decltype(ad.STI) &STI;
     std::vector<uint8_t> code;
     raw_u8_ostream vcode;
     SmallVector<MCFixup, 4> fixups;
@@ -803,19 +726,13 @@ void translate(const ElfFile &file, Result &res) {
     }
   };
 
-  StubCE E(CE2, STI);
+  StubCE E;
 
-  // text jmp to stub (Add)
-  // v = v + stub - text
-  // v = v + (stubStart+stubAddr) - (loadStart+addr)
-  // v = v + stubAddr-addr + (stubStart-loadStart)
+  int rspFix = 0;
+  int totOpType[kOpTypeNr] = {};
+  int totJmpType[kJmpTypeNr] = {};
 
-  // stub jmp to text (Sub)
-  // v = v + text - stub
-  // v = v + (loadAddr+addr) - (stubStart+stubAddr)
-  // v = v + addr-stubAddr - (stubStart-loadStart)
-
-  auto adjustRIPImm4 = [&](const MCInst &inst, const InstInfo &info, uint64_t addr) {
+  void adjustRIPImm4(const MCInst &inst, const AsmDism::InstInfo &info, uint64_t addr) {
     bool isJmp = inst.getOpcode() == X86::JCC_4 || inst.getOpcode() == X86::JMP_4;
     if (
       (inst.getOpcode() == X86::JCC_4 || inst.getOpcode() == X86::JMP_4) ||
@@ -828,10 +745,8 @@ void translate(const ElfFile &file, Result &res) {
     }
   };
 
-  int rspFix = 0;
-
-  auto emitAndFix = [&](const MCInst &inst, uint64_t addr) {
-    auto info = getInstInfo(inst);
+  void emitAndFix(const MCInst &inst, uint64_t addr) {
+    auto info = ad.getInstInfo(inst);
 
     if (info.hasRspM && rspFix) {
       E.emit(MCInstBuilder(X86::LEA64r)
@@ -847,7 +762,19 @@ void translate(const ElfFile &file, Result &res) {
     }
   };
 
-  auto emitOldTlsInst = [&](AddrAndIdx i) {
+  #define instAllStr ad.instAllStr
+
+  // text jmp to stub (Add)
+  // v = v + stub - text
+  // v = v + (stubStart+stubAddr) - (loadStart+addr)
+  // v = v + stubAddr-addr + (stubStart-loadStart)
+
+  // stub jmp to text (Sub)
+  // v = v + text - stub
+  // v = v + (loadAddr+addr) - (stubStart+stubAddr)
+  // v = v + addr-stubAddr - (stubStart-loadStart)
+
+  void emitOldTlsInst(AddrAndIdx i) {
     auto r = mcDecode2(i);
     auto inst1 = r.inst;
     auto size1 = r.size;
@@ -861,16 +788,16 @@ void translate(const ElfFile &file, Result &res) {
       inst1.op inst1.reg, (%tmp) // modified instr
       pop %tmp // recovery tmp
     */
-    auto info = getInstInfo(inst1);
+    auto info = ad.getInstInfo(inst1);
     if (info.mIdx == -1) {
       panicUnsupportedInstr(inst1);
     }
-    auto used = instUsedRegMask(inst1);
-    int ti = gpFindFreeReg(used);
+    auto used = ad.instUsedRegMask(inst1);
+    int ti = ad.gpFindFreeReg(used);
     if (ti == -1) {
       panicUnsupportedInstr(inst1);
     }
-    auto tmpReg = gpRegs[ti];
+    auto tmpReg = ad.gpRegs[ti];
 
     E.emit(MCInstBuilder(X86::PUSH64r).addReg(tmpReg));
     rspFix += 8;
@@ -905,7 +832,7 @@ void translate(const ElfFile &file, Result &res) {
     E.emit(MCInstBuilder(X86::POP64r).addReg(tmpReg));
   };
 
-  auto emitOldInst = [&](AddrAndIdx i) {
+  void emitOldInst(AddrAndIdx i) {
     auto op = allOpcode[i.idx];
     if (op.type == kTlsOp) {
       emitOldTlsInst(i);
@@ -918,7 +845,9 @@ void translate(const ElfFile &file, Result &res) {
     }
   };
 
-  auto emitOldInsts = [&](AddrRange r) {
+  #undef instAllStr
+
+  void emitOldInsts(AddrRange r) {
     auto addr = r.i.addr;
     for (auto i = r.i.idx; i < r.i.idx+r.n; i++) {
       emitOldInst({.addr = addr, .idx = i});
@@ -926,7 +855,7 @@ void translate(const ElfFile &file, Result &res) {
     }
   };
 
-  auto emitJmpBack = [&](AddrRange r) {
+  void emitJmpBack(AddrRange r) {
     E.emit(MCInstBuilder(X86::JMP_4).addImm(128));
     // v = text - stub (Sub)
     // v = addr-stubAddr - (stubStart-loadStart)
@@ -935,12 +864,12 @@ void translate(const ElfFile &file, Result &res) {
     E.relocs.push_back({(uint32_t)E.code.size()-4, (unsigned)SlotType::Stub, (unsigned)RelType::Sub});
   };
 
-  auto emitDirectJmpStub = [&](AddrRange r0) {
+  void emitDirectJmpStub(AddrRange r0) {
     emitOldInsts(r0);
     emitJmpBack(r0);
   };
 
-  auto emitDirectCallStub = [&](AddrRange r0) {
+  void emitDirectCallStub(AddrRange r0) {
     rspFix += 8;
     E.emit(MCInstBuilder(X86::ENDBR64));
     emitOldInsts(r0);
@@ -948,7 +877,7 @@ void translate(const ElfFile &file, Result &res) {
     rspFix -= 8;
   };
 
-  auto emitPushJmpStub = [&](AddrRange r0, AddrRange r1, bool pushF) {
+  void emitPushJmpStub(AddrRange r0, AddrRange r1, bool pushF) {
     // r0: push rsp; jmp 
     // r1: [pushq]; jmp
     /*
@@ -999,7 +928,7 @@ void translate(const ElfFile &file, Result &res) {
     emitJmpBack(r1);
   };
 
-  auto patch32Reloc = [&](uint64_t stubAddr) {
+  void patch32Reloc(uint64_t stubAddr) {
     auto p = E.patchCode.size();
     E.patchCode.resize(p+4);
     // v = stub - text (Add)
@@ -1008,7 +937,7 @@ void translate(const ElfFile &file, Result &res) {
     E.relocs.push_back({(uint32_t)E.patchAddr()-4, (unsigned)SlotType::Patch, (unsigned)RelType::Add});
   };
 
-  auto patchLongJmp = [&](AddrRange r0, uint64_t stubAddr, unsigned op = 0) {
+  void patchLongJmp(AddrRange r0, uint64_t stubAddr, unsigned op = 0) {
     E.patchStart(r0.i.addr);
     int n = r0.size;
     if (op) {
@@ -1021,7 +950,7 @@ void translate(const ElfFile &file, Result &res) {
     E.patchEnd();
   };
 
-  auto patchShortJmp = [&](AddrRange r0, AddrRange r1, int off1 = 0, unsigned op = 0) {
+  void patchShortJmp(AddrRange r0, AddrRange r1, int off1 = 0, unsigned op = 0) {
     E.patchStart(r0.i.addr);
     int n = r0.size;
     if (op) {
@@ -1034,15 +963,15 @@ void translate(const ElfFile &file, Result &res) {
     E.patchEnd();
   };
 
-  auto patchPushRspJmp = [&](AddrRange r0, uint64_t stubAddr) {
+  void patchPushRspJmp(AddrRange r0, uint64_t stubAddr) {
     patchLongJmp(r0, stubAddr, 0x54); // push %rsp
   };
 
-  auto patchPushFJmp = [&](AddrRange r0, AddrRange r1) {
+  void patchPushFJmp(AddrRange r0, AddrRange r1) {
     patchShortJmp(r0, r1, 1, 0x9c); // pushf; skip push %rsp
   };
 
-  auto patchCall = [&](AddrRange r0, int stubAddr) {
+  void patchCall(AddrRange r0, int stubAddr) {
     E.patchStart(r0.i.addr);
     E.patchn(0xf2, r0.size-5); // repne call
     E.patch8(0xe8);
@@ -1050,7 +979,7 @@ void translate(const ElfFile &file, Result &res) {
     E.patchEnd();
   };
 
-  auto singleAddrRange = [&](AddrAndIdx i) -> AddrRange {
+  AddrRange singleAddrRange(AddrAndIdx i) {
     AddrRange r;
     r.i = i;
     r.n = 1;
@@ -1058,26 +987,32 @@ void translate(const ElfFile &file, Result &res) {
     return r;
   };
 
-  auto canReplaceInst = [&](const MCInst &inst) -> bool {
+  bool canReplaceInst(const MCInst &inst) {
     auto op = inst.getOpcode();
     if (op == X86::JCC_1 || op == X86::JMP_1) {
       return false;
     }
-    auto info = getInstInfo(inst, false);
+    auto info = ad.getInstInfo(inst, false);
     return info.ok && !info.hasRspR;
   };
 
-  auto canReplaceIdx = [&](AddrAndIdx i) -> bool {
+  bool canReplaceIdx(AddrAndIdx i) {
     return canReplaceInst(mcDecode2(i).inst);
   };
 
-  auto markInstRangeUsed = [&](AddrRange r) {
+  void markInstRangeUsed(AddrRange r) {
     for (int i = r.i.idx; i < r.i.idx+r.n; i++) {
       allOpcode[i].used = 1;
     }
   };
 
-  auto checkPushJmp = [&](AddrAndIdx i, int minSize, int type) -> JmpRes {
+  void logJmpFail(uint64_t addr, const char *tag) {
+    if (debug) {
+      fmtPrintf("jmpfailat addr %lx %s\n", vaddr(addr), tag);
+    }
+  };
+
+  JmpRes checkPushJmp(AddrAndIdx i, int minSize, int type) {
     auto op = allOpcode[i.idx];
 
     if (op.size < minSize) {
@@ -1104,7 +1039,7 @@ void translate(const ElfFile &file, Result &res) {
     return {.type = kJmpFail};
   };
 
-  auto checkCombineJmp = [&](AddrAndIdx i0) -> JmpRes {
+  JmpRes checkCombineJmp(AddrAndIdx i0) {
     JmpRes res = {.type = kJmpFail};
 
     uint64_t size = 0;
@@ -1173,7 +1108,7 @@ void translate(const ElfFile &file, Result &res) {
     return res;
   };
 
-  auto doReplace = [&](AddrAndIdx i) -> JmpRes {
+  JmpRes doReplace(AddrAndIdx i) {
     auto op = allOpcode[i.idx];
 
     if (op.type == kNormalOp) {
@@ -1215,7 +1150,7 @@ void translate(const ElfFile &file, Result &res) {
     return {.type = kJmpFail};
   };
 
-  auto handleInst = [&](AddrAndIdx i) {
+  void handleInst(AddrAndIdx i) {
     auto op = allOpcode[i.idx];
 
     JmpRes jmp = doReplace(i);
@@ -1232,7 +1167,7 @@ void translate(const ElfFile &file, Result &res) {
     auto stubAddr = E.code.size();
     auto relocIdx = E.relocs.size();
     auto patchIdx = E.patches.size();
-    auto stype = kJmpTypeStrs[jmp.type];
+    auto stype = kJmpTypeStrs(jmp.type);
 
     switch (jmp.type) {
       case kPushJmp: {
@@ -1280,7 +1215,7 @@ void translate(const ElfFile &file, Result &res) {
         fmtPrintf("add %s\n", s.c_str());
       }
       auto D = [&](const std::string &s, Slice buf, uint64_t va) {
-        dismInstBuf(fmtSprintf("%s_%s", stype, s.c_str()), buf, va);
+        ad.dumpInstBuf(fmtSprintf("%s_%s", stype, s.c_str()), buf, va);
       };
       auto before = [&](const std::string &s, AddrRange r) {
         D(s + "_before", instBuf.slice(r.i.addr,r.size), vaddr(r.i.addr));
@@ -1305,7 +1240,7 @@ void translate(const ElfFile &file, Result &res) {
     }
   };
 
-  auto forAllInst0 = [&](std::function<void(AddrAndIdx,const Section&)> fn) {
+  void forAllInst0(std::function<void(AddrAndIdx,const Section&)> fn) {
     for (auto sec: allSecs) {
       uint64_t addr = sec.start;
       for (int i = sec.startIdx; i < sec.endIdx; i++) {
@@ -1315,13 +1250,13 @@ void translate(const ElfFile &file, Result &res) {
     }
   };
 
-  auto forAllInst = [&](std::function<void(AddrAndIdx)> fn) {
+  void forAllInst(std::function<void(AddrAndIdx)> fn) {
     forAllInst0([&](AddrAndIdx i, const Section& sec) {
       fn(i);
     });
   };
 
-  auto markAllJmp = [&]() {
+  void markAllJmp() {
     for (auto sec: allSecs) {
       std::vector<uint64_t> tos;
       uint64_t addr = sec.start;
@@ -1364,39 +1299,147 @@ void translate(const ElfFile &file, Result &res) {
     }
   };
 
-  markAllJmp();
+  Translater(AsmDism &ad, const ElfFile & file, Result &res): 
+    ad(ad),
+    file(file), 
+    res(res),
+    eh(file.eh()),
+    phX(file.phX),
+    instBuf((uint8_t *)eh + phX->p_offset, phX->p_filesz),
+    E(ad.CE, ad.STI)
+  {
+  }
 
-  if (forAll) {
-    forAllInst([&](AddrAndIdx i) {
-      handleInst(i);
-    });
-  } else if (forSingleInstr != -1) {
-    forAllInst([&](AddrAndIdx i) {
-      if (vaddr(i.addr) == forSingleInstr) {
+  void run() {
+    for (auto &s: file.secs) {
+      if (!(s.sh->sh_flags & SHF_EXECINSTR)) {
+        continue;
+      }
+      if (s.name.substr(0, plt.size()) == plt) {
+        continue;
+      }
+      uint64_t addr = s.sh->sh_offset - phX->p_offset;
+      uint64_t start = addr;
+      uint64_t end = addr + s.sh->sh_size;
+      if (debug) {
+        fmtPrintf("section %s %lx %lx\n", s.name.c_str(), vaddr(start), vaddr(end));
+      }
+      allSecs.push_back({.start = addr, .end = end, .name = s.name});
+    }
+
+    for (auto &sec: allSecs) {
+      sec.startIdx = allOpcode.size();
+      for (uint64_t addr = sec.start; addr < sec.end; ) {
+        auto op = decodeInst(addr);
+
+        auto idx = (int)allOpcode.size();
+
+        if (op.op == ad.X86_BAD) {
+          if (badRanges.size() == 0 ||
+              addr - badRanges[badRanges.size()-1].addr > BadMaxDiff)
+          {
+            badRanges.push_back({addr, idx});
+            badRanges.push_back({addr+op.size, idx+1});
+          } else {
+            badRanges[badRanges.size()-1] = {addr+op.size, idx+1};
+          }
+        }
+
+        AddrAndIdx ai = {addr, idx};
+        allOpcode.push_back(op);
+        addr += op.size;
+
+        if (op.type >= kTlsStackCanary) {
+          fsInsts.push_back(ai);
+        }
+
+        if (op.type != kNormalOp) {
+          if (op.size >= 5) {
+            auto h = instHash(ai);
+            auto mi = instOccurMap.emplace(h, (int)instOccur.size());
+            int oi;
+            if (mi.second) {
+              oi = instOccur.size();
+              instOccur.push_back({});
+            } else {
+              oi = mi.first->second;
+            }
+            auto &p = instOccur[oi];
+            p.i = ai;
+            p.n++;
+          }
+        }
+      }
+      sec.endIdx = allOpcode.size();
+    }
+
+    if (debug) {
+      debugInstOccur();
+    }
+
+    for (auto bi: badRanges) {
+      for (int i = 0; i < badRanges.size(); i += 2) {
+        for (int j = badRanges[i].idx; j < badRanges[i+1].idx; j++) {
+          allOpcode[j].bad = 1;
+        }
+      }
+      forInstAround(bi, BadMaxDiff, [&](AddrAndIdx i) -> int {
+        allOpcode[i.idx].bad = 1;
+        allOpcode[i.idx].used = 1;
+        return -1;
+      });
+    }
+
+    if (debug) {
+      for (int i = 0; i < badRanges.size(); i += 2) {
+        auto start = badRanges[i];
+        auto end = badRanges[i+1];
+        fmtPrintf("bad range %d addr %lx %lx len %lu n %d\n", i/2, vaddr(start.addr), vaddr(end.addr),
+          end.addr-start.addr, end.idx-start.idx);
+      }
+    }
+
+    markAllJmp();
+
+    if (forAll) {
+      forAllInst([&](AddrAndIdx i) {
+        handleInst(i);
+      });
+    } else if (forSingleInstr != -1) {
+      forAllInst([&](AddrAndIdx i) {
+        if (vaddr(i.addr) == forSingleInstr) {
+          handleInst(i);
+        }
+      });
+    } else {
+      for (auto i: fsInsts) {
         handleInst(i);
       }
-    });
-  } else {
-    for (auto i: fsInsts) {
-      handleInst(i);
     }
-  }
 
-  if (summary) {
-    std::stringstream ss;
-    for (int i = 0; i < kOpTypeNr; i++) {
-      ss << kOpTypeStrs[i] << " " << totOpType[i] << " ";
+    if (summary) {
+      std::stringstream ss;
+      for (int i = 0; i < kOpTypeNr; i++) {
+        ss << kOpTypeStrs(i) << " " << totOpType[i] << " ";
+      }
+      for (int i = 1; i < kJmpTypeNr; i++) {
+        ss << kJmpTypeStrs(i) << " " << totJmpType[i] << " ";
+      }
+      fmtPrintf("%s\n", ss.str().c_str());
     }
-    for (int i = 1; i < kJmpTypeNr; i++) {
-      ss << kJmpTypeStrs[i] << " " << totJmpType[i] << " ";
-    }
-    fmtPrintf("%s\n", ss.str().c_str());
-  }
 
-  res.relocs = std::move(E.relocs);
-  res.stubCode = std::move(E.code);
-  res.patches = std::move(E.patches);
-  res.patchCode = std::move(E.patchCode);
+    res.relocs = std::move(E.relocs);
+    res.stubCode = std::move(E.code);
+    res.patches = std::move(E.patches);
+    res.patchCode = std::move(E.patchCode);
+  }
+};
+
+static AsmDism AD;
+
+void translate(const ElfFile &file, Result &res) {
+  Translater t(AD, file, res);
+  t.run();
 }
 
 error writeElfFile(const Result &res, const ElfFile &input, const std::string &output) {

@@ -1115,7 +1115,7 @@ static error runBin(const std::vector<std::string> &args) {
 
   auto stackSize = 1024*64;
   auto stackTop = (uint8_t *)mmap((void *)0, stackSize, PROT_READ|PROT_WRITE, 
-      MAP_FIXED|MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+      MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
   if (stackTop == MAP_FAILED) {
     return fmtErrorf("mmap stack failed");
   }
