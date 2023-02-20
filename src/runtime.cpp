@@ -224,22 +224,25 @@ struct VMAs {
   }
 
   void merge0(const Nodes &rs) {
-    auto p = rs[rs.size()-1];
+    if (rs.size() < 2) {
+      return;
+    }
+    auto ri = rs[rs.size()-1];
     for (int i = rs.size()-2; i >= 0; i--) {
       auto li = rs[i];
       auto &l = li->second;
-      auto &r = p->second;
+      auto &r = ri->second;
       if (l.end == r.start && l.fd == r.fd && l.prot == r.prot) {
         r.start = l.start;
         m.erase(li);
       } else {
-        p = li;
+        ri = li;
       }
     }
   }
 
   void remove0(Nodes &rs, uint64_t start, uint64_t end) {
-    auto ri = rs.begin();
+   auto ri = rs.begin();
     while (ri != rs.end()) {
       auto r = *ri;
       if (start <= r->second.start && r->second.end <= end) {
@@ -249,6 +252,13 @@ struct VMAs {
         ri++;
       }
     }
+  }
+
+  void insert0(Nodes &rs, VMA a) {
+    rs.push_back(m.emplace(a.end, a).first);
+    std::sort(rs.begin(), rs.end(), [](auto l, auto r) {
+      return l->second.end < r->second.end;
+    });
   }
 
   void remove(uint64_t start, uint64_t end) {
@@ -271,10 +281,7 @@ struct VMAs {
     remove0(rs, start, end);
     a.start = start;
     a.end = end;
-    rs.push_back(m.emplace(end, a).first);
-    std::sort(rs.begin(), rs.end(), [](auto l, auto r) {
-      return l->second.end < r->second.end;
-    });
+    insert0(rs, a);
     merge0(rs);
   }
 };
@@ -1149,6 +1156,8 @@ static error runBin(const std::vector<std::string> &args) {
   v.push_back(0);
 
   // env
+  v.push_back(auxs("PATH=/usr/bin:/bin"));
+  v.push_back(auxs("PWD=/src"));
   v.push_back(0);
 
   auto eh = file.eh();
