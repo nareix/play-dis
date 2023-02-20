@@ -62,19 +62,6 @@ using namespace llvm;
 
 namespace translater {
 
-static std::string fmtReloc(Reloc r, int i, const ElfFile &file) {
-  uint64_t vaddr;
-  const char *vatype;
-  if (r.slot == (int)SlotType::Patch) {
-    vaddr = r.addr + file.phX->p_vaddr;
-    vatype = "patch";
-  } else {
-    vaddr = r.addr;
-    vatype = "stub";
-  }
-  return fmtSprintf("reloc_%d %s addr %lx rel %d", i, vatype, vaddr, r.rel);
-}
-
 class raw_u8_ostream : public raw_ostream {
   std::vector<uint8_t> &OS;
   void write_impl(const char *Ptr, size_t Size) override {
@@ -1150,6 +1137,19 @@ public:
     return {.type = JmpFail};
   };
 
+  std::string fmtReloc(Reloc r, int i) {
+    uint64_t vaddr;
+    const char *vatype;
+    if (r.slot == (int)SlotType::Patch) {
+      vaddr = r.addr + file.phX->p_vaddr;
+      vatype = "patch";
+    } else {
+      vaddr = r.addr;
+      vatype = "stub";
+    }
+    return fmtSprintf("reloc_%d %s addr %lx rel %d", i, vatype, vaddr, r.rel);
+  }
+
   void handleInst(AddrAndIdx i) {
     auto op = allOpcode[i.idx];
 
@@ -1211,7 +1211,7 @@ public:
       }
       for (int i = relocIdx; i < E.relocs.size(); i++) {
         auto r = E.relocs[i];
-        auto s = fmtReloc(r, i, file);
+        auto s = fmtReloc(r, i);
         fmtPrintf("add %s\n", s.c_str());
       }
       auto D = [&](const std::string &s, Slice buf, uint64_t va) {
@@ -1548,6 +1548,45 @@ error writeElfFile(const Result &res, const ElfFile &input, const std::string &o
   return nullptr;
 }
 
+error genAddrFiles(const std::vector<std::string> &args) {
+  auto addrStart = 0x00007ff000000000UL;
+  auto addrInc   = 0x0000000010000000UL;
+  auto addr = addrStart;
+  std::fstream faddr("addrs", std::fstream::out);
+  std::fstream faddrGdb("addrs.gdb", std::fstream::out);
+
+  for (auto &filename: args) {
+    ElfFile file;
+    auto err = file.open(filename);
+    if (err) {
+      return err;
+    }
+
+    auto basename = std::filesystem::path(filename).filename().string();
+    auto trname = "tr."+basename;
+    fmtPrintf("translate %s %s\n", basename.c_str(), trname.c_str());
+
+    Result res;
+    translate(file, res);
+    err = writeElfFile(res, file, trname);
+    if (err) {
+      return err;
+    }
+
+    faddr << basename <<  " " << trname << " 0x" << std::hex << addr << "\n";
+    faddrGdb << "add-symbol-file" << " " << trname;
+    for (auto i: file.secs) {
+      if (i.sh->sh_addr) {
+        faddrGdb << " -s " << i.name << " 0x" << std::hex << i.sh->sh_addr + addr;
+      }
+    }
+    faddrGdb << "\n";
+    addr += addrInc;
+  }
+
+  return nullptr;
+}
+
 error cmdMain(const std::vector<std::string> &args0) {
   std::vector<std::string> args;
   bool gen = false;
@@ -1605,42 +1644,7 @@ error cmdMain(const std::vector<std::string> &args0) {
   }
 
   if (gen) {
-    auto addrStart = 0x00007ff000000000UL;
-    auto addrInc   = 0x0000000010000000UL;
-    auto addr = addrStart;
-    std::fstream faddr("addrs", std::fstream::out);
-    std::fstream faddrGdb("addrs.gdb", std::fstream::out);
-
-    for (auto &filename: args) {
-      ElfFile file;
-      auto err = file.open(filename);
-      if (err) {
-        return err;
-      }
-
-      auto basename = std::filesystem::path(filename).filename().string();
-      auto trname = "tr."+basename;
-      fmtPrintf("translate %s %s\n", basename.c_str(), trname.c_str());
-
-      Result res;
-      translate(file, res);
-      err = writeElfFile(res, file, trname);
-      if (err) {
-        return err;
-      }
-
-      faddr << basename <<  " " << trname << " 0x" << std::hex << addr << "\n";
-      faddrGdb << "add-symbol-file" << " " << trname;
-      for (auto i: file.secs) {
-        if (i.sh->sh_addr) {
-          faddrGdb << " -s " << i.name << " 0x" << std::hex << i.sh->sh_addr + addr;
-        }
-      }
-      faddrGdb << "\n";
-      addr += addrInc;
-    }
-
-    return nullptr;
+    return genAddrFiles(args);
   }
 
   auto input0 = args[0];
