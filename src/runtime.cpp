@@ -1126,7 +1126,9 @@ static error runBin(const std::vector<std::string> &args) {
 
   auto auxb = [&](uint8_t *b, int n) {
     auxEnd -= n;
-    memcpy(auxEnd, b, n);
+    if (auxEnd >= stackTop) {
+      memcpy(auxEnd, b, n);
+    }
     return (size_t)auxEnd;
   };
   auto auxs = [&](const char *s) {
