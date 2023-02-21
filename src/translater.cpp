@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <ios>
 #include <iostream>
 #include <memory>
 #include <vector>
@@ -183,15 +184,11 @@ struct AsmDism {
   }
 
   std::string instHexStr(Slice buf) {
-    std::string hex = "[";
+    std::vector<std::string> v;
     for (int i = 0; i < buf.size(); i++) {
-      hex += fmtSprintf("%.2X", buf[i]);
-      if (i < buf.size()-1) {
-        hex += " ";
-      }
+      v.push_back(fmtSprintf("%.2X", buf[i]));
     }
-    hex += "]";
-    return hex;
+    return "[" + stringsJoin(v, " ") + "]";
   }
 
   void dumpInstBuf(const std::string &prefix, Slice buf, uint64_t va = 0) {
@@ -220,21 +217,18 @@ struct AsmDism {
 
   std::string instDumpStr(const MCInst &inst) {
     auto n = inst.getNumOperands();
-    std::string s = std::string(IP->getOpcodeName(inst.getOpcode())) + 
-        fmtSprintf("(%d),n=%d[", inst.getOpcode(), n);
+    std::vector<std::string> v;
     for (int i = 0; i < n; i++) {
       auto op = inst.getOperand(i);
       if (op.isReg()) {
-        s += fmtSprintf("r%d", op.getReg());
+        v.push_back(fmtSprintf("r%d", op.getReg()));
       } else if (op.isImm()) {
-        s += fmtSprintf("i%d", op.getImm());
-      }
-      if (i < n-1) {
-        s += ",";
+        v.push_back(fmtSprintf("i%d", op.getImm()));
       }
     }
-    s += "]";
-    return s;
+    return fmtSprintf("%s(%d),n=%d[%s]",
+                      IP->getOpcodeName(inst.getOpcode()).str().c_str(),
+                      inst.getOpcode(), n, stringsJoin(v, ",").c_str());
   }
 
   std::string instAllStr(const MCInst &inst, Slice buf = {}) {
@@ -1036,7 +1030,7 @@ public:
     auto addr = i0.addr;
     for (int i = i0.idx; i > 0; i--) {
       auto &op = allOpcode[i];
-      if (!canReplaceIdx({addr,i})) {
+      if (!canReplaceIdx({addr, i})) {
         logJmpFail(addr, "replace");
         break;
       }
@@ -1069,7 +1063,7 @@ public:
     addr = i0.addr;
     for (int i = i0.idx; i < allOpcode.size(); i++) {
       auto &op = allOpcode[i];
-      if (!canReplaceIdx({addr,i})) {
+      if (!canReplaceIdx({addr, i})) {
         logJmpFail(addr, "replace");
         break;
       }
@@ -1219,7 +1213,7 @@ public:
         ad.dumpInstBuf(fmtSprintf("%s_%s", JmpTypeStr(jmp.type), s.c_str()), buf, va);
       };
       auto before = [&](const std::string &s, AddrRange r) {
-        D(s + "_before", instBuf.slice(r.i.addr,r.size), vaddr(r.i.addr));
+        D(s + "_before", instBuf.slice(r.i.addr, r.size), vaddr(r.i.addr));
       };
       auto after = [&](const std::string &s, int i) {
         if (patchIdx + i < E.patches.size()) {

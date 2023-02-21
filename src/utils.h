@@ -5,6 +5,7 @@
 #include <functional>
 #include <string_view>
 #include <memory>
+#include <sstream>
 #include <sys/types.h>
 
 class Slice: public std::basic_string_view<uint8_t> {
@@ -49,6 +50,18 @@ template <typename... Types>
 static inline void fmtPrintf(const char *fmt, Types... args) {
   auto s = fmtSprintf(fmt, args...);
   fputs(s.c_str(), stdout);
+}
+
+static inline std::string stringsJoin(const std::vector<std::string> &sv,
+                                      const std::string &sep) {
+  std::ostringstream c;
+  std::copy(sv.begin(), sv.end(),
+            std::ostream_iterator<std::string>(c, sep.c_str()));
+  auto r = c.str();
+  if (r.size() > 0) {
+    r.resize(r.size() - 1);
+  }
+  return r;
 }
 
 class IError {

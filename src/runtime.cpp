@@ -145,7 +145,7 @@ struct VMAs {
     decltype(alls) heaps;
     std::copy_if(alls.begin(), alls.end(), std::back_inserter(heaps), 
       [](auto r) { 
-        auto m = PROT_WRITE|PROT_READ;
+        auto m = PROT_WRITE | PROT_READ;
         return (r->second.prot & m) == m; 
       }
     );
@@ -186,7 +186,7 @@ struct VMAs {
     end = sysPageCeil(end);
 
     auto si = m.lower_bound(start);
-    auto ei = m.lower_bound(end);
+    auto ei = m.upper_bound(end);
 
     if (si != m.begin()) {
       si--;
@@ -196,11 +196,8 @@ struct VMAs {
     }
 
     Nodes rs;
-    for (auto i = si; i != m.end(); i++) {
+    for (auto i = si; i != ei; i++) {
       rs.push_back(i);
-      if (i == ei) {
-        break;
-      }
     }
 
     split(rs, start);
@@ -303,16 +300,17 @@ struct Proc {
     }
 
     int len = addr - brkEnd;
-    int prot = PROT_READ|PROT_WRITE;
+    int prot = PROT_READ | PROT_WRITE;
     auto p = ::mmap((void *)brkEnd, len, prot,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     if (p == MAP_FAILED) {
       return -1;
     }
-    vm.add(brkEnd, brkEnd+len, {.prot = prot, .fd = -1});
 
+    vm.add(brkEnd, brkEnd+len, {.prot = prot, .fd = -1});
     brkEnd = addr;
-    return addr;
+
+    return brkEnd;
   }
 
   void close(int fd) {
@@ -429,11 +427,7 @@ struct Syscall {
     if (m || sv.size() == 0) {
       sv.push_back(fmtSprintf("0x%x", m));
     }
-    std::ostringstream c;
-    std::copy(sv.begin(), sv.end(), std::ostream_iterator<std::string>(c, "|"));
-    auto r = c.str();
-    r.resize(r.size()-1);
-    return r;
+    return stringsJoin(sv, "|");
   }
 
 #define F(x) {x, #x}
@@ -1096,8 +1090,8 @@ static error runBin(const std::vector<std::string> &args) {
     }
 
     if (debug) {
-      fmtPrintf("load %lx len %lx off %lx anon %d fill0 %d\n", 
-        segP, seg.len, seg.off, seg.anon, seg.fill0);
+      fmtPrintf("load %lx len %lx off %lx anon %d fill0 %d\n", segP, seg.len,
+                seg.off, seg.anon, seg.fill0);
     }
 
     proc.vm.add((uint64_t)segP, (uint64_t)segP+seg.len, {.prot = seg.prot, .fd = fd});
