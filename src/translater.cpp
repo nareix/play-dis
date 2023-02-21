@@ -521,7 +521,7 @@ public:
 
   uint64_t vaddr(uint64_t a) { 
     return a + phX->p_vaddr; 
-  };
+  }
 
   struct DecodeRes {
     MCInst inst;
@@ -609,7 +609,7 @@ public:
       .used = used,
       .type = type,
     };
-  };
+  }
 
   std::vector<AddrAndIdx> fsInsts;
   std::vector<AddrAndIdx> badRanges;
@@ -619,7 +619,7 @@ public:
 
   size_t instHash(AddrAndIdx i) {
     return strHash({(char *)instBuf.data()+i.addr, allOpcode[i.idx].size});
-  };
+  }
 
   struct OccurPair {
     AddrAndIdx i;
@@ -651,7 +651,7 @@ public:
       sep << tag << 
       "\n";
     fmtPrintf("%s", ss.str().c_str());
-  };
+  }
 
   void debugInstOccur() {
     std::vector<int> sortIdx;
@@ -750,7 +750,7 @@ public:
       E.emit(MCInstBuilder(X86::LEA64r)
         .addReg(X86::RSP).addReg(X86::RSP).addImm(1).addReg(0).addImm(rspFix).addReg(0));
     }
-  };
+  }
 
   #define instAllStr ad.instAllStr
 
@@ -820,7 +820,7 @@ public:
     E.emit(inst2);
 
     E.emit(MCInstBuilder(X86::POP64r).addReg(tmpReg));
-  };
+  }
 
   void emitOldInst(AddrAndIdx i) {
     auto op = allOpcode[i.idx];
@@ -833,7 +833,7 @@ public:
       auto r = decodeInst2(i);
       emitAndFix(r.inst, i.addr+r.size);
     }
-  };
+  }
 
   #undef instAllStr
 
@@ -843,7 +843,7 @@ public:
       emitOldInst({.addr = addr, .idx = i});
       addr += allOpcode[i].size;
     }
-  };
+  }
 
   void emitJmpBack(AddrRange r) {
     E.emit(MCInstBuilder(X86::JMP_4).addImm(128));
@@ -852,12 +852,12 @@ public:
     auto addr = r.i.addr+r.size;
     *(int32_t *)&E.code[E.code.size()-4] = int(addr) - int(E.code.size());
     E.relocs.push_back({(uint32_t)E.code.size()-4, (unsigned)SlotType::Stub, (unsigned)RelType::Sub});
-  };
+  }
 
   void emitDirectJmpStub(AddrRange r0) {
     emitOldInsts(r0);
     emitJmpBack(r0);
-  };
+  }
 
   void emitDirectCallStub(AddrRange r0) {
     rspFix += 8;
@@ -865,7 +865,7 @@ public:
     emitOldInsts(r0);
     E.emit(MCInstBuilder(X86::RET64));
     rspFix -= 8;
-  };
+  }
 
   void emitPushJmpStub(AddrRange r0, AddrRange r1, bool pushF) {
     // r0: push rsp; jmp 
@@ -916,7 +916,7 @@ public:
     recovery(pushF);
     emitOldInsts(r1);
     emitJmpBack(r1);
-  };
+  }
 
   void patch32Reloc(uint64_t stubAddr) {
     auto p = E.patchCode.size();
@@ -925,7 +925,7 @@ public:
     // v = stubAddr-addr + (stubStart-loadStart)
     *(int32_t *)&E.patchCode[p] = int(stubAddr) - int(E.patchAddr());
     E.relocs.push_back({(uint32_t)E.patchAddr()-4, (unsigned)SlotType::Patch, (unsigned)RelType::Add});
-  };
+  }
 
   void patchLongJmp(AddrRange r0, uint64_t stubAddr, unsigned op = 0) {
     E.patchStart(r0.i.addr);
@@ -938,7 +938,7 @@ public:
     E.patch8(0xe9);
     patch32Reloc(stubAddr);
     E.patchEnd();
-  };
+  }
 
   void patchShortJmp(AddrRange r0, AddrRange r1, int off1 = 0, unsigned op = 0) {
     E.patchStart(r0.i.addr);
@@ -951,15 +951,15 @@ public:
     E.patch8(0xeb);
     E.patch8(int(r1.i.addr + off1) - int(E.patchAddr() + 1));
     E.patchEnd();
-  };
+  }
 
   void patchPushRspJmp(AddrRange r0, uint64_t stubAddr) {
     patchLongJmp(r0, stubAddr, 0x54); // push %rsp
-  };
+  }
 
   void patchPushFJmp(AddrRange r0, AddrRange r1) {
     patchShortJmp(r0, r1, 1, 0x9c); // pushf; skip push %rsp
-  };
+  }
 
   void patchCall(AddrRange r0, int stubAddr) {
     E.patchStart(r0.i.addr);
@@ -967,7 +967,7 @@ public:
     E.patch8(0xe8);
     patch32Reloc(stubAddr);
     E.patchEnd();
-  };
+  }
 
   AddrRange singleAddrRange(AddrAndIdx i) {
     AddrRange r;
@@ -975,7 +975,7 @@ public:
     r.n = 1;
     r.size = allOpcode[r.i.idx].size;
     return r;
-  };
+  }
 
   bool canReplaceInst(const MCInst &inst) {
     auto op = inst.getOpcode();
@@ -984,23 +984,23 @@ public:
     }
     auto info = ad.getInstInfo(inst, false);
     return info.ok && !info.hasRspR;
-  };
+  }
 
   bool canReplaceIdx(AddrAndIdx i) {
     return canReplaceInst(decodeInst2(i).inst);
-  };
+  }
 
   void markInstRangeUsed(AddrRange r) {
     for (int i = r.i.idx; i < r.i.idx+r.n; i++) {
       allOpcode[i].used = 1;
     }
-  };
+  }
 
   void logJmpFail(uint64_t addr, const char *tag) {
     if (debug) {
       fmtPrintf("jmpfailat addr %lx %s\n", vaddr(addr), tag);
     }
-  };
+  }
 
   JmpRes checkPushJmp(AddrAndIdx i, int minSize, int type) {
     auto op = allOpcode[i.idx];
@@ -1027,7 +1027,7 @@ public:
     }
 
     return {.type = JmpFail};
-  };
+  }
 
   JmpRes checkCombineJmp(AddrAndIdx i0) {
     JmpRes res = {.type = JmpFail};
@@ -1096,7 +1096,7 @@ public:
     }
 
     return res;
-  };
+  }
 
   JmpRes doReplace(AddrAndIdx i) {
     auto op = allOpcode[i.idx];
@@ -1138,7 +1138,7 @@ public:
     }
 
     return {.type = JmpFail};
-  };
+  }
 
   std::string fmtReloc(Reloc r, int i) {
     uint64_t vaddr;
@@ -1239,7 +1239,7 @@ public:
         D("stub", E.codeSlice(stubAddr), stubAddr);
       }
     }
-  };
+  }
 
   void forAllInst0(std::function<void(AddrAndIdx,const Section&)> fn) {
     for (auto sec: allSecs) {
@@ -1249,13 +1249,13 @@ public:
         addr += allOpcode[i].size;
       }
     }
-  };
+  }
 
   void forAllInst(std::function<void(AddrAndIdx)> fn) {
     forAllInst0([&](AddrAndIdx i, const Section& sec) {
       fn(i);
     });
-  };
+  }
 
   void markAllJmp() {
     for (auto sec: allSecs) {
@@ -1298,7 +1298,7 @@ public:
         fmtPrintf("markjmp %d/%d\n", n, tos.size());
       }
     }
-  };
+  }
 
   Translater(AsmDism &ad, const ElfFile & file, Result &res): 
     ad(ad),
