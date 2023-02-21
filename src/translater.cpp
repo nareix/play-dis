@@ -564,43 +564,49 @@ public:
     return false;
   }
 
+  unsigned instType(const MCInst &inst) {
+    auto opcode = inst.getOpcode();
+
+    if (opcode == ad.X86_BAD) {
+      return NormalOp;
+    } 
+    if (opcode == X86::SYSCALL) {
+      return Syscall;
+    }
+
+    auto &idesc = ad.MII->get(opcode);
+    for (int i = 0; i < idesc.NumOperands; i++) {
+      auto od = inst.getOperand(i);
+      auto opinfo = idesc.OpInfo[i];
+      if (opinfo.RegClass == X86::SEGMENT_REGRegClassID) {
+        if (od.getReg() == X86::FS) {
+          unsigned type = TlsOp;
+          if (i > 0) {
+            auto preOp = inst.getOperand(i-1);
+            if (preOp.isImm() && preOp.getImm() == 40) {
+              type = TlsStackCanary;
+            }
+          }
+          return type;
+        }
+      }
+    }
+
+    return NormalOp;
+  }
+
   OpcodeAndSize decodeInst(uint64_t addr) {
     MCInst inst;
     uint64_t size;
     ad.decode(inst, size, instBuf.slice(addr));
 
-    if (inst.getOpcode() == ad.X86_BAD) {
-      return {.op = ad.X86_BAD, .size = 1, .type = NormalOp};
-    }
-
-    auto &idesc = ad.MII->get(inst.getOpcode());
-    unsigned type = NormalOp;
-
-    if (inst.getOpcode() == X86::SYSCALL) {
-      type = Syscall;
-    } else {
-      for (int i = 0; i < idesc.NumOperands; i++) {
-        auto od = inst.getOperand(i);
-        auto opinfo = idesc.OpInfo[i];
-        if (opinfo.RegClass == X86::SEGMENT_REGRegClassID) {
-          if (od.getReg() == X86::FS) {
-            type = TlsOp;
-            if (i > 0) {
-              auto preOp = inst.getOperand(i-1);
-              if (preOp.isImm() && preOp.getImm() == 40) {
-                type = TlsStackCanary;
-              }
-            }
-            break;
-          }
-        }
-      }
-    }
+    unsigned type = instType(inst);
+    unsigned used = type != NormalOp;
 
     return {
       .op = (uint16_t)inst.getOpcode(),
       .size = (uint8_t)size,
-      .used = type != NormalOp,
+      .used = used,
       .type = type,
     };
   };
