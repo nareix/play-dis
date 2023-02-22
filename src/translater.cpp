@@ -723,7 +723,6 @@ public:
   int totJmpType[JmpTypeNr] = {};
 
   void adjustRIPImm4(const MCInst &inst, const AsmDism::InstInfo &info, uint64_t addr) {
-    bool isJmp = inst.getOpcode() == X86::JCC_4 || inst.getOpcode() == X86::JMP_4;
     if (
       (inst.getOpcode() == X86::JCC_4 || inst.getOpcode() == X86::JMP_4) ||
       (info.mIdx != -1 && inst.getOperand(info.mIdx).getReg() == X86::RIP)
@@ -766,8 +765,8 @@ public:
 
   void emitOldTlsInst(AddrAndIdx i) {
     auto r = decodeInst2(i);
-    auto inst1 = r.inst;
-    auto size1 = r.size;
+    auto inst = r.inst;
+    auto size = r.size;
 
     /*
       push %tmp // save tmp
@@ -778,14 +777,14 @@ public:
       inst1.op inst1.reg, (%tmp) // modified instr
       pop %tmp // recovery tmp
     */
-    auto info = ad.getInstInfo(inst1);
+    auto info = ad.getInstInfo(inst);
     if (info.mIdx == -1) {
-      panicUnsupportedInstr(inst1);
+      panicUnsupportedInstr(inst);
     }
-    auto used = ad.instUsedRegMask(inst1);
+    auto used = ad.instUsedRegMask(inst);
     int ti = ad.gpFindFreeReg(used);
     if (ti == -1) {
-      panicUnsupportedInstr(inst1);
+      panicUnsupportedInstr(inst);
     }
     auto tmpReg = ad.gpRegs[ti];
 
@@ -796,10 +795,10 @@ public:
     lea.setOpcode(X86::LEA64r);
     lea.addOperand(MCOperand::createReg(tmpReg));
     for (int i = 0; i < 5; i++) {
-      lea.addOperand(inst1.getOperand(info.mIdx+i));
+      lea.addOperand(inst.getOperand(info.mIdx+i));
     }
     lea.getOperand(5).setReg(0);
-    emitAndFix(lea, i.addr+size1);
+    emitAndFix(lea, i.addr+size);
 
     rspFix -= 8;
     E.emit(MCInstBuilder(X86::PUSH64r).addReg(X86::RAX));
@@ -811,7 +810,7 @@ public:
       .addReg(tmpReg).addReg(X86::RAX).addImm(1).addReg(tmpReg).addImm(0).addReg(0));
     E.emit(MCInstBuilder(X86::POP64r).addReg(X86::RAX));
 
-    MCInst inst2 = inst1;
+    MCInst inst2 = inst;
     inst2.getOperand(info.mIdx).setReg(tmpReg);
     inst2.getOperand(info.mIdx+1).setImm(1);
     inst2.getOperand(info.mIdx+2).setReg(0);

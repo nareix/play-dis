@@ -8,12 +8,12 @@
 #include "elf_file.h"
 
 namespace translater {
-  enum class SlotType: int {
+  enum class SlotType {
     Patch,
     Stub,
   };
 
-  enum class RelType: int {
+  enum class RelType {
     Add,
     Sub,
   };

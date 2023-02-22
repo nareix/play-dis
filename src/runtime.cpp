@@ -185,6 +185,11 @@ struct VMAs {
     start = sysPageFloor(start);
     end = sysPageCeil(end);
 
+    Nodes rs;
+    if (start == end) {
+      return rs;
+    }
+
     auto si = m.lower_bound(start);
     auto ei = m.upper_bound(end);
 
@@ -195,7 +200,6 @@ struct VMAs {
       ei++;
     }
 
-    Nodes rs;
     for (auto i = si; i != ei; i++) {
       rs.push_back(i);
     }
@@ -239,7 +243,7 @@ struct VMAs {
   }
 
   void remove0(Nodes &rs, uint64_t start, uint64_t end) {
-   auto ri = rs.begin();
+    auto ri = rs.begin();
     while (ri != rs.end()) {
       auto r = *ri;
       if (start <= r->second.start && r->second.end <= end) {
@@ -1100,9 +1104,9 @@ static error runBin(const std::vector<std::string> &args) {
 
   auto entryP = loadP + file.eh()->e_entry - (*file.loads.begin())->p_vaddr;
 
-  // << stackTop
+  // --- stackTop ---
   // .. stack ..
-  // << stackStart
+  // --- stackStart ---
   // argc
   // .. argv ...
   // 0
@@ -1110,9 +1114,9 @@ static error runBin(const std::vector<std::string> &args) {
   // 0
   // .. aux ..
   // 0 0
-  // << auxEnd
+  // --- auxEnd ---
   // ... str values ...
-  // << stackEnd
+  // --- stackEnd ---
 
   auto stackSize = 1024*64;
   auto stackTop = (uint8_t *)mmap((void *)0, stackSize, PROT_READ | PROT_WRITE,

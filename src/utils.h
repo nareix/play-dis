@@ -18,7 +18,7 @@ public:
     Slice(nullptr, 0); 
   }
 
-  uint8_t *p() { return (uint8_t*)data(); };
+  uint8_t *p() { return (uint8_t *)data(); };
 
   Slice slice(size_t start) {
     return {data() + start, size() - start};

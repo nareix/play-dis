@@ -36,10 +36,12 @@ set(SRCS
   src/main.cpp
 )
 
+include_directories(/src/llvm-x86)
+
 add_executable(s2 ${SRCS})
 add_executable(s2a ${SRCS})
 
-add_llvm_library(llvmdeps empty.cpp)
+add_llvm_library(llvmdeps src/empty.cpp)
 target_link_libraries(s2 llvmdeps)
 target_link_libraries(s2a llvmdeps)
 
