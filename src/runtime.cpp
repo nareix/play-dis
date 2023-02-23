@@ -991,7 +991,7 @@ struct Syscall {
 
 thread_local decltype(Syscall::dbgarg) Syscall::dbgarg;
 
-static error initH() {
+static error hostInit() {
   auto size = 1024*128;
   auto stack = (uint8_t *)mmap(nullptr, size, PROT_READ | PROT_WRITE,
                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -1036,14 +1036,20 @@ static __attribute__((naked)) void enterBin(void *entry, void *stack) {
 }
 
 static error runBin(const std::vector<std::string> &args) {
-  auto err = initH();
+  auto filename = args[0];
+
+  ElfFile file;
+  auto err = file.open(filename);
   if (err) {
     return err;
   }
 
+  err = hostInit();
+  if (err) {
+    return err;
+  }
   auto &proc = H.r()->t->p;
 
-  auto filename = args[0];
   uint8_t *loadP = nullptr;
 
   auto hook = fileHooks.find(filename);
@@ -1051,12 +1057,6 @@ static error runBin(const std::vector<std::string> &args) {
     auto &h = fileHooks.e[hook];
     loadP = (uint8_t *)h.addr;
     filename = h.trname;
-  }
-
-  ElfFile file;
-  err = file.open(filename);
-  if (err) {
-    return err;
   }
 
   auto segs = file.mmapSegs();

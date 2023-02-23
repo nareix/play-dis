@@ -83,15 +83,14 @@ static bool forAll;
 static int forSingleInstr = -1;
 
 struct AsmDism {
-  MCTargetOptions MO;
+  MCTargetOptions TO;
   const Target *T;
   std::unique_ptr<MCSubtargetInfo> STI;
-  std::unique_ptr<MCRegisterInfo> MRI;
-  std::unique_ptr<MCAsmInfo> MAI;
-  std::unique_ptr<MCInstrInfo> MII;
+  std::unique_ptr<MCRegisterInfo> RI;
+  std::unique_ptr<MCAsmInfo> AI;
   SourceMgr SM;
   std::unique_ptr<MCContext> C;
-  std::unique_ptr<MCInstrInfo> MCII;
+  std::unique_ptr<MCInstrInfo> II;
   SmallString<128> Sb;
   raw_svector_ostream Ss;
   MCInstPrinter *IP;
@@ -111,23 +110,19 @@ struct AsmDism {
     std::string err;
     T = TargetRegistry::lookupTarget(tname, err);
     STI.reset(T->createMCSubtargetInfo(tname, "", ""));
-    MRI.reset(T->createMCRegInfo(tname));
-    MAI.reset(T->createMCAsmInfo(*MRI, tname, MO));
-    MII.reset(T->createMCInstrInfo());
-    C.reset(new MCContext(triple, MAI.get(), MRI.get(), STI.get(), &SM, &MO));
-    MCII.reset(T->createMCInstrInfo());
-    IP = T->createMCInstPrinter(triple, 0, *MAI, *MCII, *MRI);
+    RI.reset(T->createMCRegInfo(tname));
+    AI.reset(T->createMCAsmInfo(*RI, tname, TO));
+    C.reset(new MCContext(triple, AI.get(), RI.get(), STI.get(), &SM, &TO));
+    II.reset(T->createMCInstrInfo());
+    IP = T->createMCInstPrinter(triple, 0, *AI, *II, *RI);
 
     S.reset(T->createAsmStreamer(
-        *C, 
-        std::make_unique<formatted_raw_ostream>(Ss),
-        /*asmverbose*/false, /*useDwarfDirectory*/false, 
-        IP, 
-        std::unique_ptr<MCCodeEmitter>(T->createMCCodeEmitter(*MCII, *C)),
-        std::unique_ptr<MCAsmBackend>(T->createMCAsmBackend(*STI, *MRI, MO)),
-        /*showinst*/true
-    ));
-    E.reset(T->createMCCodeEmitter(*MCII, *C));
+        *C, std::make_unique<formatted_raw_ostream>(Ss),
+        /*asmverbose*/ false, /*useDwarfDirectory*/ false, IP,
+        std::unique_ptr<MCCodeEmitter>(T->createMCCodeEmitter(*II, *C)),
+        std::unique_ptr<MCAsmBackend>(T->createMCAsmBackend(*STI, *RI, TO)),
+        /*showinst*/ true));
+    E.reset(T->createMCCodeEmitter(*II, *C));
     D.reset(T->createMCDisassembler(*STI, *C));
   }
 
@@ -177,7 +172,7 @@ struct AsmDism {
 
   unsigned superReg(unsigned reg) {
     auto super = reg;
-    for (MCSuperRegIterator i(reg, MRI.get()); i.isValid(); ++i) {
+    for (MCSuperRegIterator i(reg, RI.get()); i.isValid(); ++i) {
       super = *i;
     }
     return super;
@@ -490,7 +485,7 @@ public:
     unsigned size:5;
     unsigned used:1;
     unsigned type:3;
-    unsigned jmpto:1;
+    unsigned jmpdest:1;
     unsigned bad:1;
   } __attribute__((packed, aligned(4)));
   static_assert(sizeof(OpcodeAndSize) == 4, "");
@@ -574,20 +569,19 @@ public:
       return Syscall;
     }
 
-    auto &idesc = ad.MII->get(opcode);
-    for (int i = 0; i < idesc.NumOperands; i++) {
+    auto &id = ad.II->get(opcode);
+    for (int i = 0; i < id.NumOperands; i++) {
       auto od = inst.getOperand(i);
-      auto opinfo = idesc.OpInfo[i];
+      auto opinfo = id.OpInfo[i];
       if (opinfo.RegClass == X86::SEGMENT_REGRegClassID) {
         if (od.getReg() == X86::FS) {
-          unsigned type = TlsOp;
           if (i > 0) {
             auto preOp = inst.getOperand(i-1);
             if (preOp.isImm() && preOp.getImm() == 40) {
-              type = TlsStackCanary;
+              return TlsStackCanary;
             }
           }
-          return type;
+          return TlsOp;
         }
       }
     }
@@ -613,7 +607,7 @@ public:
 
   std::vector<AddrAndIdx> fsInsts;
   std::vector<AddrAndIdx> badRanges;
-  const int BadMaxDiff = 100;
+  const int MaxBadDiff = 100;
 
   std::hash<std::string_view> strHash;
 
@@ -639,8 +633,8 @@ public:
       tag += fmtSprintf(":%d,%d", jmp.r0.size, jmp.r0.n);
     }
 
-    if (r.op.jmpto) {
-      tag += ":jmpto";
+    if (r.op.jmpdest) {
+      tag += ":jmpdest";
     }
 
     std::stringstream ss;
@@ -1057,8 +1051,8 @@ public:
           },
         };
       }
-      if (op.jmpto) {
-        logJmpFail(addr, "jmpto");
+      if (op.jmpdest) {
+        logJmpFail(addr, "jmpdest");
         break;
       }
       addr -= allOpcode[i-1].size;
@@ -1076,8 +1070,8 @@ public:
         logJmpFail(addr, "used");
         break;
       }
-      if (op.jmpto && i != i0.idx) {
-        logJmpFail(addr, "jmpto");
+      if (op.jmpdest && i != i0.idx) {
+        logJmpFail(addr, "jmpdest");
         break;
       }
       size += op.size;
@@ -1256,7 +1250,7 @@ public:
     });
   }
 
-  void markAllJmp() {
+  void markAllJmpDest() {
     for (auto sec: allSecs) {
       std::vector<uint64_t> tos;
       uint64_t addr = sec.start;
@@ -1285,10 +1279,11 @@ public:
       addr = sec.start;
       for (int ti = 0; ti < tos.size(); ti++) {
         while (i < sec.endIdx && addr < tos[ti]) {
-          addr += allOpcode[i].size, i++;
+          addr += allOpcode[i].size;
+          i++;
         }
         if (addr == tos[ti]) {
-          allOpcode[i].jmpto = 1;
+          allOpcode[i].jmpdest = 1;
           n++;
         }
       }
@@ -1336,7 +1331,7 @@ public:
 
         if (op.op == ad.X86_BAD) {
           if (badRanges.size() == 0 ||
-              addr - badRanges[badRanges.size()-1].addr > BadMaxDiff)
+              addr - badRanges[badRanges.size()-1].addr > MaxBadDiff)
           {
             badRanges.push_back({addr, idx});
             badRanges.push_back({addr+op.size, idx+1});
@@ -1383,7 +1378,7 @@ public:
           allOpcode[j].bad = 1;
         }
       }
-      forInstAround(bi, BadMaxDiff, [&](AddrAndIdx i) -> int {
+      forInstAround(bi, MaxBadDiff, [&](AddrAndIdx i) -> int {
         allOpcode[i.idx].bad = 1;
         allOpcode[i.idx].used = 1;
         return -1;
@@ -1400,7 +1395,7 @@ public:
       }
     }
 
-    markAllJmp();
+    markAllJmpDest();
 
     if (forAll) {
       forAllInst([&](AddrAndIdx i) {
