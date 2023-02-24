@@ -36,7 +36,7 @@ public:
   ~DeferF() { f(); }
 };
 
-#define defer(f) DeferF __df##__COUNTER__(f)
+#define defer(f) DeferF __df__##__COUNTER__(f)
 
 template <typename... Types>
 static inline std::string fmtSprintf(const char *fmt, Types... args) {
@@ -52,10 +52,10 @@ static inline void fmtPrintf(const char *fmt, Types... args) {
   fputs(s.c_str(), stdout);
 }
 
-static inline std::string stringsJoin(const std::vector<std::string> &sv,
+static inline std::string stringsJoin(const std::vector<std::string> &v,
                                       const std::string &sep) {
   std::ostringstream c;
-  std::copy(sv.begin(), sv.end(),
+  std::copy(v.begin(), v.end(),
             std::ostream_iterator<std::string>(c, sep.c_str()));
   auto r = c.str();
   if (r.size() > 0) {

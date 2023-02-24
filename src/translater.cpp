@@ -183,7 +183,7 @@ struct AsmDism {
     for (int i = 0; i < buf.size(); i++) {
       v.push_back(fmtSprintf("%.2X", buf[i]));
     }
-    return "[" + stringsJoin(v, " ") + "]";
+    return fmtSprintf("n=%d[%s]", buf.size(), stringsJoin(v, ",").c_str());
   }
 
   void dumpInstBuf(const std::string &prefix, Slice buf, uint64_t va = 0) {
@@ -202,7 +202,7 @@ struct AsmDism {
     S->emitInstruction(inst, *STI);
     auto r = Sb.slice(1, Sb.size()-1).str();
     for (int i = 0; i < r.size(); i++) {
-      if (r[i] == '\t') {
+      if (r[i] == '\t' || r[i] == ' ') {
         r[i] = ' ';
       }
     }
@@ -342,13 +342,13 @@ struct AsmDism {
       N(1) IMM(0) USE(RAX) E()
     }
 
-    fail:
-    if (panic) { 
+  fail:
+    if (panic) {
       panicUnsupportedInstr(inst);
     }
     return r;
 
-    ok:
+  ok:
     auto isRsp = [&](int i) -> bool {
       auto r = inst.getOperand(i).getReg();
       return r == X86::ESP || r == X86::RSP;
@@ -507,11 +507,6 @@ public:
     int type;
     AddrRange r0;
     AddrRange r1;
-  };
-
-  struct JmpFailLog {
-    uint64_t addr;
-    const char *tag;
   };
 
   uint64_t vaddr(uint64_t a) { 
