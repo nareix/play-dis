@@ -30,6 +30,7 @@ set(LLVM_LINK_COMPONENTS
 
 set(SRCS
   src/translater.cpp
+  src/compiler.cpp
   src/runtime.cpp
   src/elf_file.cpp
   src/utils.cpp

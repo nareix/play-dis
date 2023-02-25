@@ -8,6 +8,7 @@
 #include "runtime.h"
 #include "translater.h"
 #include "elf_file.h"
+#include "compiler.h"
 #include "utils.h"
 
 static error runMain(int argc, char **argv) {
@@ -28,6 +29,8 @@ static error runMain(int argc, char **argv) {
     return translater::cmdMain(args);
   } else if (action == "rt" || action == "runtime") {
     return runtime::cmdMain(args);
+  } else if (action == "build") {
+    return compiler::cmdMain(args);
   } else if (action == "play") {
     return nullptr;
   }

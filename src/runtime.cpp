@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <functional>
 #include <optional>
+#include <sstream>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
@@ -421,17 +422,17 @@ struct Syscall {
   }
 
   std::string strflags(uint64_t m, const std::vector<std::pair<uint64_t, std::string>> &v) {
-    std::vector<std::string> sv;
+    std::vector<std::string> vs;
     for (auto &p: v) {
       if (m & p.first) {
-        sv.push_back(p.second);
+        vs.push_back(p.second);
         m &= ~p.first;
       }
     }
-    if (m || sv.size() == 0) {
-      sv.push_back(fmtSprintf("0x%x", m));
+    if (m || vs.size() == 0) {
+      vs.push_back(fmtSprintf("0x%x", m));
     }
-    return stringsJoin(sv, "|");
+    return stringsJoin(vs, "|");
   }
 
 #define F(x) {x, #x}
@@ -889,22 +890,17 @@ struct Syscall {
     if (debug) {
       auto &fn = dbgarg[0];
       auto &ret = dbgarg[dbgarg.size()-1];
-      fmtPrintf("%s(", fn.second.c_str());
+      std::vector<std::string> v;
       for (int i = 1; i < dbgarg.size()-1; i++) {
         auto &p = dbgarg[i];
-        fmtPrintf("%s=%s", p.first.c_str(), p.second.c_str());
-        if (i < dbgarg.size()-2) {
-          fmtPrintf(",");
-        }
+        v.push_back(fmtSprintf("%s=%s", p.first.c_str(), p.second.c_str()));
       }
-      fmtPrintf(") = %s", ret.second.c_str());
-      if (bypass) {
-        fmtPrintf(" (bypass)");
-      }
-      fmtPrintf("\n");
+      std::string rets = bypass ? "bypass" : ret.second;
+      fmtPrintf("%s(%s) = %s\n", fn.second.c_str(), stringsJoin(v, ",").c_str(),
+                rets.c_str());
       dbgarg.clear();
     }
-    
+
     p.vm.ptrScan();
 
     return handled;

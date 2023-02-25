@@ -600,7 +600,7 @@ public:
     };
   }
 
-  std::vector<AddrAndIdx> fsInsts;
+  std::vector<AddrAndIdx> keyInsts;
   std::vector<AddrAndIdx> badRanges;
   const int MaxBadDiff = 100;
 
@@ -1340,7 +1340,7 @@ public:
         addr += op.size;
 
         if (op.type >= TlsStackCanary) {
-          fsInsts.push_back(ai);
+          keyInsts.push_back(ai);
         }
 
         if (op.type != NormalOp) {
@@ -1403,7 +1403,7 @@ public:
         }
       });
     } else {
-      for (auto i: fsInsts) {
+      for (auto i: keyInsts) {
         handleInst(i);
       }
     }
@@ -1469,13 +1469,13 @@ error writeElfFile(const Result &res, const ElfFile &input, const std::string &o
     return err;
   }
 
-  auto filem = buf.p();
+  auto fileP = buf.p();
   auto codeOff = input.phX->p_offset;
-  auto code = filem + codeOff;
-  auto stubCode = filem + stubCodeOff;
+  auto code = fileP + codeOff;
+  auto stubCode = fileP + stubCodeOff;
 
-  memcpy(filem, input.buf.data(), input.buf.size());
-  memcpy(filem + stubCodeOff, res.stubCode.data(), res.stubCode.size());
+  memcpy(fileP, input.buf.data(), input.buf.size());
+  memcpy(fileP + stubCodeOff, res.stubCode.data(), res.stubCode.size());
 
   for (auto p: res.patches) {
     auto c = code + p.addr;
@@ -1524,13 +1524,13 @@ error writeElfFile(const Result &res, const ElfFile &input, const std::string &o
     .p_filesz = res.stubCode.size(), .p_memsz = res.stubCode.size(),
     .p_align = sysPageSize,
   }});
-  memcpy(filem + newPhsOff, phs.data(), newPhsSize);
+  memcpy(fileP + newPhsOff, phs.data(), newPhsSize);
 
-  auto newEh = (Elf64_Ehdr *)filem;
+  auto newEh = (Elf64_Ehdr *)fileP;
   newEh->e_phoff = newPhsOff;
   newEh->e_phnum = phs.size();
 
-  if (msync(filem, totSize, MS_SYNC) == -1) {
+  if (msync(fileP, totSize, MS_SYNC) == -1) {
     return fmtErrorf("msync failed");
   }
 
