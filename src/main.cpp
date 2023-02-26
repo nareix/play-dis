@@ -29,7 +29,7 @@ static error runMain(int argc, char **argv) {
     return translater::cmdMain(args);
   } else if (action == "rt" || action == "runtime") {
     return runtime::cmdMain(args);
-  } else if (action == "build") {
+  } else if (action == "b" || action == "build") {
     return compiler::cmdMain(args);
   } else if (action == "play") {
     return nullptr;
