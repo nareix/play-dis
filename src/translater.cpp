@@ -78,7 +78,6 @@ public:
 static bool verbose;
 static bool summary;
 static bool debug;
-static bool debugOnlyBefore;
 static bool forAll;
 static int forSingleInstr = -1;
 
@@ -1197,35 +1196,30 @@ public:
     if (debug) {
       for (int i = patchIdx; i < E.patches.size(); i++) {
         auto p = E.patches[i];
-        fmtPrintf("add patch_%d addr %lx off %d size %d\n", i, vaddr(p.addr), p.off, p.size);
+        fmtPrintf("patch_%d addr %lx off %d size %d\n", i, vaddr(p.addr), p.off, p.size);
       }
       for (int i = relocIdx; i < E.relocs.size(); i++) {
         auto r = E.relocs[i];
-        fmtPrintf("add %s\n", fmtReloc(r, i).c_str());
+        fmtPrintf("%s\n", fmtReloc(r, i).c_str());
       }
-      auto D = [&](const std::string &s, Slice buf, uint64_t va) {
+      auto dism = [&](const std::string &s, Slice buf, uint64_t va) {
         ad.dumpInstBuf(fmtSprintf("%s_%s", JmpTypeStr(jmp.type), s.c_str()), buf, va);
       };
       auto before = [&](const std::string &s, AddrRange r) {
-        D(s + "_before", instBuf.slice(r.i.addr, r.size), vaddr(r.i.addr));
+        dism(s + "_before", instBuf.slice(r.i.addr, r.size), vaddr(r.i.addr));
       };
       auto after = [&](const std::string &s, int i) {
         if (patchIdx + i < E.patches.size()) {
           auto p = E.patches[patchIdx + i];
           auto c = E.patchCode.begin() + p.off;
-          D(s + "_after", {c, c + p.size}, vaddr(p.addr));
+          dism(s + "_after", {c, c + p.size}, vaddr(p.addr));
         }
       };
-      if (debugOnlyBefore) {
-        before("inst0", jmp.r0);
-        before("inst1", jmp.r1);
-      } else {
-        before("inst0", jmp.r0);
-        after("inst0", 0);
-        before("inst1", jmp.r1);
-        after("inst1", 1);
-        D("stub", E.codeSlice(stubAddr), stubAddr);
-      }
+      before("inst0", jmp.r0);
+      after("inst0", 0);
+      before("inst1", jmp.r1);
+      after("inst1", 1);
+      dism("stub", E.codeSlice(stubAddr), stubAddr);
     }
   }
 
@@ -1603,10 +1597,6 @@ error cmdMain(const std::vector<std::string> &args0) {
       debug = true;
       forAll = true;
       verbose = true;
-      continue;
-    }
-    if (o == "-dob") {
-      debugOnlyBefore = true;
       continue;
     }
     if (o == "-v") {
