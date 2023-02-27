@@ -51,13 +51,15 @@ struct Host {
   static __attribute__((naked)) void setr(HostRegs *t) {
     asm("endbr64; wrgsbase %rdi; ret");
   }
+
   static __attribute__((naked)) HostRegs *r() {
     asm("endbr64; rdgsbase %rax; ret");
   }
+
+  error initThread();
 };
 
-struct Host H;
-
+static Host H;
 static bool debug = true;
 
 struct FileHooks {
@@ -987,7 +989,7 @@ struct Syscall {
 
 thread_local decltype(Syscall::dbgarg) Syscall::dbgarg;
 
-static error hostInit() {
+error Host::initThread() {
   auto size = 1024*128;
   auto stack = (uint8_t *)mmap(nullptr, size, PROT_READ | PROT_WRITE,
                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -1040,7 +1042,7 @@ static error runBin(const std::vector<std::string> &args) {
     return err;
   }
 
-  err = hostInit();
+  err = H.initThread();
   if (err) {
     return err;
   }
