@@ -1283,7 +1283,7 @@ public:
     }
   }
 
-  Translater(AsmDism &ad, const ElfFile & file, Result &res): 
+  Translater(AsmDism &ad, const ElfFile &file, Result &res): 
     ad(ad),
     file(file), 
     res(res),
