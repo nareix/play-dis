@@ -919,7 +919,7 @@ struct Syscall {
   // syscall: rax(nr) rdi(1) rsi(2) rdx(3) r10(4) r8(5) r9(6) rax(ret) 
   // caller:  rdi(1) rsi(2) rdx(3) rcx(4) r8(5) r9(6) rax(ret) r10 r11
 
-  static constexpr int R(int i) {
+  static const int R(int i) {
     return offsetof(HostRegs, regs) + i*8;
   }
   static const int Stack = offsetof(HostRegs, stack);
