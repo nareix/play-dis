@@ -1,11 +1,11 @@
 package main
 
 import (
-	"os"
-	"os/exec"
+	"fmt"
+	"path/filepath"
 )
 
 func main() {
-	exec.Command("hi")
-	os.Create("hi")
+	a, _ := filepath.Abs("sss")
+	fmt.Println(a)
 }
