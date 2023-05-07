@@ -1,6 +1,6 @@
 
-LLVM=/src/llvm-src/llvm
-TARGET=/src/llvm-x86
+LLVM=/src/llvm-project/llvm
+TARGET=/usr/local/llvm/include-gen
 
 gen() {
   filename=$1

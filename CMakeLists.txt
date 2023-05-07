@@ -37,7 +37,7 @@ set(SRCS
   src/main.cpp
 )
 
-include_directories(/src/llvm-x86)
+include_directories(/usr/local/llvm/include-gen)
 
 add_executable(s2 ${SRCS})
 add_executable(s2a ${SRCS})

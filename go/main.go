@@ -2,10 +2,10 @@ package main
 
 import (
 	"fmt"
-	"path/filepath"
+	"time"
 )
 
 func main() {
-	a, _ := filepath.Abs("sss")
-	fmt.Println(a)
+	fmt.Println("sss")
+	time.Sleep(time.Second)
 }
